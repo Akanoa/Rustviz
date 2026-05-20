@@ -103,6 +103,8 @@ src/
 ## Active Technologies
 - N/A — deliverable is markdown documentation + `CLAUDE.md` (authoritative scope source); `specs/001-milestone-roadmap/spec.md` (this feature's spec) (001-milestone-roadmap)
 - filesystem, version-controlled in git (001-milestone-roadmap)
+- Rust 2024 edition (latest stable), MSRV pinned to current stable at scaffold time (recorded in `Cargo.toml`) + `insta` (snapshot testing). No parser framework (CLAUDE.md locked-in decision). No `thiserror`/`anyhow` for M01 — error type is a single hand-rolled struct. (002-m01-frontend-skeleton)
+- N/A (in-memory only; SourceMap holds source text) (002-m01-frontend-skeleton)
 
 ## Recent Changes
 - 001-milestone-roadmap: Added N/A — deliverable is markdown documentation + `CLAUDE.md` (authoritative scope source); `specs/001-milestone-roadmap/spec.md` (this feature's spec)
