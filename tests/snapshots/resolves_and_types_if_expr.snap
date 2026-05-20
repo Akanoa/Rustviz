@@ -1,0 +1,255 @@
+---
+source: tests/m02.rs
+expression: result
+---
+Ok {
+    resolution: Resolution {
+        uses: {
+            Span {
+                start: 70,
+                end: 71,
+                file: FileId(
+                    1,
+                ),
+            }: BindingId(
+                3,
+            ),
+            Span {
+                start: 97,
+                end: 98,
+                file: FileId(
+                    1,
+                ),
+            }: BindingId(
+                3,
+            ),
+            Span {
+                start: 109,
+                end: 112,
+                file: FileId(
+                    1,
+                ),
+            }: BindingId(
+                0,
+            ),
+            Span {
+                start: 137,
+                end: 140,
+                file: FileId(
+                    1,
+                ),
+            }: BindingId(
+                1,
+            ),
+        },
+        bindings: {
+            BindingId(
+                0,
+            ): BindingDecl {
+                name: "foo",
+                kind: Fn,
+                decl_span: Span {
+                    start: 0,
+                    end: 11,
+                    file: FileId(
+                        1,
+                    ),
+                },
+                name_span: Span {
+                    start: 0,
+                    end: 11,
+                    file: FileId(
+                        1,
+                    ),
+                },
+            },
+            BindingId(
+                1,
+            ): BindingDecl {
+                name: "bar",
+                kind: Fn,
+                decl_span: Span {
+                    start: 12,
+                    end: 23,
+                    file: FileId(
+                        1,
+                    ),
+                },
+                name_span: Span {
+                    start: 12,
+                    end: 23,
+                    file: FileId(
+                        1,
+                    ),
+                },
+            },
+            BindingId(
+                2,
+            ): BindingDecl {
+                name: "main",
+                kind: Fn,
+                decl_span: Span {
+                    start: 25,
+                    end: 152,
+                    file: FileId(
+                        1,
+                    ),
+                },
+                name_span: Span {
+                    start: 25,
+                    end: 152,
+                    file: FileId(
+                        1,
+                    ),
+                },
+            },
+            BindingId(
+                3,
+            ): BindingDecl {
+                name: "c",
+                kind: Let {
+                    mutable: false,
+                },
+                decl_span: Span {
+                    start: 41,
+                    end: 54,
+                    file: FileId(
+                        1,
+                    ),
+                },
+                name_span: Span {
+                    start: 41,
+                    end: 54,
+                    file: FileId(
+                        1,
+                    ),
+                },
+            },
+            BindingId(
+                4,
+            ): BindingDecl {
+                name: "v",
+                kind: Let {
+                    mutable: false,
+                },
+                decl_span: Span {
+                    start: 59,
+                    end: 89,
+                    file: FileId(
+                        1,
+                    ),
+                },
+                name_span: Span {
+                    start: 59,
+                    end: 89,
+                    file: FileId(
+                        1,
+                    ),
+                },
+            },
+        },
+    },
+    types: TypeMap {
+        expr_types: {
+            Span {
+                start: 49,
+                end: 53,
+                file: FileId(
+                    1,
+                ),
+            }: Bool,
+            Span {
+                start: 70,
+                end: 71,
+                file: FileId(
+                    1,
+                ),
+            }: Bool,
+            Span {
+                start: 74,
+                end: 75,
+                file: FileId(
+                    1,
+                ),
+            }: I32,
+            Span {
+                start: 85,
+                end: 86,
+                file: FileId(
+                    1,
+                ),
+            }: I32,
+            Span {
+                start: 67,
+                end: 88,
+                file: FileId(
+                    1,
+                ),
+            }: I32,
+            Span {
+                start: 97,
+                end: 98,
+                file: FileId(
+                    1,
+                ),
+            }: Bool,
+            Span {
+                start: 109,
+                end: 114,
+                file: FileId(
+                    1,
+                ),
+            }: Unit,
+            Span {
+                start: 137,
+                end: 142,
+                file: FileId(
+                    1,
+                ),
+            }: Unit,
+            Span {
+                start: 94,
+                end: 149,
+                file: FileId(
+                    1,
+                ),
+            }: Unit,
+        },
+        binding_types: {
+            BindingId(
+                0,
+            ): Fn(
+                FnSig {
+                    params: [],
+                    ret: Unit,
+                },
+            ),
+            BindingId(
+                1,
+            ): Fn(
+                FnSig {
+                    params: [],
+                    ret: Unit,
+                },
+            ),
+            BindingId(
+                2,
+            ): Fn(
+                FnSig {
+                    params: [],
+                    ret: Unit,
+                },
+            ),
+            BindingId(
+                3,
+            ): Var(
+                Bool,
+            ),
+            BindingId(
+                4,
+            ): Var(
+                I32,
+            ),
+        },
+    },
+}

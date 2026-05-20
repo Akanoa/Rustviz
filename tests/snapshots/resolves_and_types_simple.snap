@@ -1,0 +1,93 @@
+---
+source: tests/m02.rs
+expression: result
+---
+Ok {
+    resolution: Resolution {
+        uses: {},
+        bindings: {
+            BindingId(
+                0,
+            ): BindingDecl {
+                name: "main",
+                kind: Fn,
+                decl_span: Span {
+                    start: 0,
+                    end: 32,
+                    file: FileId(
+                        1,
+                    ),
+                },
+                name_span: Span {
+                    start: 0,
+                    end: 32,
+                    file: FileId(
+                        1,
+                    ),
+                },
+            },
+            BindingId(
+                1,
+            ): BindingDecl {
+                name: "x",
+                kind: Let {
+                    mutable: false,
+                },
+                decl_span: Span {
+                    start: 16,
+                    end: 30,
+                    file: FileId(
+                        1,
+                    ),
+                },
+                name_span: Span {
+                    start: 16,
+                    end: 30,
+                    file: FileId(
+                        1,
+                    ),
+                },
+            },
+        },
+    },
+    types: TypeMap {
+        expr_types: {
+            Span {
+                start: 24,
+                end: 25,
+                file: FileId(
+                    1,
+                ),
+            }: I32,
+            Span {
+                start: 28,
+                end: 29,
+                file: FileId(
+                    1,
+                ),
+            }: I32,
+            Span {
+                start: 24,
+                end: 29,
+                file: FileId(
+                    1,
+                ),
+            }: I32,
+        },
+        binding_types: {
+            BindingId(
+                0,
+            ): Fn(
+                FnSig {
+                    params: [],
+                    ret: Unit,
+                },
+            ),
+            BindingId(
+                1,
+            ): Var(
+                I32,
+            ),
+        },
+    },
+}

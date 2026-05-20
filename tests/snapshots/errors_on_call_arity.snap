@@ -1,0 +1,16 @@
+---
+source: tests/m02.rs
+expression: result
+---
+Err(
+    ParseError {
+        message: "function `add` expects 2 argument(s), found 1",
+        span: Span {
+            start: 69,
+            end: 75,
+            file: FileId(
+                1,
+            ),
+        },
+    },
+)

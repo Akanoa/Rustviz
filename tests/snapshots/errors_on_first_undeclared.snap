@@ -1,0 +1,16 @@
+---
+source: tests/m02.rs
+expression: result
+---
+Err(
+    ParseError {
+        message: "use of undeclared variable `z`",
+        span: Span {
+            start: 24,
+            end: 25,
+            file: FileId(
+                1,
+            ),
+        },
+    },
+)

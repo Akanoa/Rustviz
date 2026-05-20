@@ -7,6 +7,7 @@ description = "Pedagogical visualizer for Rust ownership and borrowing"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+indexmap = "2"
 
 [dev-dependencies]
 insta = "1"
@@ -14,3 +15,7 @@ insta = "1"
 [[test]]
 name = "m01"
 path = "tests/m01.rs"
+
+[[test]]
+name = "m02"
+path = "tests/m02.rs"

@@ -1,0 +1,16 @@
+---
+source: tests/m02.rs
+expression: result
+---
+Err(
+    ParseError {
+        message: "function returns `i32`, but body has type `bool`",
+        span: Span {
+            start: 20,
+            end: 24,
+            file: FileId(
+                1,
+            ),
+        },
+    },
+)

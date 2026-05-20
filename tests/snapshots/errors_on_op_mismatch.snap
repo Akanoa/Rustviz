@@ -1,0 +1,16 @@
+---
+source: tests/m02.rs
+expression: result
+---
+Err(
+    ParseError {
+        message: "binary operator `+` requires both operands to be `i32`, found `i32` and `bool`",
+        span: Span {
+            start: 24,
+            end: 32,
+            file: FileId(
+                1,
+            ),
+        },
+    },
+)

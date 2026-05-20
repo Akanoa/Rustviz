@@ -105,6 +105,8 @@ src/
 - filesystem, version-controlled in git (001-milestone-roadmap)
 - Rust 2024 edition (latest stable), MSRV pinned to current stable at scaffold time (recorded in `Cargo.toml`) + `insta` (snapshot testing). No parser framework (CLAUDE.md locked-in decision). No `thiserror`/`anyhow` for M01 — error type is a single hand-rolled struct. (002-m01-frontend-skeleton)
 - N/A (in-memory only; SourceMap holds source text) (002-m01-frontend-skeleton)
+- Rust 2024 edition, same toolchain as M01 (1.85+). No `Cargo.toml` changes other than registering the new `[[test]]` target `m02`. + existing `insta` dev-dep; no new deps. (003-m02-resolve-typeck)
+- in-memory; metadata stored in `BTreeMap<Span, ...>` side tables for determinism. (003-m02-resolve-typeck)
 
 ## Recent Changes
 - 001-milestone-roadmap: Added N/A — deliverable is markdown documentation + `CLAUDE.md` (authoritative scope source); `specs/001-milestone-roadmap/spec.md` (this feature's spec)

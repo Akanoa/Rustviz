@@ -1,0 +1,16 @@
+---
+source: tests/m02.rs
+expression: result
+---
+Err(
+    ParseError {
+        message: "duplicate parameter `x`",
+        span: Span {
+            start: 13,
+            end: 19,
+            file: FileId(
+                1,
+            ),
+        },
+    },
+)

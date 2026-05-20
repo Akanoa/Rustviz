@@ -6,8 +6,12 @@
 #![warn(clippy::all)]
 
 pub mod parse;
+pub mod resolve;
+pub mod typeck;
 
 pub use parse::ast;
 pub use parse::error::ParseError;
 pub use parse::parse;
 pub use parse::span::{FileId, SourceMap, Span};
+pub use resolve::{resolve, BindingDecl, BindingId, BindingKind, Resolution};
+pub use typeck::{typeck, BindingType, FnSig, Ty, TypeMap};

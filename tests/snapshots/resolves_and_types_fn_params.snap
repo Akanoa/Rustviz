@@ -1,0 +1,223 @@
+---
+source: tests/m02.rs
+expression: result
+---
+Ok {
+    resolution: Resolution {
+        uses: {
+            Span {
+                start: 36,
+                end: 37,
+                file: FileId(
+                    1,
+                ),
+            }: BindingId(
+                2,
+            ),
+            Span {
+                start: 40,
+                end: 41,
+                file: FileId(
+                    1,
+                ),
+            }: BindingId(
+                3,
+            ),
+            Span {
+                start: 69,
+                end: 72,
+                file: FileId(
+                    1,
+                ),
+            }: BindingId(
+                0,
+            ),
+        },
+        bindings: {
+            BindingId(
+                0,
+            ): BindingDecl {
+                name: "add",
+                kind: Fn,
+                decl_span: Span {
+                    start: 0,
+                    end: 43,
+                    file: FileId(
+                        1,
+                    ),
+                },
+                name_span: Span {
+                    start: 0,
+                    end: 43,
+                    file: FileId(
+                        1,
+                    ),
+                },
+            },
+            BindingId(
+                1,
+            ): BindingDecl {
+                name: "main",
+                kind: Fn,
+                decl_span: Span {
+                    start: 45,
+                    end: 81,
+                    file: FileId(
+                        1,
+                    ),
+                },
+                name_span: Span {
+                    start: 45,
+                    end: 81,
+                    file: FileId(
+                        1,
+                    ),
+                },
+            },
+            BindingId(
+                2,
+            ): BindingDecl {
+                name: "a",
+                kind: Param,
+                decl_span: Span {
+                    start: 7,
+                    end: 13,
+                    file: FileId(
+                        1,
+                    ),
+                },
+                name_span: Span {
+                    start: 7,
+                    end: 13,
+                    file: FileId(
+                        1,
+                    ),
+                },
+            },
+            BindingId(
+                3,
+            ): BindingDecl {
+                name: "b",
+                kind: Param,
+                decl_span: Span {
+                    start: 15,
+                    end: 21,
+                    file: FileId(
+                        1,
+                    ),
+                },
+                name_span: Span {
+                    start: 15,
+                    end: 21,
+                    file: FileId(
+                        1,
+                    ),
+                },
+            },
+            BindingId(
+                4,
+            ): BindingDecl {
+                name: "r",
+                kind: Let {
+                    mutable: false,
+                },
+                decl_span: Span {
+                    start: 61,
+                    end: 79,
+                    file: FileId(
+                        1,
+                    ),
+                },
+                name_span: Span {
+                    start: 61,
+                    end: 79,
+                    file: FileId(
+                        1,
+                    ),
+                },
+            },
+        },
+    },
+    types: TypeMap {
+        expr_types: {
+            Span {
+                start: 36,
+                end: 37,
+                file: FileId(
+                    1,
+                ),
+            }: I32,
+            Span {
+                start: 40,
+                end: 41,
+                file: FileId(
+                    1,
+                ),
+            }: I32,
+            Span {
+                start: 36,
+                end: 41,
+                file: FileId(
+                    1,
+                ),
+            }: I32,
+            Span {
+                start: 73,
+                end: 74,
+                file: FileId(
+                    1,
+                ),
+            }: I32,
+            Span {
+                start: 76,
+                end: 77,
+                file: FileId(
+                    1,
+                ),
+            }: I32,
+            Span {
+                start: 69,
+                end: 78,
+                file: FileId(
+                    1,
+                ),
+            }: I32,
+        },
+        binding_types: {
+            BindingId(
+                0,
+            ): Fn(
+                FnSig {
+                    params: [
+                        I32,
+                        I32,
+                    ],
+                    ret: I32,
+                },
+            ),
+            BindingId(
+                1,
+            ): Fn(
+                FnSig {
+                    params: [],
+                    ret: Unit,
+                },
+            ),
+            BindingId(
+                2,
+            ): Var(
+                I32,
+            ),
+            BindingId(
+                3,
+            ): Var(
+                I32,
+            ),
+            BindingId(
+                4,
+            ): Var(
+                I32,
+            ),
+        },
+    },
+}

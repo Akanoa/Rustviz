@@ -1,0 +1,16 @@
+---
+source: tests/m02.rs
+expression: result
+---
+Err(
+    ParseError {
+        message: "L1 only supports direct function calls (callee must be a function name)",
+        span: Span {
+            start: 24,
+            end: 27,
+            file: FileId(
+                1,
+            ),
+        },
+    },
+)

@@ -222,6 +222,7 @@ dependencies = [
 name = "rustviz"
 version = "0.1.0"
 dependencies = [
+ "indexmap",
  "insta",
 ]
 

@@ -1,0 +1,16 @@
+---
+source: tests/m02.rs
+expression: result
+---
+Err(
+    ParseError {
+        message: "`if` condition must be `bool`, found `i32`",
+        span: Span {
+            start: 27,
+            end: 28,
+            file: FileId(
+                1,
+            ),
+        },
+    },
+)

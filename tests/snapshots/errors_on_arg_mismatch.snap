@@ -1,0 +1,16 @@
+---
+source: tests/m02.rs
+expression: result
+---
+Err(
+    ParseError {
+        message: "argument 1: expected `bool`, found `i32`",
+        span: Span {
+            start: 70,
+            end: 71,
+            file: FileId(
+                1,
+            ),
+        },
+    },
+)
