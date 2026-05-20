@@ -99,3 +99,10 @@ src/
 - **Pedagogical first**: prefer readability over optimization. Comment the *why* of subtle choices.
 - **Faithfulness to `rustc` is not a goal**. If a simplification helps the visualization without misleading the reader, take it.
 - Code is in English; user-facing strings (errors, notes) can be either — decide per audience.
+
+## Active Technologies
+- N/A — deliverable is markdown documentation + `CLAUDE.md` (authoritative scope source); `specs/001-milestone-roadmap/spec.md` (this feature's spec) (001-milestone-roadmap)
+- filesystem, version-controlled in git (001-milestone-roadmap)
+
+## Recent Changes
+- 001-milestone-roadmap: Added N/A — deliverable is markdown documentation + `CLAUDE.md` (authoritative scope source); `specs/001-milestone-roadmap/spec.md` (this feature's spec)
