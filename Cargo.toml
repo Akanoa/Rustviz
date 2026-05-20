@@ -1,0 +1,16 @@
+[package]
+name = "rustviz"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Pedagogical visualizer for Rust ownership and borrowing"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+
+[dev-dependencies]
+insta = "1"
+
+[[test]]
+name = "m01"
+path = "tests/m01.rs"

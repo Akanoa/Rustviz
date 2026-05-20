@@ -1,0 +1,16 @@
+---
+source: tests/m01.rs
+expression: result
+---
+Err(
+    ParseError {
+        message: "expected binding name, found `=`",
+        span: Span {
+            start: 20,
+            end: 21,
+            file: FileId(
+                1,
+            ),
+        },
+    },
+)

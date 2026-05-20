@@ -1,0 +1,16 @@
+---
+source: tests/m01.rs
+expression: result
+---
+Err(
+    ParseError {
+        message: "expected `;`, found `}`",
+        span: Span {
+            start: 26,
+            end: 27,
+            file: FileId(
+                1,
+            ),
+        },
+    },
+)

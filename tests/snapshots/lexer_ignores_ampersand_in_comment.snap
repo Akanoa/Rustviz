@@ -1,0 +1,67 @@
+---
+source: tests/m01.rs
+expression: result
+---
+Ok(
+    Program {
+        items: [
+            Fn(
+                FnDecl {
+                    name: "main",
+                    params: [],
+                    return_ty: None,
+                    body: Block {
+                        stmts: [
+                            Let(
+                                LetStmt {
+                                    mutable: false,
+                                    name: "x",
+                                    ty: None,
+                                    init: LitInt(
+                                        5,
+                                        Span {
+                                            start: 101,
+                                            end: 102,
+                                            file: FileId(
+                                                1,
+                                            ),
+                                        },
+                                    ),
+                                    span: Span {
+                                        start: 93,
+                                        end: 103,
+                                        file: FileId(
+                                            1,
+                                        ),
+                                    },
+                                },
+                            ),
+                        ],
+                        tail: None,
+                        span: Span {
+                            start: 10,
+                            end: 105,
+                            file: FileId(
+                                1,
+                            ),
+                        },
+                    },
+                    span: Span {
+                        start: 0,
+                        end: 105,
+                        file: FileId(
+                            1,
+                        ),
+                    },
+                },
+            ),
+        ],
+        span: Span {
+            start: 0,
+            end: 105,
+            file: FileId(
+                1,
+            ),
+        },
+    },
+)

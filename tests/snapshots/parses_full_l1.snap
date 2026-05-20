@@ -1,0 +1,514 @@
+---
+source: tests/m01.rs
+expression: result
+---
+Ok(
+    Program {
+        items: [
+            Fn(
+                FnDecl {
+                    name: "add",
+                    params: [
+                        Param {
+                            name: "x",
+                            ty: Path {
+                                segments: [
+                                    "i32",
+                                ],
+                                span: Span {
+                                    start: 46,
+                                    end: 49,
+                                    file: FileId(
+                                        1,
+                                    ),
+                                },
+                            },
+                            span: Span {
+                                start: 43,
+                                end: 49,
+                                file: FileId(
+                                    1,
+                                ),
+                            },
+                        },
+                        Param {
+                            name: "y",
+                            ty: Path {
+                                segments: [
+                                    "i32",
+                                ],
+                                span: Span {
+                                    start: 54,
+                                    end: 57,
+                                    file: FileId(
+                                        1,
+                                    ),
+                                },
+                            },
+                            span: Span {
+                                start: 51,
+                                end: 57,
+                                file: FileId(
+                                    1,
+                                ),
+                            },
+                        },
+                    ],
+                    return_ty: Some(
+                        Path {
+                            segments: [
+                                "i32",
+                            ],
+                            span: Span {
+                                start: 62,
+                                end: 65,
+                                file: FileId(
+                                    1,
+                                ),
+                            },
+                        },
+                    ),
+                    body: Block {
+                        stmts: [],
+                        tail: Some(
+                            Binary {
+                                op: Add,
+                                lhs: Ident(
+                                    "x",
+                                    Span {
+                                        start: 72,
+                                        end: 73,
+                                        file: FileId(
+                                            1,
+                                        ),
+                                    },
+                                ),
+                                rhs: Ident(
+                                    "y",
+                                    Span {
+                                        start: 76,
+                                        end: 77,
+                                        file: FileId(
+                                            1,
+                                        ),
+                                    },
+                                ),
+                                span: Span {
+                                    start: 72,
+                                    end: 77,
+                                    file: FileId(
+                                        1,
+                                    ),
+                                },
+                            },
+                        ),
+                        span: Span {
+                            start: 66,
+                            end: 79,
+                            file: FileId(
+                                1,
+                            ),
+                        },
+                    },
+                    span: Span {
+                        start: 36,
+                        end: 79,
+                        file: FileId(
+                            1,
+                        ),
+                    },
+                },
+            ),
+            Fn(
+                FnDecl {
+                    name: "main",
+                    params: [],
+                    return_ty: None,
+                    body: Block {
+                        stmts: [
+                            Let(
+                                LetStmt {
+                                    mutable: true,
+                                    name: "counter",
+                                    ty: None,
+                                    init: LitInt(
+                                        0,
+                                        Span {
+                                            start: 115,
+                                            end: 116,
+                                            file: FileId(
+                                                1,
+                                            ),
+                                        },
+                                    ),
+                                    span: Span {
+                                        start: 97,
+                                        end: 117,
+                                        file: FileId(
+                                            1,
+                                        ),
+                                    },
+                                },
+                            ),
+                            Let(
+                                LetStmt {
+                                    mutable: false,
+                                    name: "v",
+                                    ty: None,
+                                    init: If {
+                                        cond: Binary {
+                                            op: Eq,
+                                            lhs: Ident(
+                                                "counter",
+                                                Span {
+                                                    start: 133,
+                                                    end: 140,
+                                                    file: FileId(
+                                                        1,
+                                                    ),
+                                                },
+                                            ),
+                                            rhs: LitInt(
+                                                0,
+                                                Span {
+                                                    start: 144,
+                                                    end: 145,
+                                                    file: FileId(
+                                                        1,
+                                                    ),
+                                                },
+                                            ),
+                                            span: Span {
+                                                start: 133,
+                                                end: 145,
+                                                file: FileId(
+                                                    1,
+                                                ),
+                                            },
+                                        },
+                                        then_block: Block {
+                                            stmts: [
+                                                Let(
+                                                    LetStmt {
+                                                        mutable: false,
+                                                        name: "t",
+                                                        ty: None,
+                                                        init: Call {
+                                                            callee: Ident(
+                                                                "add",
+                                                                Span {
+                                                                    start: 164,
+                                                                    end: 167,
+                                                                    file: FileId(
+                                                                        1,
+                                                                    ),
+                                                                },
+                                                            ),
+                                                            args: [
+                                                                LitInt(
+                                                                    2,
+                                                                    Span {
+                                                                        start: 168,
+                                                                        end: 169,
+                                                                        file: FileId(
+                                                                            1,
+                                                                        ),
+                                                                    },
+                                                                ),
+                                                                LitInt(
+                                                                    3,
+                                                                    Span {
+                                                                        start: 171,
+                                                                        end: 172,
+                                                                        file: FileId(
+                                                                            1,
+                                                                        ),
+                                                                    },
+                                                                ),
+                                                            ],
+                                                            span: Span {
+                                                                start: 164,
+                                                                end: 173,
+                                                                file: FileId(
+                                                                    1,
+                                                                ),
+                                                            },
+                                                        },
+                                                        span: Span {
+                                                            start: 156,
+                                                            end: 174,
+                                                            file: FileId(
+                                                                1,
+                                                            ),
+                                                        },
+                                                    },
+                                                ),
+                                            ],
+                                            tail: Some(
+                                                Unary {
+                                                    op: Neg,
+                                                    expr: Ident(
+                                                        "t",
+                                                        Span {
+                                                            start: 184,
+                                                            end: 185,
+                                                            file: FileId(
+                                                                1,
+                                                            ),
+                                                        },
+                                                    ),
+                                                    span: Span {
+                                                        start: 183,
+                                                        end: 185,
+                                                        file: FileId(
+                                                            1,
+                                                        ),
+                                                    },
+                                                },
+                                            ),
+                                            span: Span {
+                                                start: 146,
+                                                end: 191,
+                                                file: FileId(
+                                                    1,
+                                                ),
+                                            },
+                                        },
+                                        else_block: Some(
+                                            Block {
+                                                stmts: [],
+                                                tail: Some(
+                                                    LitInt(
+                                                        0,
+                                                        Span {
+                                                            start: 207,
+                                                            end: 208,
+                                                            file: FileId(
+                                                                1,
+                                                            ),
+                                                        },
+                                                    ),
+                                                ),
+                                                span: Span {
+                                                    start: 197,
+                                                    end: 214,
+                                                    file: FileId(
+                                                        1,
+                                                    ),
+                                                },
+                                            },
+                                        ),
+                                        span: Span {
+                                            start: 130,
+                                            end: 214,
+                                            file: FileId(
+                                                1,
+                                            ),
+                                        },
+                                    },
+                                    span: Span {
+                                        start: 122,
+                                        end: 215,
+                                        file: FileId(
+                                            1,
+                                        ),
+                                    },
+                                },
+                            ),
+                            Let(
+                                LetStmt {
+                                    mutable: false,
+                                    name: "block_val",
+                                    ty: None,
+                                    init: Block(
+                                        Block {
+                                            stmts: [],
+                                            tail: Some(
+                                                Binary {
+                                                    op: Add,
+                                                    lhs: LitInt(
+                                                        1,
+                                                        Span {
+                                                            start: 246,
+                                                            end: 247,
+                                                            file: FileId(
+                                                                1,
+                                                            ),
+                                                        },
+                                                    ),
+                                                    rhs: LitInt(
+                                                        2,
+                                                        Span {
+                                                            start: 250,
+                                                            end: 251,
+                                                            file: FileId(
+                                                                1,
+                                                            ),
+                                                        },
+                                                    ),
+                                                    span: Span {
+                                                        start: 246,
+                                                        end: 251,
+                                                        file: FileId(
+                                                            1,
+                                                        ),
+                                                    },
+                                                },
+                                            ),
+                                            span: Span {
+                                                start: 236,
+                                                end: 257,
+                                                file: FileId(
+                                                    1,
+                                                ),
+                                            },
+                                        },
+                                    ),
+                                    span: Span {
+                                        start: 220,
+                                        end: 258,
+                                        file: FileId(
+                                            1,
+                                        ),
+                                    },
+                                },
+                            ),
+                            Let(
+                                LetStmt {
+                                    mutable: false,
+                                    name: "cmp",
+                                    ty: None,
+                                    init: Binary {
+                                        op: Le,
+                                        lhs: Ident(
+                                            "block_val",
+                                            Span {
+                                                start: 273,
+                                                end: 282,
+                                                file: FileId(
+                                                    1,
+                                                ),
+                                            },
+                                        ),
+                                        rhs: Ident(
+                                            "v",
+                                            Span {
+                                                start: 286,
+                                                end: 287,
+                                                file: FileId(
+                                                    1,
+                                                ),
+                                            },
+                                        ),
+                                        span: Span {
+                                            start: 273,
+                                            end: 287,
+                                            file: FileId(
+                                                1,
+                                            ),
+                                        },
+                                    },
+                                    span: Span {
+                                        start: 263,
+                                        end: 288,
+                                        file: FileId(
+                                            1,
+                                        ),
+                                    },
+                                },
+                            ),
+                            Let(
+                                LetStmt {
+                                    mutable: false,
+                                    name: "logical",
+                                    ty: None,
+                                    init: Binary {
+                                        op: And,
+                                        lhs: Unary {
+                                            op: Not,
+                                            expr: Ident(
+                                                "cmp",
+                                                Span {
+                                                    start: 308,
+                                                    end: 311,
+                                                    file: FileId(
+                                                        1,
+                                                    ),
+                                                },
+                                            ),
+                                            span: Span {
+                                                start: 307,
+                                                end: 311,
+                                                file: FileId(
+                                                    1,
+                                                ),
+                                            },
+                                        },
+                                        rhs: LitBool(
+                                            true,
+                                            Span {
+                                                start: 315,
+                                                end: 319,
+                                                file: FileId(
+                                                    1,
+                                                ),
+                                            },
+                                        ),
+                                        span: Span {
+                                            start: 307,
+                                            end: 319,
+                                            file: FileId(
+                                                1,
+                                            ),
+                                        },
+                                    },
+                                    span: Span {
+                                        start: 293,
+                                        end: 320,
+                                        file: FileId(
+                                            1,
+                                        ),
+                                    },
+                                },
+                            ),
+                            Expr(
+                                Ident(
+                                    "logical",
+                                    Span {
+                                        start: 371,
+                                        end: 378,
+                                        file: FileId(
+                                            1,
+                                        ),
+                                    },
+                                ),
+                            ),
+                        ],
+                        tail: None,
+                        span: Span {
+                            start: 91,
+                            end: 381,
+                            file: FileId(
+                                1,
+                            ),
+                        },
+                    },
+                    span: Span {
+                        start: 81,
+                        end: 381,
+                        file: FileId(
+                            1,
+                        ),
+                    },
+                },
+            ),
+        ],
+        span: Span {
+            start: 36,
+            end: 381,
+            file: FileId(
+                1,
+            ),
+        },
+    },
+)

@@ -1,0 +1,16 @@
+---
+source: tests/m01.rs
+expression: result
+---
+Ok(
+    Program {
+        items: [],
+        span: Span {
+            start: 0,
+            end: 0,
+            file: FileId(
+                1,
+            ),
+        },
+    },
+)

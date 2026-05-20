@@ -1,0 +1,87 @@
+---
+source: tests/m01.rs
+expression: result
+---
+Ok(
+    Program {
+        items: [
+            Fn(
+                FnDecl {
+                    name: "main",
+                    params: [],
+                    return_ty: None,
+                    body: Block {
+                        stmts: [
+                            Let(
+                                LetStmt {
+                                    mutable: false,
+                                    name: "x",
+                                    ty: None,
+                                    init: Binary {
+                                        op: Add,
+                                        lhs: LitInt(
+                                            2,
+                                            Span {
+                                                start: 24,
+                                                end: 25,
+                                                file: FileId(
+                                                    1,
+                                                ),
+                                            },
+                                        ),
+                                        rhs: LitInt(
+                                            3,
+                                            Span {
+                                                start: 28,
+                                                end: 29,
+                                                file: FileId(
+                                                    1,
+                                                ),
+                                            },
+                                        ),
+                                        span: Span {
+                                            start: 24,
+                                            end: 29,
+                                            file: FileId(
+                                                1,
+                                            ),
+                                        },
+                                    },
+                                    span: Span {
+                                        start: 16,
+                                        end: 30,
+                                        file: FileId(
+                                            1,
+                                        ),
+                                    },
+                                },
+                            ),
+                        ],
+                        tail: None,
+                        span: Span {
+                            start: 10,
+                            end: 32,
+                            file: FileId(
+                                1,
+                            ),
+                        },
+                    },
+                    span: Span {
+                        start: 0,
+                        end: 32,
+                        file: FileId(
+                            1,
+                        ),
+                    },
+                },
+            ),
+        ],
+        span: Span {
+            start: 0,
+            end: 32,
+            file: FileId(
+                1,
+            ),
+        },
+    },
+)

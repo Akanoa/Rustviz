@@ -1,0 +1,11 @@
+/target
+*.rs.bk
+*.rlib
+*.prof*
+.idea/
+.vscode/
+*.log
+.env*
+
+# Unreviewed insta snapshots — don't commit until reviewed.
+tests/snapshots/*.snap.new
