@@ -1,0 +1,19 @@
+[build]
+target = "index.html"
+dist = "dist"
+
+[serve]
+addresses = ["127.0.0.1"]
+port = 8080
+
+# The pre-build hook writes web/traces/*.json — without this, trunk's file
+# watcher sees the write and triggers an immediate rebuild, ad infinitum.
+# Also ignore the dist/ output directory.
+[watch]
+ignore = ["traces", "dist"]
+
+# Regenerate traces before each build so editing a sample reflects after reload.
+[[hooks]]
+stage = "pre_build"
+command = "cargo"
+command_arguments = ["run", "--release", "--bin", "gen_traces"]

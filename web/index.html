@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=1024" />
+    <title>rustviz</title>
+    <!-- Import map FIRST so it's parsed before any `<script type="module">`.
+         Trunk's `<link rel="rust">` becomes such a script — the importmap
+         must be in place before that script starts loading.
+
+         Each CodeMirror sub-package URL uses `?external=` so esm.sh emits
+         bare specifiers (like `import "@codemirror/state"`) for shared deps.
+         The map resolves every bare specifier to one canonical URL so all
+         packages share the same @codemirror/state + @codemirror/view
+         instances — otherwise instanceof checks fail across modules. -->
+    <script type="importmap">
+    {
+      "imports": {
+        "@codemirror/state": "https://esm.sh/@codemirror/state@6",
+        "@codemirror/view": "https://esm.sh/@codemirror/view@6?external=@codemirror/state",
+        "@codemirror/language": "https://esm.sh/@codemirror/language@6?external=@codemirror/state,@codemirror/view",
+        "@codemirror/lang-rust": "https://esm.sh/@codemirror/lang-rust@6?external=@codemirror/state,@codemirror/view,@codemirror/language"
+      }
+    }
+    </script>
+    <link data-trunk rel="css" href="style.css" />
+    <link data-trunk rel="rust" href="../Cargo.toml" data-target-name="rustviz" data-type="main" />
+    <!-- Trunk doesn't process plain `<script>` tags. Tell it to copy index.js
+         to dist/ so the browser fetches it with the right MIME type. -->
+    <link data-trunk rel="copy-file" href="index.js" />
+    <!-- Copy the generated trace JSONs so `/traces/<name>.json` resolves. -->
+    <link data-trunk rel="copy-dir" href="traces" />
+  </head>
+  <body>
+    <header>
+      <h1>rustviz</h1>
+      <label for="sample-selector">Sample:</label>
+      <select id="sample-selector">
+        <option value="m03_arithmetic">Arithmetic</option>
+        <option value="m03_fn_call">Function Call</option>
+        <option value="m03_shadow">Shadowing</option>
+        <option value="m03_div_by_zero">Division by Zero</option>
+      </select>
+    </header>
+
+    <main>
+      <section id="editor" aria-label="source code"></section>
+      <section id="stacks" aria-label="stacks panel"></section>
+      <section id="heap" aria-label="heap panel">
+        <p class="placeholder">Heap (Level 3+)</p>
+      </section>
+    </main>
+
+    <div id="status" hidden></div>
+
+    <footer id="toolbar">
+      <button id="btn-rewind" type="button" aria-label="rewind">⏮ Rewind</button>
+      <button id="btn-step-back" type="button" aria-label="step back">◀ Step Back</button>
+      <button id="btn-play-pause" type="button" data-state="paused" aria-label="play">▶ Play</button>
+      <button id="btn-step-forward" type="button" aria-label="step forward">Step Forward ▶</button>
+      <span id="step-indicator">0 / 0</span>
+    </footer>
+
+    <noscript>rustviz requires JavaScript to be enabled.</noscript>
+
+    <script type="module" src="index.js"></script>
+  </body>
+</html>

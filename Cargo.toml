@@ -6,8 +6,16 @@ rust-version = "1.85"
 description = "Pedagogical visualizer for Rust ownership and borrowing"
 license = "MIT OR Apache-2.0"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 indexmap = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+console_error_panic_hook = "0.1"
 
 [dev-dependencies]
 insta = "1"
@@ -23,3 +31,7 @@ path = "tests/m02.rs"
 [[test]]
 name = "m03"
 path = "tests/m03.rs"
+
+[[bin]]
+name = "gen_traces"
+path = "src/bin/gen_traces.rs"

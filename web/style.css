@@ -1,0 +1,202 @@
+/* M04 — minimal layout. Three columns (editor / stacks / heap), header, status,
+   toolbar at the bottom. Light mode only. */
+
+:root {
+  --border: #d0d0d0;
+  --header-bg: #f5f5f5;
+  --text: #222;
+  --muted: #888;
+  --accent: #4a6fa5;
+  --error: #b00020;
+  --info: #2a6f97;
+  --slot-bg: #fafafa;
+  --frame-bg: #ffffff;
+  --frame-border: #c0c0d0;
+  --highlight: #ffe680;
+  --button-bg: #ffffff;
+  --button-hover: #eef2f7;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+  color: var(--text);
+  background: #fff;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.5rem 1rem;
+  background: var(--header-bg);
+  border-bottom: 1px solid var(--border);
+}
+
+header h1 {
+  font-size: 1.1rem;
+  font-weight: 600;
+  margin: 0;
+  margin-right: auto;
+}
+
+header label {
+  font-size: 0.9rem;
+  color: var(--muted);
+}
+
+header select {
+  font: inherit;
+  padding: 0.25rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: white;
+}
+
+main {
+  display: flex;
+  height: calc(100vh - 96px); /* header ~48px + status (auto) + toolbar ~48px */
+  border-bottom: 1px solid var(--border);
+}
+
+main > section {
+  flex: 1;
+  min-width: 0;
+  overflow: auto;
+  border-right: 1px solid var(--border);
+}
+
+main > section:last-child {
+  border-right: none;
+}
+
+#editor {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-size: 13px;
+}
+
+#editor .cm-editor {
+  height: 100%;
+}
+
+#editor .cm-current-span {
+  background: var(--highlight);
+  border-radius: 2px;
+}
+
+#stacks {
+  padding: 0.5rem;
+  display: flex;
+  flex-direction: column-reverse; /* innermost frame visually on top */
+  gap: 0.5rem;
+}
+
+#heap {
+  padding: 1rem;
+  color: var(--muted);
+}
+
+#heap .placeholder {
+  margin: 0;
+  font-style: italic;
+}
+
+.frame-card {
+  background: var(--frame-bg);
+  border: 1px solid var(--frame-border);
+  border-radius: 4px;
+  padding: 0.4rem 0.6rem;
+}
+
+.frame-card .frame-name {
+  font-weight: 600;
+  font-size: 0.85rem;
+  color: var(--accent);
+  margin-bottom: 0.25rem;
+}
+
+.frame-card .slots {
+  display: grid;
+  grid-template-columns: auto auto 1fr;
+  gap: 0.15rem 0.6rem;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-size: 12px;
+}
+
+.slot-row {
+  display: contents;
+}
+
+.slot-row .slot-name {
+  font-weight: 600;
+}
+
+.slot-row .slot-ty {
+  color: var(--muted);
+}
+
+.slot-row .slot-value {
+  color: var(--text);
+}
+
+.slot-row .slot-value.slot-pending::before {
+  content: "?";
+  color: var(--muted);
+  font-style: italic;
+}
+
+#status {
+  padding: 0.5rem 1rem;
+  border-top: 1px solid var(--border);
+  font-size: 0.9rem;
+}
+
+#status.status-error {
+  background: #fff0f3;
+  color: var(--error);
+  font-weight: 600;
+}
+
+#status.status-info {
+  background: #f0f7fa;
+  color: var(--info);
+}
+
+footer#toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 1rem;
+  background: var(--header-bg);
+  border-top: 1px solid var(--border);
+}
+
+footer#toolbar button {
+  font: inherit;
+  padding: 0.3rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--button-bg);
+  cursor: pointer;
+}
+
+footer#toolbar button:hover {
+  background: var(--button-hover);
+}
+
+footer#toolbar button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+#step-indicator {
+  margin-left: auto;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}

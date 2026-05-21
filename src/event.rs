@@ -13,25 +13,25 @@ use crate::typeck::Ty;
 /// Allocated sequentially during evaluation. Distinct from [`crate::resolve::BindingId`]:
 /// `BindingId` is static (one per declaration site), `SlotId` is dynamic (one per
 /// runtime instance — recursive calls produce fresh `SlotId`s for the same `BindingId`).
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct SlotId(pub u32);
 
 /// Unique, stable identifier for a stack frame instance (one per function call).
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct FrameId(pub u32);
 
 /// Forward-compatibility placeholder for heap addresses. Used only by M07+ heap events.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct HeapAddr(pub u32);
 
 /// Forward-compatibility placeholder for borrow identifiers. Used only by M06+ borrow events.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct BorrowId(pub u32);
 
 /// Where a pointer points — into the stack or onto the heap.
 ///
 /// Per CLAUDE.md › Event model: "Pointee is an enum `Slot(SlotId) | Heap(HeapAddr)`".
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Pointee {
     /// Points at a stack slot.
     Slot(SlotId),
@@ -42,7 +42,7 @@ pub enum Pointee {
 /// A runtime value held in a stack slot.
 ///
 /// M03 covers the L1 value lattice; M07 will add heap-allocated variants.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Value {
     /// 32-bit signed integer. Stored as `i64` internally to detect overflow at op time.
     Int(i64),
@@ -64,7 +64,7 @@ impl Value {
 }
 
 /// Classification of a [`MemEvent::Note`] event.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum NoteKind {
     /// Runtime error — integer overflow, division by zero, recursion depth exceeded.
     /// When emitted, the event stream ends after this note.
@@ -78,7 +78,7 @@ pub enum NoteKind {
 /// **Closed enum** from M03 onward — adding new variants is a breaking change.
 /// Later milestones (M06 borrows, M07 heap, M08 threads) fill in payloads on
 /// existing variants rather than adding new ones. See `contracts/m03-api.md`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum MemEvent {
     // ─── Threads (M08) ──────────────────────────────────────────────────────
     /// A new thread was spawned.

@@ -10,7 +10,7 @@ use crate::resolve::{BindingId, BindingKind, Resolution};
 
 /// L1 value types. Three primitives — function signatures live in [`FnSig`],
 /// not here, because functions are not first-class values in L1.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Ty {
     /// 32-bit signed integer.
     I32,

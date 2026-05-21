@@ -10,6 +10,7 @@ pub mod event;
 pub mod parse;
 pub mod resolve;
 pub mod typeck;
+pub mod ui;
 
 pub use eval::evaluate;
 pub use event::{BorrowId, FrameId, HeapAddr, MemEvent, NoteKind, Pointee, SlotId, Value};
@@ -19,3 +20,4 @@ pub use parse::parse;
 pub use parse::span::{FileId, SourceMap, Span};
 pub use resolve::{resolve, BindingDecl, BindingId, BindingKind, Resolution};
 pub use typeck::{typeck, BindingType, FnSig, Ty, TypeMap};
+pub use ui::{Cursor, FrameCardView, SlotRowView, StateSnapshot, StatusView};

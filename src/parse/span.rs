@@ -9,11 +9,11 @@ use std::collections::BTreeMap;
 ///
 /// Allocated by [`SourceMap::add`]. `FileId(0)` is reserved as a sentinel for
 /// "no file" and is never returned by `add`.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct FileId(pub u32);
 
 /// A half-open byte range `[start, end)` into a source file.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Span {
     /// Inclusive start byte offset.
     pub start: u32,
