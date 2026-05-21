@@ -14,9 +14,10 @@
 // that we don't need for read-only display and that complicate the import map.
 // A minimal assembly of `lineNumbers` + `rust` + `syntaxHighlighting` is enough.
 import { EditorState, StateEffect, StateField } from "@codemirror/state";
-import { EditorView, Decoration, lineNumbers } from "@codemirror/view";
+import { EditorView, Decoration, lineNumbers, keymap } from "@codemirror/view";
 import { syntaxHighlighting, defaultHighlightStyle } from "@codemirror/language";
 import { rust } from "@codemirror/lang-rust";
+import { indentWithTab } from "@codemirror/commands";
 
 // Trunk's `<link data-trunk rel="rust" data-type="main">` auto-injects a
 // script that runs the WASM init, then dispatches a `TrunkApplicationStarted`
@@ -83,11 +84,39 @@ const currentFnField = StateField.define({
   provide: (f) => EditorView.decorations.from(f),
 });
 
+// M05 / US2: red wavy underline at a compile-error span. Cleared on success.
+const setError = StateEffect.define(); // payload: { start, end } | null
+const errorField = StateField.define({
+  create: () => Decoration.none,
+  update(deco, tr) {
+    deco = deco.map(tr.changes);
+    for (const e of tr.effects) {
+      if (e.is(setError)) {
+        if (e.value === null) {
+          deco = Decoration.none;
+        } else {
+          const { start, end } = e.value;
+          // CodeMirror requires from < to; clamp degenerate spans to a 1-char range.
+          const safeEnd = end > start ? end : start + 1;
+          deco = Decoration.set([
+            Decoration.mark({ class: "cm-error-span" }).range(start, safeEnd),
+          ]);
+        }
+      }
+    }
+    return deco;
+  },
+  provide: (f) => EditorView.decorations.from(f),
+});
+
 // ─── State + globals ──────────────────────────────────────────────────────
 
 let editorView = null;
 let player = null;
 let playInterval = null;
+let debounceTimer = null;
+
+const DEBOUNCE_MS = 300;
 
 // ─── DOM helpers ──────────────────────────────────────────────────────────
 
@@ -102,13 +131,6 @@ function el(tag, attrs = {}, ...children) {
     if (c != null) node.appendChild(c);
   }
   return node;
-}
-
-function setEditorSource(source) {
-  editorView.dispatch({
-    changes: { from: 0, to: editorView.state.doc.length, insert: source },
-    effects: [setHighlight.of(null), setCurrentFn.of(null)],
-  });
 }
 
 // ─── render(state) — apply a StateSnapshot to the DOM ─────────────────────
@@ -192,18 +214,80 @@ function render(state) {
 
   // Step indicator.
   document.getElementById("step-indicator").textContent = `${state.position} / ${state.total}`;
+
+  // M05 / US2: success path — clear any error underline + re-enable controls.
+  editorView.dispatch({ effects: setError.of(null) });
+  setControlsEnabled(true);
 }
 
-// ─── Sample loading ───────────────────────────────────────────────────────
+// M05 / US2: render a compile error. Underline the span, show the message
+// in the status bar, disable playback controls.
+function renderError(error) {
+  // Editor underline at the error span.
+  editorView.dispatch({ effects: setError.of({ start: error.span.start, end: error.span.end }) });
 
+  // Status bar: prefix with the stage so the user sees "Parse error: ...".
+  const statusEl = document.getElementById("status");
+  statusEl.hidden = false;
+  statusEl.className = "status-error";
+  statusEl.textContent = `${error.stage} error: ${error.message}`;
+
+  // Frames panel is empty (set_source replaced cursor with empty trace).
+  document.getElementById("stacks").replaceChildren();
+  document.getElementById("step-indicator").textContent = "0 / 0";
+
+  // Editor decorations from prior successful runs no longer apply.
+  editorView.dispatch({
+    effects: [setHighlight.of(null), setCurrentFn.of(null)],
+  });
+
+  setControlsEnabled(false);
+}
+
+// M05 / US2: toggle Play / Step Forward / Step Back disabled state. Rewind
+// stays always enabled because rewinding an empty trace is a meaningful
+// no-op.
+function setControlsEnabled(enabled) {
+  for (const id of ["btn-play-pause", "btn-step-back", "btn-step-forward"]) {
+    document.getElementById(id).disabled = !enabled;
+  }
+}
+
+// ─── M05: live pipeline + sample loading ──────────────────────────────────
+
+// US1: replace the editor source. The editor's updateListener (set up in
+// `main`) sees the doc change and debounce-fires `recompile`.
+function setEditorSource(source) {
+  editorView.dispatch({
+    changes: { from: 0, to: editorView.state.doc.length, insert: source },
+    effects: [
+      setHighlight.of(null),
+      setCurrentFn.of(null),
+      setError.of(null),
+    ],
+  });
+}
+
+// US1: re-run the M01→M02→M03 pipeline on the current editor content and
+// render the result. Called by the debounced updateListener.
+function recompile(source) {
+  stopPlay();
+  const result = JSON.parse(player.set_source(source));
+  if (result.ok) {
+    render(result.state);
+  } else {
+    renderError(result.error);
+  }
+}
+
+// US1: load a sample's source from /samples/<id>.rs into the editor. The
+// updateListener picks up the doc change and triggers recompile.
 async function loadSample(id) {
   stopPlay();
-  const res = await fetch(`/traces/${id}.json`);
-  if (!res.ok) throw new Error(`fetch /traces/${id}.json → ${res.status}`);
-  const traceText = await res.text();
-  player = new Player(traceText);
-  setEditorSource(player.source());
-  render(JSON.parse(player.state()));
+  const res = await fetch(`/samples/${id}.rs`);
+  if (!res.ok) throw new Error(`fetch /samples/${id}.rs → ${res.status}`);
+  const source = await res.text();
+  setEditorSource(source);
 }
 
 // ─── Controls ─────────────────────────────────────────────────────────────
@@ -267,6 +351,16 @@ function wireControls() {
 async function main() {
   Player = window.wasmBindings.Player;
 
+  // M05 / US1: debounce editor edits → recompile. The updateListener fires
+  // on every doc change; we coalesce keystrokes via setTimeout/clearTimeout.
+  const updateListener = EditorView.updateListener.of((update) => {
+    if (!update.docChanged) return;
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => {
+      recompile(update.state.doc.toString());
+    }, DEBOUNCE_MS);
+  });
+
   editorView = new EditorView({
     parent: document.getElementById("editor"),
     state: EditorState.create({
@@ -275,13 +369,21 @@ async function main() {
         rust(),
         lineNumbers(),
         syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
-        EditorState.readOnly.of(true),
-        EditorView.editable.of(false),
+        // M05: editor is editable. Tab inserts indentation instead of
+        // navigating to the next focusable element.
+        keymap.of([indentWithTab]),
+        updateListener,
         highlightField,
         currentFnField,
+        errorField,
       ],
     }),
   });
+
+  // M05 / US1: Player created with empty source first; loadSample writes the
+  // initial sample into the editor, the updateListener picks up the change,
+  // and the debounce-fired recompile() runs the pipeline.
+  player = new Player("");
 
   wireControls();
 

@@ -90,6 +90,14 @@ main > section:last-child {
   border-radius: 2px;
 }
 
+/* M05 / US2: red wavy underline at a compile-error span. Lives at a
+   different visual layer than `.cm-current-span` (background) and
+   `.cm-current-fn` (border) so they compose cleanly. */
+#editor .cm-error-span {
+  text-decoration: red wavy underline;
+  text-decoration-thickness: 1px;
+}
+
 /* M03.1: red border around the currently-executing function's body span.
    Paired with the red `.frame-current` styling in the stacks panel so the
    learner sees the call site/active function highlighted consistently across

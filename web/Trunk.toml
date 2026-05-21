@@ -6,14 +6,11 @@ dist = "dist"
 addresses = ["127.0.0.1"]
 port = 8080
 
-# The pre-build hook writes web/traces/*.json — without this, trunk's file
-# watcher sees the write and triggers an immediate rebuild, ad infinitum.
-# Also ignore the dist/ output directory.
+# M05: the gen_traces pre-build hook is gone — the page now compiles source
+# live in-browser via Player::set_source. The `gen_traces` binary still
+# exists for CLI offline pipeline verification (`cargo run --bin gen_traces`).
+#
+# The watcher still ignores `traces/` (now-unused, gitignored) and `dist/`
+# (trunk's output dir) so trunk doesn't loop on its own writes.
 [watch]
 ignore = ["traces", "dist"]
-
-# Regenerate traces before each build so editing a sample reflects after reload.
-[[hooks]]
-stage = "pre_build"
-command = "cargo"
-command_arguments = ["run", "--release", "--bin", "gen_traces"]

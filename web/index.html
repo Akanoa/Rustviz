@@ -19,7 +19,8 @@
         "@codemirror/state": "https://esm.sh/@codemirror/state@6",
         "@codemirror/view": "https://esm.sh/@codemirror/view@6?external=@codemirror/state",
         "@codemirror/language": "https://esm.sh/@codemirror/language@6?external=@codemirror/state,@codemirror/view",
-        "@codemirror/lang-rust": "https://esm.sh/@codemirror/lang-rust@6?external=@codemirror/state,@codemirror/view,@codemirror/language"
+        "@codemirror/lang-rust": "https://esm.sh/@codemirror/lang-rust@6?external=@codemirror/state,@codemirror/view,@codemirror/language",
+        "@codemirror/commands": "https://esm.sh/@codemirror/commands@6?external=@codemirror/state,@codemirror/view,@codemirror/language"
       }
     }
     </script>
@@ -28,8 +29,9 @@
     <!-- Trunk doesn't process plain `<script>` tags. Tell it to copy index.js
          to dist/ so the browser fetches it with the right MIME type. -->
     <link data-trunk rel="copy-file" href="index.js" />
-    <!-- Copy the generated trace JSONs so `/traces/<name>.json` resolves. -->
-    <link data-trunk rel="copy-dir" href="traces" />
+    <!-- M05: serve the `.rs` sample sources so `/samples/<id>.rs` resolves.
+         Replaces the M04 `traces` copy-dir (no more pre-recorded JSON). -->
+    <link data-trunk rel="copy-dir" href="samples" />
   </head>
   <body>
     <header>
@@ -41,6 +43,10 @@
         <option value="m03_fn_call_twice">Function Call (Twice)</option>
         <option value="m03_shadow">Shadowing</option>
         <option value="m03_div_by_zero">Division by Zero</option>
+        <option value="m05_minimal">Minimal (M05)</option>
+        <option value="m05_let_chain">Let chain (M05)</option>
+        <option value="m05_double">Double fn (M05)</option>
+        <option value="m05_broken_parse">Broken parse (M05)</option>
       </select>
     </header>
 

@@ -16,7 +16,7 @@ use std::process::ExitCode;
 
 use serde_json::json;
 
-use rustviz::{evaluate, parse, resolve, typeck, SourceMap};
+use rustviz::run_pipeline;
 
 /// Samples to process. Each name `X` is read from `web/samples/X.rs` and
 /// written to `web/traces/X.json`.
@@ -72,17 +72,11 @@ fn process_one(
     let source = fs::read_to_string(&source_path)
         .map_err(|e| format!("read {source_path:?}: {e}"))?;
 
-    let mut sm = SourceMap::new();
-    let file = sm.add(format!("{sample}.rs"), source.clone());
-
-    let program = parse(file, &sm)
-        .map_err(|e| format!("parse error: {} (at {:?})", e.message, e.span))?;
-    let resolution = resolve(&program)
-        .map_err(|e| format!("resolve error: {} (at {:?})", e.message, e.span))?;
-    let types = typeck(&program, &resolution)
-        .map_err(|e| format!("typeck error: {} (at {:?})", e.message, e.span))?;
-    let events = evaluate(&program, &resolution, &types)
-        .map_err(|e| format!("evaluate error: {} (at {:?})", e.message, e.span))?;
+    // M05: use the consolidated pipeline runner. Same four stages as before,
+    // wrapped in a single error type that carries the failing stage label.
+    let events = run_pipeline(&source).map_err(|e| {
+        format!("{:?} error: {} (at {:?})", e.stage, e.message, e.span)
+    })?;
 
     let event_count = events.len();
     let doc = json!({

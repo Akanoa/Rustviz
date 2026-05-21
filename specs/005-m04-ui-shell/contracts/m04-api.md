@@ -2,6 +2,8 @@
 
 Two distinct contracts: the **wasm-bindgen `Player` API** (the WASM↔JS boundary) and the **trace JSON schema** (the file `gen_traces` writes and `Player::new` reads).
 
+> **M05 amendment** (`specs/007-live-l1-editing/`): the `Player::new` signature is changed from `new(trace_json: &str) -> Result<Player, JsValue>` to `new(source: &str) -> Player` (infallible — takes Rust source, not pre-recorded trace JSON, and exists in error state when the source fails to compile). A new method `set_source(&mut self, source: &str) -> String` is added. This is a **breaking signature change** to a previously-shipped method, permitted by relaxing M04's "additive only" rule in the same spirit M03.1 relaxed M03's closed-`MemEvent` rule. Future revision milestones can change `Player` methods with maintainer consent + coordinated update of all JS consumers. See `specs/007-live-l1-editing/contracts/m05-api.md` for the full M05 contract delta.
+
 ## Player API (wasm-bindgen)
 
 ```rust

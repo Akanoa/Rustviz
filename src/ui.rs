@@ -410,31 +410,85 @@ mod wasm {
     use super::*;
     use wasm_bindgen::prelude::*;
 
-    /// Trace file shape — `gen_traces` writes this, `Player::new` reads it.
-    #[derive(Deserialize)]
-    struct TraceFile {
-        source: String,
-        events: Vec<MemEvent>,
-    }
-
-    /// Browser-facing player. Wraps a `Cursor` + the sample's source code.
+    /// **M05**: Browser-facing player. Owns a `Cursor` + the current editor
+    /// source + the most recent `CompileError` if compilation failed.
     #[wasm_bindgen]
     pub struct Player {
         cursor: Cursor,
         source: String,
+        last_error: Option<crate::pipeline::CompileError>,
+    }
+
+    /// Serialized form of a successful `set_source` call.
+    #[derive(Serialize)]
+    struct SetSourceOk<'a> {
+        ok: bool, // always true
+        state: &'a StateSnapshot,
+    }
+
+    /// Serialized form of a failed `set_source` call.
+    #[derive(Serialize)]
+    struct SetSourceErr<'a> {
+        ok: bool, // always false
+        error: &'a crate::pipeline::CompileError,
     }
 
     #[wasm_bindgen]
     impl Player {
-        /// Parse a trace JSON document and create a player at position 0.
+        /// **M05**: takes Rust source (not a trace JSON document).
+        /// Infallible — on parse/resolve/typeck/eval error, the Player is
+        /// created with an empty cursor and a recorded `last_error`.
+        ///
+        /// Replaces the M04 signature `new(trace_json: &str) -> Result<Player, JsValue>`.
+        /// See `specs/007-live-l1-editing/contracts/m05-api.md`.
         #[wasm_bindgen(constructor)]
-        pub fn new(trace_json: &str) -> Result<Player, JsValue> {
-            let file: TraceFile = serde_json::from_str(trace_json)
-                .map_err(|e| JsValue::from_str(&format!("trace parse error: {e}")))?;
-            Ok(Player {
-                cursor: Cursor::new(file.events),
-                source: file.source,
-            })
+        pub fn new(source: &str) -> Player {
+            let mut player = Player {
+                cursor: Cursor::new(Vec::new()),
+                source: String::new(),
+                last_error: None,
+            };
+            // Discard the returned JSON; constructor exists for the side effect
+            // of compiling-and-loading. JS can call `state()` / `error_json()`
+            // separately if it needs the initial result.
+            let _ = player.set_source(source);
+            player
+        }
+
+        /// **M05**: compile + load fresh source. Returns JSON of shape:
+        ///   `{ "ok": true,  "state": <StateSnapshot> }`        on success
+        ///   `{ "ok": false, "error": <CompileError> }`         on failure
+        ///
+        /// On success: cursor is replaced with a fresh `Cursor::new(events)`
+        /// at position 0; `self.source` is updated; `self.last_error = None`.
+        ///
+        /// On failure: cursor is replaced with an empty `Cursor::new(vec![])`;
+        /// `self.source` is still updated (so `source()` reflects what the
+        /// user typed); `self.last_error = Some(err)`.
+        pub fn set_source(&mut self, source: &str) -> String {
+            self.source = source.to_owned();
+            match crate::pipeline::run_pipeline(source) {
+                Ok(events) => {
+                    self.cursor = Cursor::new(events);
+                    self.last_error = None;
+                    let snapshot = self.cursor.state_snapshot(&self.source);
+                    serde_json::to_string(&SetSourceOk {
+                        ok: true,
+                        state: &snapshot,
+                    })
+                    .expect("SetSourceOk is always Serialize")
+                }
+                Err(err) => {
+                    self.cursor = Cursor::new(Vec::new());
+                    let json = serde_json::to_string(&SetSourceErr {
+                        ok: false,
+                        error: &err,
+                    })
+                    .expect("SetSourceErr is always Serialize");
+                    self.last_error = Some(err);
+                    json
+                }
+            }
         }
 
         /// Current state snapshot as JSON.
@@ -443,7 +497,7 @@ mod wasm {
                 .expect("StateSnapshot is always Serialize")
         }
 
-        /// The sample's Rust source code.
+        /// The current editor source code.
         pub fn source(&self) -> String {
             self.source.clone()
         }
