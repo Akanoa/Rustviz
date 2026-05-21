@@ -9,7 +9,6 @@ Ok(
                 0,
             ),
             fn_name: "main",
-            params: [],
             span: Span {
                 start: 45,
                 end: 81,
@@ -23,26 +22,6 @@ Ok(
                 1,
             ),
             fn_name: "add",
-            params: [
-                (
-                    SlotId(
-                        0,
-                    ),
-                    "a",
-                    Int(
-                        2,
-                    ),
-                ),
-                (
-                    SlotId(
-                        1,
-                    ),
-                    "b",
-                    Int(
-                        3,
-                    ),
-                ),
-            ],
             span: Span {
                 start: 0,
                 end: 43,
@@ -109,25 +88,16 @@ Ok(
                 ),
             },
         },
-        SlotDrop {
-            slot_id: SlotId(
+        ReturnValue {
+            frame_id: FrameId(
                 1,
             ),
-            span: Span {
-                start: 15,
-                end: 21,
-                file: FileId(
-                    1,
-                ),
-            },
-        },
-        SlotDrop {
-            slot_id: SlotId(
-                0,
+            value: Int(
+                5,
             ),
             span: Span {
-                start: 7,
-                end: 13,
+                start: 36,
+                end: 41,
                 file: FileId(
                     1,
                 ),
@@ -177,13 +147,14 @@ Ok(
                 ),
             },
         },
-        SlotDrop {
-            slot_id: SlotId(
-                2,
+        ReturnValue {
+            frame_id: FrameId(
+                0,
             ),
+            value: Unit,
             span: Span {
-                start: 61,
-                end: 79,
+                start: 55,
+                end: 81,
                 file: FileId(
                     1,
                 ),

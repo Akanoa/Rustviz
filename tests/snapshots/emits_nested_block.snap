@@ -9,7 +9,6 @@ Ok(
                 0,
             ),
             fn_name: "main",
-            params: [],
             span: Span {
                 start: 0,
                 end: 60,
@@ -38,18 +37,6 @@ Ok(
             ),
             value: Int(
                 1,
-            ),
-            span: Span {
-                start: 26,
-                end: 36,
-                file: FileId(
-                    1,
-                ),
-            },
-        },
-        SlotDrop {
-            slot_id: SlotId(
-                0,
             ),
             span: Span {
                 start: 26,
@@ -88,13 +75,14 @@ Ok(
                 ),
             },
         },
-        SlotDrop {
-            slot_id: SlotId(
-                1,
+        ReturnValue {
+            frame_id: FrameId(
+                0,
             ),
+            value: Unit,
             span: Span {
-                start: 48,
-                end: 58,
+                start: 10,
+                end: 60,
                 file: FileId(
                     1,
                 ),

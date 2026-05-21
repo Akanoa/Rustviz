@@ -29,6 +29,20 @@ impl Ty {
             Self::Unit => "()",
         }
     }
+
+    /// Whether values of this type are `Copy` (no destructor, bytes physically
+    /// persist on the stack until storage is reused).
+    ///
+    /// L1's lattice (`I32`, `Bool`, `Unit`) is entirely Copy. M07+ will add
+    /// non-Copy heap-allocated variants (e.g. `Box`, `Vec`, `String`) that
+    /// return `false`. The exhaustive `match` below ensures any new variant
+    /// forces a deliberate classification — there is intentionally no `_`
+    /// catch-all.
+    pub fn is_copy(self) -> bool {
+        match self {
+            Self::I32 | Self::Bool | Self::Unit => true,
+        }
+    }
 }
 
 /// Function signature: parameter types and return type.

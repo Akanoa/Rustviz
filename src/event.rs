@@ -105,16 +105,19 @@ pub enum MemEvent {
         span: Span,
     },
 
-    // ─── Frames (M03) ───────────────────────────────────────────────────────
+    // ─── Frames (M03 + M03.1) ───────────────────────────────────────────────
     /// A function call began. A new stack frame opens.
+    ///
+    /// **M03.1**: the `params` field (originally `Vec<(SlotId, String, Value)>`)
+    /// was removed in the M03.1 revision. The same information is now solely
+    /// conveyed by the per-param `SlotAlloc` + `SlotWrite` events that fire
+    /// immediately after this `FrameEnter`. See `specs/006-m03-1-protocol-revision/`.
     FrameEnter {
         /// Identifier of the new frame.
         frame_id: FrameId,
         /// Function name being called.
         fn_name: String,
-        /// Parameter slots in declaration order — `(slot_id, name, value)`.
-        params: Vec<(SlotId, String, Value)>,
-        /// Source location of the function declaration's body span.
+        /// Source location of the function declaration.
         span: Span,
     },
     /// A function call returned. The frame closes.
@@ -124,6 +127,22 @@ pub enum MemEvent {
         /// Value returned by the function (or `Value::Unit` for implicit unit return).
         return_value: Value,
         /// Source location at end of the function body.
+        span: Span,
+    },
+    /// **M03.1**: A function's body has finished evaluating and its return
+    /// value is visible. Always emitted immediately before the matching
+    /// `FrameLeave` for non-halted frames; never emitted for frames that
+    /// halt on a `Note { kind: RuntimeError }`.
+    ///
+    /// Pedagogically: the value is "in transit" between callee body and
+    /// caller frame — it lives in a return register / caller-provided slot
+    /// at the ABI level. This event makes that step visible for one tick.
+    ReturnValue {
+        /// Identifier of the frame returning (matches a prior `FrameEnter.frame_id`).
+        frame_id: FrameId,
+        /// The value being returned. Mirrors the subsequent `FrameLeave.return_value`.
+        value: Value,
+        /// Source location — body tail expression's span, or body block's span if no tail.
         span: Span,
     },
 

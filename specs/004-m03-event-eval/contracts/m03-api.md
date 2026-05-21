@@ -69,6 +69,10 @@ pub mod event;  // exposed for `rustviz::event::MemEvent` pattern matching
 
 ## Stability rules
 
-- The `MemEvent` enum is **closed** from M03 onward — adding new variants is breaking. Adding fields to existing variants is breaking. Modifying payload field types is breaking.
+- The `MemEvent` enum's variant set is stable from M03 onward. **Revision milestones** (e.g. `M03.1`, future `M0X.N` patterns) may:
+  - Add **new variants** with explicit maintainer consent + coordinated update of all consumers (M04+).
+  - **Remove redundant fields** from existing variants when the same information is reachable via other events in the stream.
+  Removing or renaming existing variants remains a breaking change requiring full re-coordination. Modifying payload field semantics (without removal) is breaking.
+- **M03.1 is the first invocation of this revised rule** (see `specs/006-m03-1-protocol-revision/contracts/m03-1-protocol-delta.md`): it adds `MemEvent::ReturnValue` and removes the redundant `FrameEnter.params` field.
 - Payload value-types that ARE marked "stable for M03 variants" (e.g. `Value`, `NoteKind`) can grow additively.
 - Behavioral changes (different event emission order for the same input) are breaking and require coordination with M04.

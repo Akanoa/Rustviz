@@ -23,6 +23,7 @@ use rustviz::{evaluate, parse, resolve, typeck, SourceMap};
 const SAMPLES: &[&str] = &[
     "m03_arithmetic",
     "m03_fn_call",
+    "m03_fn_call_twice",
     "m03_shadow",
     "m03_div_by_zero",
 ];

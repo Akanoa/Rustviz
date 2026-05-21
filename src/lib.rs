@@ -20,4 +20,4 @@ pub use parse::parse;
 pub use parse::span::{FileId, SourceMap, Span};
 pub use resolve::{resolve, BindingDecl, BindingId, BindingKind, Resolution};
 pub use typeck::{typeck, BindingType, FnSig, Ty, TypeMap};
-pub use ui::{Cursor, FrameCardView, SlotRowView, StateSnapshot, StatusView};
+pub use ui::{Cursor, FrameCardView, PendingReturnView, SlotRowView, StateSnapshot, StatusView};

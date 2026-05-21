@@ -33,6 +33,10 @@ pub struct StateSnapshot {
     pub editor_highlight: Option<Span>,
     /// Status message (runtime error or info note).
     pub status: Option<StatusView>,
+    /// **M03.1**: present when the most recent event is a `MemEvent::ReturnValue`.
+    /// The JS renderer decorates the matching frame card with a transient
+    /// return-value annotation. `None` on any other event.
+    pub pending_return: Option<PendingReturnView>,
     /// Cursor position (mirrors `Cursor::position`).
     pub position: usize,
     /// Total events in the trace.
@@ -48,6 +52,20 @@ pub struct FrameCardView {
     pub fn_name: String,
     /// Active slots in declaration order.
     pub slots: Vec<SlotRowView>,
+    /// **M03.1**: `true` while the frame is between its `FrameEnter` and
+    /// `FrameLeave` events; `false` after `FrameLeave` fires. Inactive frames
+    /// linger in the visualization (grayed) to convey that the stack bytes
+    /// don't physically disappear at function return — they persist on the
+    /// stack until something else reuses the storage.
+    pub active: bool,
+    /// **M03.1**: rendered return value (e.g. `"5"`, `"()"`) once a
+    /// `MemEvent::ReturnValue` has fired for this frame. Persists across the
+    /// subsequent `FrameLeave` so the grayed-out frame card still shows the
+    /// `→ <value>` annotation — the return value lives in the frame's memory
+    /// until the bytes are reused, mirroring the machine-level reality.
+    /// `None` for frames that haven't returned yet, or that halted on a
+    /// runtime error before reaching `ReturnValue`.
+    pub return_value: Option<String>,
 }
 
 /// One stack slot's view.
@@ -70,6 +88,19 @@ pub struct StatusView {
     pub kind: String,
     /// Note message.
     pub message: String,
+}
+
+/// **M03.1**: Transient annotation surfaced when the most recent event is a
+/// [`MemEvent::ReturnValue`]. The renderer paints a `→ <value>` indicator
+/// on the matching frame card for one cursor step before `FrameLeave` closes
+/// the frame.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingReturnView {
+    /// The frame about to return (matches a `FrameCardView.frame_id` in the
+    /// same snapshot).
+    pub frame_id: u32,
+    /// Rendered return value (e.g. `"5"`, `"true"`, `"()"`).
+    pub value: String,
 }
 
 impl Cursor {
@@ -102,20 +133,15 @@ impl Cursor {
         for event in &self.trace[..self.position] {
             apply_event(&mut world, event);
         }
-        let editor_highlight = if self.position == 0 {
-            None
-        } else {
-            Some(event_span(&self.trace[self.position - 1]))
-        };
-        let status = if self.position == 0 {
-            None
-        } else {
-            note_to_status(&self.trace[self.position - 1])
-        };
+        let last = self.position.checked_sub(1).map(|i| &self.trace[i]);
+        let editor_highlight = last.map(event_span);
+        let status = last.and_then(note_to_status);
+        let pending_return = last.and_then(return_to_pending);
         StateSnapshot {
             frames: world.frames.into_iter().map(frame_to_view).collect(),
             editor_highlight,
             status,
+            pending_return,
             position: self.position,
             total: self.trace.len(),
         }
@@ -134,6 +160,12 @@ struct FrameInProgress {
     frame_id: u32,
     fn_name: String,
     slots: Vec<LiveSlot>,
+    /// M03.1: false after `FrameLeave`. The frame stays in `World.frames` so
+    /// the visualization can show it grayed out.
+    active: bool,
+    /// M03.1: rendered return value once `MemEvent::ReturnValue` has fired
+    /// for this frame. Persists across `FrameLeave`.
+    return_value: Option<String>,
 }
 
 struct LiveSlot {
@@ -146,17 +178,38 @@ struct LiveSlot {
 fn apply_event(world: &mut World, event: &MemEvent) {
     match event {
         MemEvent::FrameEnter { frame_id, fn_name, .. } => {
+            // M03.1: a new frame opens by reusing the stack region above the
+            // current top-active frame. Any grayed (inactive) frames sitting
+            // above the active top represent bytes about to be overwritten by
+            // this push — drop them. Real machine semantics: when main calls
+            // add() twice, the second call writes over the first call's
+            // freed-but-not-zeroed stack slot.
+            while world.frames.last().is_some_and(|f| !f.active) {
+                world.frames.pop();
+            }
             world.frames.push(FrameInProgress {
                 frame_id: frame_id.0,
                 fn_name: fn_name.clone(),
                 slots: Vec::new(),
+                active: true,
+                return_value: None,
             });
         }
         MemEvent::FrameLeave { .. } => {
-            world.frames.pop();
+            // M03.1: mark the innermost active frame as inactive instead of
+            // popping it. The frame card stays in the visualization (grayed)
+            // so the learner can see that the stack bytes persist after the
+            // function returns — there is no physical "frame disappears"
+            // event at the machine level, just storage that's now free to be
+            // reused by the next call.
+            if let Some(frame) = world.frames.iter_mut().rev().find(|f| f.active) {
+                frame.active = false;
+            }
         }
         MemEvent::SlotAlloc { slot_id, name, ty, .. } => {
-            if let Some(frame) = world.frames.last_mut() {
+            // M03.1: route the alloc to the innermost ACTIVE frame; inactive
+            // (grayed) frames shouldn't receive new slots.
+            if let Some(frame) = world.frames.iter_mut().rev().find(|f| f.active) {
                 frame.slots.push(LiveSlot {
                     slot_id: slot_id.0,
                     name: name.clone(),
@@ -181,8 +234,21 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                 }
             }
         }
-        // M04 doesn't visualize the remaining variants. They're inert here so
-        // future-extended traces (M06+ events) don't crash an L1-only player.
+        MemEvent::ReturnValue { frame_id, value, .. } => {
+            // M03.1: record the return value on the matching frame so the
+            // annotation persists into the subsequent FrameLeave (and the
+            // resulting grayed frame keeps the `→ <value>` indicator visible).
+            if let Some(frame) = world
+                .frames
+                .iter_mut()
+                .find(|f| f.frame_id == frame_id.0)
+            {
+                frame.return_value = Some(render_value(value));
+            }
+        }
+        // The remaining variants don't modify world state. `Note` surfaces via
+        // `note_to_status` on the most-recent-event side path. The others are
+        // forward-compat placeholders for M06+ events that L1 traces don't emit.
         MemEvent::SlotMove { .. }
         | MemEvent::HeapAlloc { .. }
         | MemEvent::HeapRealloc { .. }
@@ -198,8 +264,7 @@ fn apply_event(world: &mut World, event: &MemEvent) {
         | MemEvent::ThreadJoin { .. }
         | MemEvent::ThreadPark { .. }
         | MemEvent::Note { .. } => {
-            // Note doesn't modify world state; its message surfaces via
-            // `note_to_status` on the last-applied-event side path.
+            // No world-state change.
         }
     }
 }
@@ -218,6 +283,8 @@ fn frame_to_view(frame: FrameInProgress) -> FrameCardView {
                 value: s.value,
             })
             .collect(),
+        active: frame.active,
+        return_value: frame.return_value,
     }
 }
 
@@ -229,6 +296,18 @@ fn note_to_status(event: &MemEvent) -> Option<StatusView> {
                 NoteKind::Info => "info".to_owned(),
             },
             message: message.clone(),
+        }),
+        _ => None,
+    }
+}
+
+/// **M03.1**: extract the transient `pending_return` view from a
+/// `MemEvent::ReturnValue`; `None` for any other variant.
+fn return_to_pending(event: &MemEvent) -> Option<PendingReturnView> {
+    match event {
+        MemEvent::ReturnValue { frame_id, value, .. } => Some(PendingReturnView {
+            frame_id: frame_id.0,
+            value: render_value(value),
         }),
         _ => None,
     }
@@ -268,7 +347,8 @@ fn event_span(event: &MemEvent) -> Span {
         | MemEvent::LockRelease { span, .. }
         | MemEvent::ArcClone { span, .. }
         | MemEvent::ArcDrop { span, .. }
-        | MemEvent::Note { span, .. } => *span,
+        | MemEvent::Note { span, .. }
+        | MemEvent::ReturnValue { span, .. } => *span,
     }
 }
 
@@ -368,10 +448,10 @@ mod tests {
     }
 
     fn frame_enter(name: &str, frame_id: u32) -> MemEvent {
+        // M03.1: `params` field removed.
         MemEvent::FrameEnter {
             frame_id: FrameId(frame_id),
             fn_name: name.into(),
-            params: Vec::new(),
             span: span(),
         }
     }
@@ -380,6 +460,14 @@ mod tests {
         MemEvent::FrameLeave {
             frame_id: FrameId(frame_id),
             return_value,
+            span: span(),
+        }
+    }
+
+    fn return_value(frame_id: u32, value: Value) -> MemEvent {
+        MemEvent::ReturnValue {
+            frame_id: FrameId(frame_id),
+            value,
             span: span(),
         }
     }
@@ -436,6 +524,7 @@ mod tests {
         assert_eq!(s.frames[0].fn_name, "main");
         assert_eq!(s.frames[0].frame_id, 0);
         assert!(s.frames[0].slots.is_empty());
+        assert!(s.frames[0].active, "freshly-entered frame is active");
     }
 
     #[test]
@@ -533,12 +622,83 @@ mod tests {
         assert_eq!(status.message, "division by zero");
     }
 
+    /// M03.1: `FrameLeave` now marks the frame inactive instead of popping
+    /// it. The frame card persists (grayed) — the stack bytes don't physically
+    /// disappear at function return.
     #[test]
-    fn frame_leave_pops_frame() {
+    fn frame_leave_grays_frame() {
         let mut c = Cursor::new(vec![frame_enter("main", 0), frame_leave(0, Value::Unit)]);
         c.step_forward();
-        assert_eq!(c.state_snapshot("").frames.len(), 1);
+        let s = c.state_snapshot("");
+        assert_eq!(s.frames.len(), 1);
+        assert!(s.frames[0].active);
         c.step_forward();
-        assert_eq!(c.state_snapshot("").frames.len(), 0);
+        let s = c.state_snapshot("");
+        // Frame still present, just inactive (renderer paints it grayed).
+        assert_eq!(s.frames.len(), 1);
+        assert!(!s.frames[0].active);
+    }
+
+    /// M03.1: a new `FrameEnter` overwrites grayed frames sitting above the
+    /// current top-active frame (their stack bytes are being reused).
+    #[test]
+    fn frame_enter_overwrites_grayed_frames() {
+        let trace = vec![
+            frame_enter("main", 0),
+            frame_enter("add", 1),
+            return_value(1, Value::Int(5)),
+            frame_leave(1, Value::Int(5)),
+            // Second call to add: should overwrite the grayed first add frame.
+            frame_enter("add", 2),
+        ];
+        let mut c = Cursor::new(trace);
+        // Step through everything.
+        for _ in 0..5 {
+            c.step_forward();
+        }
+        let s = c.state_snapshot("");
+        // Expected: 2 frames — main (active) and the SECOND add (active).
+        // The first grayed add was overwritten by the second FrameEnter.
+        assert_eq!(s.frames.len(), 2);
+        assert_eq!(s.frames[0].fn_name, "main");
+        assert!(s.frames[0].active);
+        assert_eq!(s.frames[1].frame_id, 2, "first add was overwritten by second add");
+        assert!(s.frames[1].active);
+    }
+
+    /// M03.1 / US2: `MemEvent::ReturnValue` records the value on the frame
+    /// AND on the transient `pending_return`. The frame-level value persists
+    /// across the subsequent `FrameLeave` so the grayed frame still shows
+    /// `→ <value>`.
+    #[test]
+    fn return_value_persists_on_grayed_frame() {
+        let trace = vec![
+            frame_enter("main", 0),
+            return_value(0, Value::Int(5)),
+            frame_leave(0, Value::Int(5)),
+        ];
+        let mut c = Cursor::new(trace);
+        // Step to ReturnValue: frame still active, return_value set.
+        c.step_forward();
+        c.step_forward();
+        let s = c.state_snapshot("");
+        assert_eq!(s.frames.len(), 1);
+        assert!(s.frames[0].active);
+        assert_eq!(s.frames[0].return_value.as_deref(), Some("5"));
+        // pending_return still Some on the ReturnValue tick (transient highlight).
+        let pending = s.pending_return.expect("pending_return on ReturnValue tick");
+        assert_eq!(pending.frame_id, 0);
+        assert_eq!(pending.value, "5");
+        // Step past to FrameLeave: pending_return clears, but frame.return_value persists.
+        c.step_forward();
+        let s = c.state_snapshot("");
+        assert_eq!(s.pending_return, None);
+        assert_eq!(s.frames.len(), 1);
+        assert!(!s.frames[0].active);
+        assert_eq!(
+            s.frames[0].return_value.as_deref(),
+            Some("5"),
+            "return value persists on the grayed frame"
+        );
     }
 }

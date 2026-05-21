@@ -91,8 +91,27 @@ function render(state) {
   const stacksEl = document.getElementById("stacks");
   stacksEl.replaceChildren();
   for (const frame of state.frames) {
-    const card = el("div", { class: "frame-card" });
-    card.appendChild(el("div", { class: "frame-name", text: `${frame.fn_name}()` }));
+    // M03.1: `active === false` means the frame has had its `FrameLeave`
+    // event but we keep it visible (grayed) so the stack-bytes-persist story
+    // works visually. Renderer applies the `frame-grayed` class.
+    const classes = frame.active ? "frame-card" : "frame-card frame-grayed";
+    const card = el("div", { class: classes });
+    card.setAttribute("data-frame-id", String(frame.frame_id));
+    const header = el("div", { class: "frame-header" });
+    header.appendChild(el("span", { class: "frame-name", text: `${frame.fn_name}()` }));
+    // M03.1: `frame.return_value` is set once a `ReturnValue` event has fired
+    // for this frame and persists across the subsequent `FrameLeave` — so
+    // the `→ <value>` annotation stays visible on the grayed frame, not just
+    // on the single ReturnValue tick.
+    if (frame.return_value !== null && frame.return_value !== undefined) {
+      header.appendChild(
+        el("span", {
+          class: "frame-return-value",
+          text: `→ ${frame.return_value}`,
+        }),
+      );
+    }
+    card.appendChild(header);
     const slotGrid = el("div", { class: "slots" });
     for (const slot of frame.slots) {
       const row = el("div", { class: "slot-row" });

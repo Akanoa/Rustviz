@@ -205,7 +205,7 @@ impl<'a> Evaluator<'a> {
         let decl = self.fn_decls[&fn_binding];
         let frame_id = self.alloc_frame_id();
 
-        // Pre-allocate param SlotIds so the FrameEnter event can reference them.
+        // Pre-allocate param SlotIds so subsequent SlotAlloc events can use them.
         let mut param_slots: Vec<(BindingId, SlotId, String, Value, Span)> =
             Vec::with_capacity(decl.params.len());
         for (i, param) in decl.params.iter().enumerate() {
@@ -215,16 +215,12 @@ impl<'a> Evaluator<'a> {
             param_slots.push((binding_id, slot_id, param.name.clone(), value, param.span));
         }
 
-        // Build the FrameEnter params snapshot.
-        let frame_enter_params: Vec<(SlotId, String, Value)> = param_slots
-            .iter()
-            .map(|(_, sid, name, val, _)| (*sid, name.clone(), val.clone()))
-            .collect();
-
+        // M03.1: FrameEnter no longer carries a `params` field. The same info
+        // is fully conveyed by the per-param SlotAlloc + SlotWrite events that
+        // follow this FrameEnter.
         self.events.push(MemEvent::FrameEnter {
             frame_id,
             fn_name: decl.name.clone(),
-            params: frame_enter_params,
             span: decl.span,
         });
 
@@ -270,10 +266,28 @@ impl<'a> Evaluator<'a> {
         let body_value = self.eval_block(&decl.body);
 
         if self.halted {
+            // Frame did not return — no ReturnValue, no FrameLeave. Stream ends
+            // at the runtime-error Note already pushed by the halt path.
             return Value::Unit;
         }
 
-        // Drop the param scope (LIFO).
+        // M03.1: emit ReturnValue between body completion and scope teardown.
+        // Pedagogically: the value is now visible for one cursor tick before
+        // any drops fire or the frame closes.
+        let return_span = decl
+            .body
+            .tail
+            .as_ref()
+            .map(|t| t.span())
+            .unwrap_or(decl.body.span);
+        self.events.push(MemEvent::ReturnValue {
+            frame_id,
+            value: body_value.clone(),
+            span: return_span,
+        });
+
+        // Drop the param scope (LIFO). For L1 / Copy types this emits no
+        // events (gated in M03.1); M07+ non-Copy types still drop here.
         self.drop_current_scope();
 
         // Pop the frame and emit FrameLeave.
@@ -296,10 +310,20 @@ impl<'a> Evaluator<'a> {
             .pop()
             .expect("scope active");
         for local in scope.locals.into_iter().rev() {
-            self.events.push(MemEvent::SlotDrop {
-                slot_id: local.slot_id,
-                span: local.decl_span,
-            });
+            // M03.1: Copy types have no destructor; their bytes persist on the
+            // stack until the frame is reused. Skipping the SlotDrop event for
+            // Copy-typed slots avoids visualizing physical-memory loss that
+            // doesn't actually happen. Non-Copy types (M07+: Box, Vec, String)
+            // still emit SlotDrop because their drop runs real destructor work.
+            let ty = self
+                .lookup_var_ty(local.binding_id)
+                .expect("var ty after typeck");
+            if !ty.is_copy() {
+                self.events.push(MemEvent::SlotDrop {
+                    slot_id: local.slot_id,
+                    span: local.decl_span,
+                });
+            }
         }
     }
 

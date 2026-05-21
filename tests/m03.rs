@@ -68,7 +68,8 @@ fn event_span(event: &MemEvent) -> rustviz::Span {
         | MemEvent::LockRelease { span, .. }
         | MemEvent::ArcClone { span, .. }
         | MemEvent::ArcDrop { span, .. }
-        | MemEvent::Note { span, .. } => *span,
+        | MemEvent::Note { span, .. }
+        | MemEvent::ReturnValue { span, .. } => *span,
     }
 }
 

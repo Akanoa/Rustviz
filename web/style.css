@@ -114,11 +114,44 @@ main > section:last-child {
   padding: 0.4rem 0.6rem;
 }
 
+.frame-card .frame-header {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  margin-bottom: 0.25rem;
+}
+
 .frame-card .frame-name {
   font-weight: 600;
   font-size: 0.85rem;
   color: var(--accent);
-  margin-bottom: 0.25rem;
+}
+
+/* M03.1: transient return-value annotation on a frame card, shown for one
+   cursor step between body completion and FrameLeave. */
+.frame-card .frame-return-value {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-size: 12px;
+  font-weight: 600;
+  color: #2a8a3f;
+}
+
+/* M03.1: frame card lingers after FrameLeave to convey that stack bytes
+   persist until reused. The header (frame name + return-value annotation)
+   stays at full opacity so the return value is still legible; only the slots
+   area is grayed to signal "no longer the active frame's working memory". */
+.frame-card.frame-grayed {
+  background: #f5f5f7;
+}
+
+.frame-card.frame-grayed .frame-name {
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+  color: var(--muted);
+}
+
+.frame-card.frame-grayed .slots {
+  opacity: 0.45;
 }
 
 .frame-card .slots {
