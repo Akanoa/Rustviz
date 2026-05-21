@@ -218,10 +218,17 @@ impl<'a> Evaluator<'a> {
         // M03.1: FrameEnter no longer carries a `params` field. The same info
         // is fully conveyed by the per-param SlotAlloc + SlotWrite events that
         // follow this FrameEnter.
+        //
+        // The span is the **call-site** span (e.g. `add(2, 3)` in the source),
+        // not the function declaration span. This lets consumers distinguish
+        // which call site triggered each frame — important when the same
+        // function is called multiple times. The outermost `main` is invoked
+        // from `evaluate(...)` with `call_span = decl.span`, which is a
+        // reasonable fallback since there's no actual call site.
         self.events.push(MemEvent::FrameEnter {
             frame_id,
             fn_name: decl.name.clone(),
-            span: decl.span,
+            span: call_span,
         });
 
         // Push the frame with an outer (param) scope.

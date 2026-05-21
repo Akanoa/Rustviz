@@ -32,7 +32,11 @@ const SAMPLES = [
   { id: "m03_div_by_zero", label: "Division by Zero" },
 ];
 
-// ─── CodeMirror span-highlight state ──────────────────────────────────────
+// ─── CodeMirror highlight states ──────────────────────────────────────────
+// Two layers of decoration:
+//   1. `highlightField`  — yellow background on the most-recent event's span
+//   2. `currentFnField`  — red left border on the currently-executing fn's body
+// Both are mark decorations; CodeMirror composes them transparently.
 
 const setHighlight = StateEffect.define(); // payload: { start, end } | null
 const highlightField = StateField.define({
@@ -47,6 +51,29 @@ const highlightField = StateField.define({
           const { start, end } = e.value;
           deco = Decoration.set([
             Decoration.mark({ class: "cm-current-span" }).range(start, end),
+          ]);
+        }
+      }
+    }
+    return deco;
+  },
+  provide: (f) => EditorView.decorations.from(f),
+});
+
+// M03.1: red border around the currently-executing function's body span.
+const setCurrentFn = StateEffect.define(); // payload: { start, end } | null
+const currentFnField = StateField.define({
+  create: () => Decoration.none,
+  update(deco, tr) {
+    deco = deco.map(tr.changes);
+    for (const e of tr.effects) {
+      if (e.is(setCurrentFn)) {
+        if (e.value === null) {
+          deco = Decoration.none;
+        } else {
+          const { start, end } = e.value;
+          deco = Decoration.set([
+            Decoration.mark({ class: "cm-current-fn" }).range(start, end),
           ]);
         }
       }
@@ -80,7 +107,7 @@ function el(tag, attrs = {}, ...children) {
 function setEditorSource(source) {
   editorView.dispatch({
     changes: { from: 0, to: editorView.state.doc.length, insert: source },
-    effects: setHighlight.of(null),
+    effects: [setHighlight.of(null), setCurrentFn.of(null)],
   });
 }
 
@@ -91,11 +118,16 @@ function render(state) {
   const stacksEl = document.getElementById("stacks");
   stacksEl.replaceChildren();
   for (const frame of state.frames) {
-    // M03.1: `active === false` means the frame has had its `FrameLeave`
-    // event but we keep it visible (grayed) so the stack-bytes-persist story
-    // works visually. Renderer applies the `frame-grayed` class.
-    const classes = frame.active ? "frame-card" : "frame-card frame-grayed";
-    const card = el("div", { class: classes });
+    // M03.1 styling states (mutually-exclusive for grayed/current):
+    //   • `frame-grayed`: frame has returned (active === false); slots area
+    //     at reduced opacity, name muted with strikethrough.
+    //   • `frame-current`: innermost active frame — the one whose body is
+    //     currently executing. Distinguishes callee (executing) from caller
+    //     (paused).
+    const cls = ["frame-card"];
+    if (!frame.active) cls.push("frame-grayed");
+    if (frame.current) cls.push("frame-current");
+    const card = el("div", { class: cls.join(" ") });
     card.setAttribute("data-frame-id", String(frame.frame_id));
     const header = el("div", { class: "frame-header" });
     header.appendChild(el("span", { class: "frame-name", text: `${frame.fn_name}()` }));
@@ -130,12 +162,20 @@ function render(state) {
     stacksEl.appendChild(card);
   }
 
-  // Editor span highlight.
+  // Editor span highlight (yellow, most-recent event).
   if (state.editor_highlight) {
     const { start, end } = state.editor_highlight;
     editorView.dispatch({ effects: setHighlight.of({ start, end }) });
   } else {
     editorView.dispatch({ effects: setHighlight.of(null) });
+  }
+
+  // M03.1: red border around the currently-executing function's body span.
+  if (state.current_call_span) {
+    const { start, end } = state.current_call_span;
+    editorView.dispatch({ effects: setCurrentFn.of({ start, end }) });
+  } else {
+    editorView.dispatch({ effects: setCurrentFn.of(null) });
   }
 
   // Status message.
@@ -238,6 +278,7 @@ async function main() {
         EditorState.readOnly.of(true),
         EditorView.editable.of(false),
         highlightField,
+        currentFnField,
       ],
     }),
   });

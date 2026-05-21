@@ -23,8 +23,8 @@ Ok(
             ),
             fn_name: "add",
             span: Span {
-                start: 0,
-                end: 43,
+                start: 69,
+                end: 78,
                 file: FileId(
                     1,
                 ),

@@ -31,6 +31,18 @@ pub struct StateSnapshot {
     pub frames: Vec<FrameCardView>,
     /// Span the editor should highlight at this step.
     pub editor_highlight: Option<Span>,
+    /// **M03.1**: span of the **call site** that opened the currently-
+    /// executing frame (i.e. the `add(2, 3)` text in the source). Matches the
+    /// `FrameEnter.span` of the innermost active frame, when there is at
+    /// least one caller below it on the stack. The editor paints this span
+    /// with a red border so the learner can tell which specific call is in
+    /// flight — important when the same function is called multiple times
+    /// from different lines.
+    ///
+    /// `None` when no callee is currently in flight: position 0, after the
+    /// outermost frame returns, or while execution is in the entry function
+    /// (typically `main`) itself with no nested call on the stack.
+    pub current_call_span: Option<Span>,
     /// Status message (runtime error or info note).
     pub status: Option<StatusView>,
     /// **M03.1**: present when the most recent event is a `MemEvent::ReturnValue`.
@@ -66,6 +78,13 @@ pub struct FrameCardView {
     /// `None` for frames that haven't returned yet, or that halted on a
     /// runtime error before reaching `ReturnValue`.
     pub return_value: Option<String>,
+    /// **M03.1**: `true` for the innermost active frame — the one whose body
+    /// is currently executing. Other active frames are paused waiting for
+    /// their callee to return. Distinguishing the "current" frame from the
+    /// "caller" makes the call-stack relationship visible at a glance.
+    /// At most one frame per snapshot has `current = true`; grayed frames
+    /// always have `current = false`.
+    pub current: bool,
 }
 
 /// One stack slot's view.
@@ -137,9 +156,32 @@ impl Cursor {
         let editor_highlight = last.map(event_span);
         let status = last.and_then(note_to_status);
         let pending_return = last.and_then(return_to_pending);
+        // M03.1: the currently-executing frame is the topmost active frame in
+        // the stack. All other active frames are paused callers waiting for
+        // their callee to return; grayed frames have already returned.
+        let current_frame = world.frames.iter().rev().find(|f| f.active);
+        let current_frame_id = current_frame.map(|f| f.frame_id);
+        // M03.1: only highlight a call site when there's an actual callee in
+        // flight — i.e. ≥ 2 active frames (a caller waiting for its callee).
+        // The bottommost active frame (typically `main`) is the program entry,
+        // not invoked from any visible call site; its `enter_span` is just a
+        // fallback to the function's declaration. Don't paint a misleading
+        // red border on the whole entry function while it's the only active
+        // frame on the stack.
+        let active_count = world.frames.iter().filter(|f| f.active).count();
+        let current_call_span = if active_count >= 2 {
+            current_frame.map(|f| f.enter_span)
+        } else {
+            None
+        };
         StateSnapshot {
-            frames: world.frames.into_iter().map(frame_to_view).collect(),
+            frames: world
+                .frames
+                .into_iter()
+                .map(|f| frame_to_view(f, current_frame_id))
+                .collect(),
             editor_highlight,
+            current_call_span,
             status,
             pending_return,
             position: self.position,
@@ -166,6 +208,11 @@ struct FrameInProgress {
     /// M03.1: rendered return value once `MemEvent::ReturnValue` has fired
     /// for this frame. Persists across `FrameLeave`.
     return_value: Option<String>,
+    /// M03.1: span of the `FrameEnter` event that opened this frame — i.e.
+    /// the call-site span (`add(2, 3)` text). Used to paint a red border on
+    /// the active call site in the editor so the learner can see which
+    /// specific call site is in flight.
+    enter_span: Span,
 }
 
 struct LiveSlot {
@@ -177,7 +224,7 @@ struct LiveSlot {
 
 fn apply_event(world: &mut World, event: &MemEvent) {
     match event {
-        MemEvent::FrameEnter { frame_id, fn_name, .. } => {
+        MemEvent::FrameEnter { frame_id, fn_name, span, .. } => {
             // M03.1: a new frame opens by reusing the stack region above the
             // current top-active frame. Any grayed (inactive) frames sitting
             // above the active top represent bytes about to be overwritten by
@@ -193,6 +240,7 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                 slots: Vec::new(),
                 active: true,
                 return_value: None,
+                enter_span: *span,
             });
         }
         MemEvent::FrameLeave { .. } => {
@@ -269,7 +317,8 @@ fn apply_event(world: &mut World, event: &MemEvent) {
     }
 }
 
-fn frame_to_view(frame: FrameInProgress) -> FrameCardView {
+fn frame_to_view(frame: FrameInProgress, current_frame_id: Option<u32>) -> FrameCardView {
+    let current = current_frame_id == Some(frame.frame_id);
     FrameCardView {
         frame_id: frame.frame_id,
         fn_name: frame.fn_name,
@@ -285,6 +334,7 @@ fn frame_to_view(frame: FrameInProgress) -> FrameCardView {
             .collect(),
         active: frame.active,
         return_value: frame.return_value,
+        current,
     }
 }
 
@@ -525,6 +575,53 @@ mod tests {
         assert_eq!(s.frames[0].frame_id, 0);
         assert!(s.frames[0].slots.is_empty());
         assert!(s.frames[0].active, "freshly-entered frame is active");
+        assert!(
+            s.frames[0].current,
+            "only-frame is the current (executing) one"
+        );
+    }
+
+    /// M03.1: only the innermost active frame is `current`. Caller is paused
+    /// while callee executes; grayed frames are never current. Also covers
+    /// the `current_call_span` semantics: only set when ≥ 2 active frames.
+    #[test]
+    fn current_marks_innermost_active_frame() {
+        let trace = vec![
+            frame_enter("main", 0),
+            frame_enter("add", 1),
+            return_value(1, Value::Int(5)),
+            frame_leave(1, Value::Int(5)),
+        ];
+        let mut c = Cursor::new(trace);
+        // After FrameEnter(main): main is the only frame, current.
+        // current_call_span is None: main is the program entry, no real caller.
+        c.step_forward();
+        let s = c.state_snapshot("");
+        assert!(s.frames[0].current);
+        assert_eq!(s.current_call_span, None);
+        // After FrameEnter(add): main paused, add current. Two active frames
+        // → current_call_span is Some (the add() call-site span).
+        c.step_forward();
+        let s = c.state_snapshot("");
+        assert_eq!(s.frames.len(), 2);
+        assert!(!s.frames[0].current, "caller (main) is paused");
+        assert!(s.frames[1].current, "callee (add) is currently executing");
+        assert!(s.current_call_span.is_some());
+        // After ReturnValue(add): add still active+current+highlighted.
+        c.step_forward();
+        let s = c.state_snapshot("");
+        assert!(s.frames[1].current);
+        assert!(s.current_call_span.is_some());
+        // After FrameLeave(add): add grayed, main becomes current again.
+        // Only 1 active frame → current_call_span clears.
+        c.step_forward();
+        let s = c.state_snapshot("");
+        assert!(s.frames[0].current, "caller resumes as current after callee returns");
+        assert!(!s.frames[1].current, "grayed frame is never current");
+        assert_eq!(
+            s.current_call_span, None,
+            "no call site highlight while only the entry frame is active"
+        );
     }
 
     #[test]
