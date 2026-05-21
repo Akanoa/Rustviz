@@ -13,9 +13,11 @@ M01 ──► M02 ──► M03 ──► M04 ──► M05 ──► M06 ──
                   └─────────────┴───────┴───────┴───────┘
             (M03 also directly feeds M05, M06, M07, M08 —
              each extends MemEvent enum payloads defined in M03)
+
+M03 ──► M03.1     # additive protocol revision; M04+ consume it once shipped
 ```
 
-Acyclic. The drawn order is one valid topological sort. Edges from M03 to M05–M08 are real direct dependencies (each later milestone fills payloads in the event enum M03 defines), not just transitive.
+Acyclic. The drawn order is one valid topological sort. Edges from M03 to M05–M08 are real direct dependencies (each later milestone fills payloads in the event enum M03 defines), not just transitive. **M03.1** is a *revision* milestone — it patches M03's event protocol after M03 closed, based on pedagogical issues uncovered during M04's manual QA. Revisions don't sit in the main chain; they hang off the milestone they patch and improve downstream milestones' behavior once shipped.
 
 ## Milestones
 
@@ -140,6 +142,50 @@ Acyclic. The drawn order is one valid topological sort. Edges from M03 to M05–
 - Command: `cargo test --test m03`
 
 **Notes.** The full event enum lands here even though M03 only emits a subset, so later milestones extend payloads in-place rather than refactoring the enum. The `Note` infrastructure is intentionally introduced here for the same reason.
+
+---
+
+### M03.1 — Protocol revision: Copy-drop + return-value bridge
+
+- **Kind**: foundation
+- **Status**: planned
+- **Complexity**: M (modules: 2, bullets: 3, boundaries: 2)
+- **Depends on**: M03
+- **Authority**: CLAUDE.md › Event model › "SlotMove is intentionally distinct from SlotDrop"; CLAUDE.md › Pedagogical goal › "Give a newcomer concrete intuition for Rust's memory mechanics: moves, borrows, lifetimes, drops"
+
+**Goal.** Revise M03's event protocol to fix two pedagogical issues uncovered during M04's manual QA: (1) `SlotDrop` events are emitted for Copy-typed slots, wrongly visualizing physical-memory loss for types whose bytes don't actually go away; (2) function-return values appear out of thin air in the caller's slot — the ABI return-value mechanic is invisible.
+
+**In scope.**
+- Gate `SlotDrop` emission in `src/eval.rs` on the slot's binding type. Only emit `SlotDrop` when `typeck.binding_types[id]` resolves to a non-Copy `Ty`. For L1's `i32` / `bool` (both Copy) no `SlotDrop` is emitted — the slot persists visually until the whole frame leaves.
+- Add a new `MemEvent::ReturnValue { frame_id, value, span }` variant in `src/event.rs`, emitted between body completion and `FrameLeave`. Carries the function's computed return value so consumers can visualize the "value lives somewhere between caller and callee" moment.
+- Relax the "closed enum from M03" rule in the `MemEvent` contract: additive variants are permitted in **revision milestones** with maintainer consent. The relaxed rule is documented in `specs/004-m03-event-eval/contracts/m03-api.md`.
+- Optional cleanup: drop the redundant `FrameEnter.params` field (info already covered by the subsequent per-param `SlotAlloc`+`SlotWrite` events).
+- Update `src/ui.rs::apply_event` in M04 to handle the new variant — render the return value as a transient annotation on the frame card before it leaves.
+- Regenerate M03 snapshot tests (`tests/snapshots/emits_*.snap`) and M04 traces (`web/traces/*.json`).
+
+**Out of scope.**
+- M04 layout / CSS changes (the visualization improves "for free" once Copy drops are gone).
+- M06+ events (borrows, heap, sync, threads remain on their respective milestones).
+- Visual changes to M07's `SlotDrop` (heap-allocated drops keep firing because their destructors do real work).
+
+**Entry criteria.**
+- M03 closed (event model + L1 evaluator on `main`).
+- M04 closed (UI shell consuming the event stream on `main`).
+- Pedagogical issues documented in this milestone's `research.md`.
+
+**Exit criteria.**
+- `cargo test --test m03` passes with revised snapshots (fewer `SlotDrop` events for L1, new `ReturnValue` events in fn-call traces).
+- `cargo test --test m01` and `cargo test --test m02` still pass unchanged.
+- `cargo test --lib ui::` passes (Cursor handles the new `ReturnValue` variant).
+- M04 page (manual QA, per `specs/005-m04-ui-shell/quickstart.md` SC-008 procedure) shows: (a) Copy-type slots stay visible until `FrameLeave`, (b) a transient return-value indicator appears between body completion and frame disappearance.
+
+**Demo.**
+- Format: browser
+- Inputs: existing `web/samples/m03_*.rs` (no new samples needed)
+- Outputs (browser-observed steps): for `m03_fn_call` (`fn add(a, b) -> i32 { a + b }`): step through 1 → 13. At steps 7–8, both `a` and `b` stay visible in the `add` frame (previously they disappeared); at the new step between body and `FrameLeave`, a `→ 5` indicator appears on the `add` frame card; after `FrameLeave`, the frame disappears and `r` gets `5` in `main`.
+- Command: `cd web && trunk serve --open`
+
+**Notes.** First revision milestone in the project. The `MemEvent` enum's "closed from M03" rule is relaxed for additive protocol changes in revision milestones — variants can be added with maintainer consent. The new variant `ReturnValue` is documented as additive in M03's contract (`specs/004-m03-event-eval/contracts/m03-api.md`).
 
 ---
 

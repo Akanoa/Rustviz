@@ -10,7 +10,7 @@ A single ordered unit of work.
 
 | Field             | Type                                                          | Required | Notes                                                                          |
 |-------------------|---------------------------------------------------------------|----------|--------------------------------------------------------------------------------|
-| `id`              | string matching `^M[0-9]{2}[a-z]?$`                           | yes      | `M01`–`M99`, optional split-suffix letter. See R-002, R-003.                  |
+| `id`              | string matching `^M[0-9]{2}(\.[0-9]+)?[a-z]?$`                | yes      | `M01`–`M99`; optional `.N` revision suffix (e.g. `M03.1` — a protocol revision patching an earlier shipped milestone); optional `a`/`b`/… split-suffix letter. See R-002, R-003.       |
 | `title`           | string, ≤ 60 chars                                            | yes      | Human-readable name.                                                          |
 | `kind`            | enum `foundation \| feature`                                  | yes      | Foundation = cross-cutting machinery; feature = visible level/capability.     |
 | `status`          | enum `planned \| active \| closed \| absorbed \| deferred`    | yes      | Lifecycle. Numbers persist across status changes.                             |

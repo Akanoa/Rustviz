@@ -92,7 +92,9 @@ Each `### Mxx — <title>` heading is followed by a block of the form below. Fie
 
 Header line (h3 with id and title) → metadata bullets in the fixed order **Kind, Status, Complexity, Depends on, Authority** → labeled paragraphs in the fixed order **Goal, In scope, Out of scope, Entry criteria, Exit criteria, Demo, Notes**.
 
-A linter / audit script walks each `### M\d{2}` block and asserts the field order verbatim. Field order is part of the contract so contributors can scan multiple milestones uniformly without re-orienting.
+A linter / audit script walks each `### M\d{2}(\.\d+)?[a-z]?` block and asserts the field order verbatim. Field order is part of the contract so contributors can scan multiple milestones uniformly without re-orienting.
+
+The `\.\d+` segment is for **revision milestones** like `M03.1` — a protocol revision sitting between two shipped milestones. Revisions don't get their own sequential id; they patch an earlier one. The split-suffix letter (`a`, `b`, …) is still for in-place splits of an unshipped milestone.
 
 ### Field formats
 
@@ -130,7 +132,7 @@ Deferred items live under the top-level `## Deferred` heading, not as `### Mxx` 
 The document is conforming iff all of:
 
 1. **C-1 Structural**: Top-level section order matches the template above.
-2. **C-2 IDs**: Every `### M\d{2}[a-z]?` heading has a unique id. No reuse.
+2. **C-2 IDs**: Every `### M\d{2}(\.\d+)?[a-z]?` heading has a unique id. No reuse.
 3. **C-3 Field order**: In every milestone block, metadata bullets and labeled paragraphs appear in the exact order specified.
 4. **C-4 Field values**: Each field parses to its declared type (Kind enum, Complexity ∈ {S, M, L} with non-XL sizing axes, etc.).
 5. **C-5 DAG**: The dependency graph induced by `Depends on:` across all non-`absorbed`, non-`deferred` milestones is acyclic.
