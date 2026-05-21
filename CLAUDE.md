@@ -107,6 +107,8 @@ src/
 - N/A (in-memory only; SourceMap holds source text) (002-m01-frontend-skeleton)
 - Rust 2024 edition, same toolchain as M01 (1.85+). No `Cargo.toml` changes other than registering the new `[[test]]` target `m02`. + existing `insta` dev-dep; no new deps. (003-m02-resolve-typeck)
 - in-memory; metadata stored in `BTreeMap<Span, ...>` side tables for determinism. (003-m02-resolve-typeck)
+- Rust 2024 edition, same toolchain as M01/M02. No `Cargo.toml` changes other than registering the new `[[test]]` target `m03`. + existing `indexmap` regular dep (used in M02), existing `insta` dev-dep. No new deps. (004-m03-event-eval)
+- in-memory; the event stream is a `Vec<MemEvent>` accumulated as the evaluator walks the AST. (004-m03-event-eval)
 
 ## Recent Changes
 - 001-milestone-roadmap: Added N/A — deliverable is markdown documentation + `CLAUDE.md` (authoritative scope source); `specs/001-milestone-roadmap/spec.md` (this feature's spec)

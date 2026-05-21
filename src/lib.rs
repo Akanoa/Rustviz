@@ -5,10 +5,14 @@
 #![warn(missing_docs, unused, dead_code, unreachable_pub)]
 #![warn(clippy::all)]
 
+pub mod eval;
+pub mod event;
 pub mod parse;
 pub mod resolve;
 pub mod typeck;
 
+pub use eval::evaluate;
+pub use event::{BorrowId, FrameId, HeapAddr, MemEvent, NoteKind, Pointee, SlotId, Value};
 pub use parse::ast;
 pub use parse::error::ParseError;
 pub use parse::parse;

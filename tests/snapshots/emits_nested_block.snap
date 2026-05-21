@@ -1,0 +1,117 @@
+---
+source: tests/m03.rs
+expression: result
+---
+Ok(
+    [
+        FrameEnter {
+            frame_id: FrameId(
+                0,
+            ),
+            fn_name: "main",
+            params: [],
+            span: Span {
+                start: 0,
+                end: 60,
+                file: FileId(
+                    1,
+                ),
+            },
+        },
+        SlotAlloc {
+            slot_id: SlotId(
+                0,
+            ),
+            name: "y",
+            ty: I32,
+            span: Span {
+                start: 26,
+                end: 36,
+                file: FileId(
+                    1,
+                ),
+            },
+        },
+        SlotWrite {
+            slot_id: SlotId(
+                0,
+            ),
+            value: Int(
+                1,
+            ),
+            span: Span {
+                start: 26,
+                end: 36,
+                file: FileId(
+                    1,
+                ),
+            },
+        },
+        SlotDrop {
+            slot_id: SlotId(
+                0,
+            ),
+            span: Span {
+                start: 26,
+                end: 36,
+                file: FileId(
+                    1,
+                ),
+            },
+        },
+        SlotAlloc {
+            slot_id: SlotId(
+                1,
+            ),
+            name: "z",
+            ty: I32,
+            span: Span {
+                start: 48,
+                end: 58,
+                file: FileId(
+                    1,
+                ),
+            },
+        },
+        SlotWrite {
+            slot_id: SlotId(
+                1,
+            ),
+            value: Int(
+                2,
+            ),
+            span: Span {
+                start: 48,
+                end: 58,
+                file: FileId(
+                    1,
+                ),
+            },
+        },
+        SlotDrop {
+            slot_id: SlotId(
+                1,
+            ),
+            span: Span {
+                start: 48,
+                end: 58,
+                file: FileId(
+                    1,
+                ),
+            },
+        },
+        FrameLeave {
+            frame_id: FrameId(
+                0,
+            ),
+            return_value: Unit,
+            span: Span {
+                start: 10,
+                end: 60,
+                file: FileId(
+                    1,
+                ),
+            },
+        },
+    ],
+)

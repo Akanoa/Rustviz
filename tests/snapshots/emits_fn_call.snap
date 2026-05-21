@@ -1,0 +1,206 @@
+---
+source: tests/m03.rs
+expression: result
+---
+Ok(
+    [
+        FrameEnter {
+            frame_id: FrameId(
+                0,
+            ),
+            fn_name: "main",
+            params: [],
+            span: Span {
+                start: 45,
+                end: 81,
+                file: FileId(
+                    1,
+                ),
+            },
+        },
+        FrameEnter {
+            frame_id: FrameId(
+                1,
+            ),
+            fn_name: "add",
+            params: [
+                (
+                    SlotId(
+                        0,
+                    ),
+                    "a",
+                    Int(
+                        2,
+                    ),
+                ),
+                (
+                    SlotId(
+                        1,
+                    ),
+                    "b",
+                    Int(
+                        3,
+                    ),
+                ),
+            ],
+            span: Span {
+                start: 0,
+                end: 43,
+                file: FileId(
+                    1,
+                ),
+            },
+        },
+        SlotAlloc {
+            slot_id: SlotId(
+                0,
+            ),
+            name: "a",
+            ty: I32,
+            span: Span {
+                start: 7,
+                end: 13,
+                file: FileId(
+                    1,
+                ),
+            },
+        },
+        SlotWrite {
+            slot_id: SlotId(
+                0,
+            ),
+            value: Int(
+                2,
+            ),
+            span: Span {
+                start: 7,
+                end: 13,
+                file: FileId(
+                    1,
+                ),
+            },
+        },
+        SlotAlloc {
+            slot_id: SlotId(
+                1,
+            ),
+            name: "b",
+            ty: I32,
+            span: Span {
+                start: 15,
+                end: 21,
+                file: FileId(
+                    1,
+                ),
+            },
+        },
+        SlotWrite {
+            slot_id: SlotId(
+                1,
+            ),
+            value: Int(
+                3,
+            ),
+            span: Span {
+                start: 15,
+                end: 21,
+                file: FileId(
+                    1,
+                ),
+            },
+        },
+        SlotDrop {
+            slot_id: SlotId(
+                1,
+            ),
+            span: Span {
+                start: 15,
+                end: 21,
+                file: FileId(
+                    1,
+                ),
+            },
+        },
+        SlotDrop {
+            slot_id: SlotId(
+                0,
+            ),
+            span: Span {
+                start: 7,
+                end: 13,
+                file: FileId(
+                    1,
+                ),
+            },
+        },
+        FrameLeave {
+            frame_id: FrameId(
+                1,
+            ),
+            return_value: Int(
+                5,
+            ),
+            span: Span {
+                start: 30,
+                end: 43,
+                file: FileId(
+                    1,
+                ),
+            },
+        },
+        SlotAlloc {
+            slot_id: SlotId(
+                2,
+            ),
+            name: "r",
+            ty: I32,
+            span: Span {
+                start: 61,
+                end: 79,
+                file: FileId(
+                    1,
+                ),
+            },
+        },
+        SlotWrite {
+            slot_id: SlotId(
+                2,
+            ),
+            value: Int(
+                5,
+            ),
+            span: Span {
+                start: 61,
+                end: 79,
+                file: FileId(
+                    1,
+                ),
+            },
+        },
+        SlotDrop {
+            slot_id: SlotId(
+                2,
+            ),
+            span: Span {
+                start: 61,
+                end: 79,
+                file: FileId(
+                    1,
+                ),
+            },
+        },
+        FrameLeave {
+            frame_id: FrameId(
+                0,
+            ),
+            return_value: Unit,
+            span: Span {
+                start: 55,
+                end: 81,
+                file: FileId(
+                    1,
+                ),
+            },
+        },
+    ],
+)
