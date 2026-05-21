@@ -189,50 +189,54 @@ Acyclic. The drawn order is one valid topological sort. Edges from M03 to M05–
 
 ---
 
-### M03.2 — Scalar lattice expansion (integer types)
+### M03.2 — Scalar lattice expansion (integer + float types)
 
 - **Kind**: foundation
 - **Status**: planned
-- **Complexity**: M (modules: 3, bullets: 5, boundaries: 2)
+- **Complexity**: M (modules: 3, bullets: 6, boundaries: 2)
 - **Depends on**: M03, M05
-- **Authority**: CLAUDE.md › Supported Rust subset › "Level 1: primitives, let/let mut, functions, scopes". M03's typeck lattice (`i32`, `bool`, `()` only) under-implements the word "primitives" — common L1 patterns like `let count: u32 = …` or `let byte: u8 = …` hit a "Typeck error: unknown type" wall. This milestone broadens the lattice to cover Rust's signed/unsigned integer family.
+- **Authority**: CLAUDE.md › Supported Rust subset › "Level 1: primitives, let/let mut, functions, scopes". M03's typeck lattice (`i32`, `bool`, `()` only) under-implements the word "primitives" — common L1 patterns like `let count: u32 = …`, `let byte: u8 = …`, or `let ratio: f64 = …` hit a "Typeck error: unknown type" wall. This milestone broadens the lattice to cover Rust's signed/unsigned integer family plus the two IEEE 754 float types.
 
-**Goal.** Extend M03's `Ty` lattice to include the full Rust integer family (`i8`/`i16`/`i32`/`i64`/`i128`, `u8`/`u16`/`u32`/`u64`/`u128`, `isize`/`usize`) so learners writing common Rust patterns are not stopped by the type lattice's narrowness. Floats (`f32`/`f64`) deferred to a future revision because of their distinct comparison and overflow rules.
+**Goal.** Extend M03's `Ty` lattice to include (a) the full Rust integer family (`i8`/`i16`/`i32`/`i64`/`i128`, `u8`/`u16`/`u32`/`u64`/`u128`, `isize`/`usize`) and (b) the two float types (`f32`, `f64`), so learners writing common Rust patterns are not stopped by the lattice's narrowness.
 
 **In scope.**
-- Extend `Ty` enum in `src/typeck.rs` with 12 new integer variants. Update `Ty::is_copy()` (all integers are Copy → return `true`) and `Ty::name()` (per-variant string rendering: `"u8"`, `"i64"`, …). Rust's match-exhaustiveness check will flag every site needing an arm.
-- Extend `Value` in `src/event.rs` to hold typed integer values. Plan-phase decides between per-type variants (`Value::I8(i8)`, …) versus a unified representation (`Value::Int { kind: IntKind, bits: i128 }`); the unified form is cleaner but adds a small abstraction. Either way the JSON wire shape is documented as part of M03's amended contract.
-- Recognize the 12 new type names as valid type annotations in `let` bindings, function parameters, and function return types. Annotation-driven only — **no literal suffix parsing** (`5u8`, `5_i64`) in this milestone (deferred).
-- Add overflow detection at the evaluator: arithmetic operations that would overflow the destination type's range emit a `Note { kind: RuntimeError, message: "u8 overflow: …" }` and halt the trace. Pedagogically aligned with the existing div-by-zero pattern.
-- Cross-type arithmetic is a typeck error with a clear message (e.g. `u8 + i32` reports "expected u8, found i32" at the right operand's span).
-- Update `src/ui.rs::render_value` to suffix the type when rendering values (`5_u8` instead of just `5`). The stacks panel makes the type visible alongside the value.
-- M03 snapshot tests grow at least 2 new samples exercising non-i32 integers; M05 dropdown grows at least 1 user-facing example.
+- Extend `Ty` enum in `src/typeck.rs` with 12 new integer variants + 2 float variants (`F32`, `F64`). Update `Ty::is_copy()` (all 14 are Copy → return `true`) and `Ty::name()` (per-variant string rendering). Rust's match-exhaustiveness check will flag every site needing an arm.
+- Extend `Value` in `src/event.rs` to hold typed integer + float values. Plan-phase decides between per-type variants vs. a unified representation (e.g. `Value::Int { kind: IntKind, bits: i128 }` plus `Value::Float { kind: FloatKind, bits: u64 }` storing the IEEE 754 bit pattern); the unified form is cleaner but adds a small abstraction. Either way the JSON wire shape is documented as part of M03's amended contract. Note: introducing floats means `Value` can no longer derive `Eq` — `PartialEq` only. Any downstream usage relying on `Eq` (HashMap keys, etc.) gets refactored as part of this milestone.
+- Recognize the 14 new type names as valid type annotations in `let` bindings, function parameters, and function return types. Annotation-driven only — **no literal suffix parsing** (`5u8`, `2.5_f32`) in this milestone (deferred).
+- **Integer arithmetic**: overflow on `+`/`-`/`*` emits a `Note { kind: RuntimeError, message: "u8 overflow: …" }` and halts the trace. Pedagogically aligned with the existing div-by-zero pattern.
+- **Float arithmetic**: follows IEEE 754 — overflow produces `±Inf`, `0.0 / 0.0` produces `NaN`, etc. **No runtime error** for these (they're valid Rust behavior). Instead, the evaluator emits a `Note { kind: Info, message: "produced NaN" }` (or similar) the first time a NaN or Inf appears in a binding, surfacing the special-value pedagogy without halting the trace.
+- Cross-type arithmetic is a typeck error with a clear message (e.g. `u8 + i32` reports "expected u8, found i32" at the right operand's span). `i32 + f64` likewise.
+- Update `src/ui.rs::render_value` to suffix the type when rendering values (`5_u8`, `2.5_f64`, `NaN_f32`, `-Inf_f64`). The stacks panel makes the type visible alongside the value; NaN/Inf are rendered as the literal Rust strings.
+- M03 snapshot tests grow at least 3 new samples exercising non-`i32` types; M05 dropdown grows at least 2 user-facing examples (one integer, one float).
 
 **Out of scope.**
-- **Literal type suffixes** (`5u8`, `5_i64`). Values get their type from annotations or function signatures, not from suffix syntax. A future revision could add suffix parsing if learner cases demand it.
-- **Float types** (`f32`, `f64`). Different equality/comparison/NaN/overflow semantics; needs its own revision milestone.
-- **Casts** (`x as u32`). Conversion is implicit through annotation only; explicit casts deferred.
+- **Literal type suffixes** (`5u8`, `2.5_f32`). Values get their type from annotations or function signatures, not from suffix syntax. A future revision could add suffix parsing if learner cases demand it.
+- **Float-typed literals without annotation**: `let x = 2.5;` requires the parser to recognize `2.5` as a float literal. This milestone supports `let x: f64 = 2;` (integer literal coerced via annotation, plan-phase confirms) and `let x: f64 = 2.5;` (float literal with a `.`). The full untyped-literal inference story is plan-phase work.
+- **Casts** (`x as u32`, `i as f64`). Conversion is implicit through annotation only; explicit casts deferred.
 - **BigInt** / arbitrary-precision integers.
+- **Float comparisons that exercise NaN ordering quirks** (`NaN < 1.0` returns `false`, etc.) get the standard Rust `PartialOrd` semantics; no special pedagogical UX for this in M03.2.
 
 **Entry criteria.**
 - M03 closed (event model + L1 evaluator on `main`).
 - M05 closed (live pipeline + editor — required for browser-side QA of the new types).
 
 **Exit criteria.**
-- `cargo test` passes with new typeck + eval unit tests covering each new integer type's basic arithmetic.
+- `cargo test` passes with new typeck + eval unit tests covering each new type's basic arithmetic.
 - Typing `fn main() { let x: u8 = 5; }` in the M05 editor produces a trace where `x` shows in the stacks panel as `5_u8`.
 - Typing `fn main() { let x: u8 = 250; let y = x + 10; }` produces a `Note { kind: RuntimeError }` pointing at the overflow site (`+ 10` exceeds `u8::MAX`).
-- Cross-type arithmetic (e.g. annotating two `let`s with different integer types and adding them) is a typeck error with a span on the mismatched operand.
+- Typing `fn main() { let x: f64 = 0.0; let y = 1.0 / x; }` produces a `Note { kind: Info }` describing `y` as `+Inf_f64`; the trace does NOT halt (Inf is valid).
+- Typing `fn main() { let x: f64 = 0.0; let y = x / x; }` produces a `Note { kind: Info }` describing `y` as `NaN_f64`; trace does NOT halt.
+- Cross-type arithmetic (e.g. `let a: u8 = 1; let b: i32 = 2; let c = a + b;`) is a typeck error with a span on the mismatched operand.
 - No regression to existing M01/M02/M03/M04/M05 tests — `i32`/`bool`/`()` semantics unchanged.
-- ≥ 2 new `m03_2_*.rs` samples shipped covering: (a) basic `u8` arithmetic, (b) overflow runtime-error.
+- ≥ 3 new `m03_2_*.rs` samples shipped covering: (a) basic `u8` arithmetic, (b) integer overflow runtime-error, (c) float arithmetic with NaN or Inf.
 
 **Demo.**
 - Format: browser (via M05's editor)
-- Inputs: `tests/samples/m03_2_*.rs` (≥ 2 samples) + live editing of typical patterns like `let count: u32 = 100;`.
-- Outputs (browser-observed steps): for `m03_2_u8_overflow`: step 1 → main opens; 2-3 → `x: u8 = 250` allocated and written; 4-5 → `+ 10` evaluates → status bar shows `"Typeck error: u8 overflow"`. Stacks panel halts at `x = 250_u8`.
+- Inputs: `tests/samples/m03_2_*.rs` + live editing of typical patterns like `let count: u32 = 100;` or `let ratio: f64 = 3.14;`.
+- Outputs (browser-observed steps): for `m03_2_u8_overflow`: step 1 → main opens; 2-3 → `x: u8 = 250` allocated and written; 4-5 → `+ 10` evaluates → status bar shows `"u8 overflow"`. Stacks panel halts. For `m03_2_float_nan`: similar but ends with `y = NaN_f64` and an info note.
 - Command: `cd web && trunk serve --open`
 
-**Notes.** Second revision milestone in the project (after M03.1). Reuses the closed-enum-with-revisions precedent established in M03.1 — `Ty` and `Value` grow additively by 12 + N variants respectively. The choice between per-type `Value` variants vs. a unified `Value::Int { kind, bits }` is a plan-phase decision; both work, the unified form is more compact. Float types are deferred to a separate revision milestone (M03.3 if they land).
+**Notes.** Second revision milestone in the project (after M03.1). Reuses the closed-enum-with-revisions precedent established in M03.1 — `Ty` and `Value` grow additively. Adding floats forces `Value` to drop the `Eq` derive (floats don't impl `Eq` because `NaN != NaN`); this is intentional and any downstream `Eq`-dependent code gets refactored to `PartialEq` as part of M03.2. Integer overflow halts the trace (consistent with div-by-zero); float `Inf`/`NaN` are valid Rust behavior and surface via `Note { kind: Info }` without halting — the distinction is itself pedagogically meaningful. Plan-phase decides the exact `Value` shape (per-type variants vs. unified `{ kind, bits }`).
 
 - **Kind**: foundation
 - **Status**: planned
