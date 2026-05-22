@@ -115,6 +115,8 @@ src/
 - in-memory; trace JSON shape gains the new `ReturnValue` variant case and loses the `FrameEnter.params` field. (006-m03-1-protocol-revision)
 - Rust 2024 edition (same toolchain as M01–M03.1). No new toolchain requirements. + existing `indexmap`, `serde`, `serde_json`, `wasm-bindgen`, `js-sys`, `console_error_panic_hook`. **No new Rust deps**. New JS dependency on `@codemirror/commands@6` (already added pre-plan for the Tab-handling adjustment; reused here for the keymap). (007-live-l1-editing)
 - in-memory; no new files. `web/traces/*.json` files become deprecated artifacts (FR-010); trunk's pre-build `gen_traces` hook is dropped. (007-live-l1-editing)
+- Rust 2024 edition (same toolchain as M01–M05). No new toolchain requirements. + existing `indexmap`, `serde`, `serde_json`, `wasm-bindgen`, `js-sys`, `console_error_panic_hook`. **No new Rust deps**. No JS dep changes. (008-m03-2-scalar-lattice)
+- in-memory; no new files. M03 snapshot tests re-baselined (Value's Debug format changes); `web/traces/` remains obsolete (M05 already removed the trunk hook). (008-m03-2-scalar-lattice)
 
 ## Recent Changes
 - 001-milestone-roadmap: Added N/A — deliverable is markdown documentation + `CLAUDE.md` (authoritative scope source); `specs/001-milestone-roadmap/spec.md` (this feature's spec)

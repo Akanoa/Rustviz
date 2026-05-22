@@ -20,6 +20,8 @@ pub struct Token {
 pub enum TokenKind {
     /// Integer literal parsed to `i64`.
     Int(i64),
+    /// **M03.2**: Float literal parsed to `f64`. Recognized as `digits.digits`.
+    Float(f64),
     /// Boolean literal `true` or `false`.
     Bool(bool),
     /// Identifier (non-keyword).
@@ -95,6 +97,7 @@ impl TokenKind {
     pub fn describe(&self) -> &'static str {
         match self {
             Self::Int(_) => "integer literal",
+            Self::Float(_) => "float literal",
             Self::Bool(_) => "boolean literal",
             Self::Ident(_) => "identifier",
             Self::Let => "`let`",

@@ -171,21 +171,27 @@ Ok {
                 file: FileId(
                     1,
                 ),
-            }: I32,
+            }: Int(
+                I32,
+            ),
             Span {
                 start: 85,
                 end: 86,
                 file: FileId(
                     1,
                 ),
-            }: I32,
+            }: Int(
+                I32,
+            ),
             Span {
                 start: 67,
                 end: 88,
                 file: FileId(
                     1,
                 ),
-            }: I32,
+            }: Int(
+                I32,
+            ),
             Span {
                 start: 97,
                 end: 98,
@@ -248,7 +254,9 @@ Ok {
             BindingId(
                 4,
             ): Var(
-                I32,
+                Int(
+                    I32,
+                ),
             ),
         },
     },

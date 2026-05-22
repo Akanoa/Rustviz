@@ -69,10 +69,11 @@ pub mod event;  // exposed for `rustviz::event::MemEvent` pattern matching
 
 ## Stability rules
 
-- The `MemEvent` enum's variant set is stable from M03 onward. **Revision milestones** (e.g. `M03.1`, future `M0X.N` patterns) may:
-  - Add **new variants** with explicit maintainer consent + coordinated update of all consumers (M04+).
+- The `MemEvent`, `Ty`, and `Value` types' shapes are stable from M03 onward. **Revision milestones** (e.g. `M03.1`, `M03.2`, future `M0X.N` patterns) may:
+  - Add **new variants** to closed enums with explicit maintainer consent + coordinated update of all consumers (M04+).
   - **Remove redundant fields** from existing variants when the same information is reachable via other events in the stream.
-  Removing or renaming existing variants remains a breaking change requiring full re-coordination. Modifying payload field semantics (without removal) is breaking.
-- **M03.1 is the first invocation of this revised rule** (see `specs/006-m03-1-protocol-revision/contracts/m03-1-protocol-delta.md`): it adds `MemEvent::ReturnValue` and removes the redundant `FrameEnter.params` field.
-- Payload value-types that ARE marked "stable for M03 variants" (e.g. `Value`, `NoteKind`) can grow additively.
+  - **Restructure variants' internal field layout** with maintainer consent (e.g. `Value::Int(i64)` → `Value::Int { kind: IntKind, bits: i128 }` in M03.2 to support multiple integer widths).
+  Removing or renaming top-level variants remains a breaking change requiring full re-coordination. Modifying payload field semantics (without restructure) is breaking.
+- **M03.1 was the first invocation of this revised rule** (see `specs/006-m03-1-protocol-revision/contracts/m03-1-protocol-delta.md`): adds `MemEvent::ReturnValue`, removes the redundant `FrameEnter.params` field.
+- **M03.2 extends the rule to `Ty` + `Value`** (see `specs/008-m03-2-scalar-lattice/contracts/m03-2-protocol-delta.md`): restructures `Ty` to `Int(IntKind) / Float(FloatKind) / Bool / Unit`, restructures `Value` to a unified `Int { kind, bits }` + `Float { kind, value }` form, and introduces `IntKind` (12 variants) + `FloatKind` (2 variants).
 - Behavioral changes (different event emission order for the same input) are breaking and require coordination with M04.

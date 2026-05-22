@@ -41,11 +41,30 @@ pub enum Pointee {
 
 /// A runtime value held in a stack slot.
 ///
-/// M03 covers the L1 value lattice; M07 will add heap-allocated variants.
+/// **M03.2**: integer and float variants unified to `{ kind, bits|value }` form
+/// so all 12 integer widths + 2 float widths dispatch through one match per op.
+/// `Bool` and `Unit` stay as standalone variants.
+///
+/// `PartialEq` only (no `Eq`) because floats don't impl `Eq` (NaN != NaN).
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Value {
-    /// 32-bit signed integer. Stored as `i64` internally to detect overflow at op time.
-    Int(i64),
+    /// Integer value. `bits` stores the value widened to `i128`; the actual
+    /// representable range is determined by `kind` (see `IntKind::contains`).
+    Int {
+        /// Width / signedness discriminator.
+        kind: crate::typeck::IntKind,
+        /// Value, widened to `i128` for unified storage.
+        bits: i128,
+    },
+    /// Float value. Always stored as `f64`; narrowed to `f32` on display and
+    /// after arithmetic when `kind == F32` (so f32-specific overflow → Inf
+    /// surfaces correctly).
+    Float {
+        /// Width discriminator (F32 or F64).
+        kind: crate::typeck::FloatKind,
+        /// Value, always stored as f64.
+        value: f64,
+    },
     /// Boolean.
     Bool(bool),
     /// Unit `()`.
@@ -53,10 +72,11 @@ pub enum Value {
 }
 
 impl Value {
-    /// User-facing type name of this value (`"i32"`, `"bool"`, `"()"`).
+    /// User-facing type name of this value (`"u8"`, `"f64"`, `"bool"`, `"()"`).
     pub fn type_name(&self) -> &'static str {
         match self {
-            Self::Int(_) => "i32",
+            Self::Int { kind, .. } => kind.name(),
+            Self::Float { kind, .. } => kind.name(),
             Self::Bool(_) => "bool",
             Self::Unit => "()",
         }
@@ -307,7 +327,7 @@ mod tests {
         let e = MemEvent::SlotMove {
             from: SlotId(0),
             to: SlotId(1),
-            value: Value::Int(5),
+            value: Value::Int { kind: crate::typeck::IntKind::I32, bits: 5 },
             span: dummy_span(),
         };
         let dbg = format!("{e:?}");

@@ -261,6 +261,10 @@ impl Parser {
                 self.bump();
                 Ok(Expr::LitInt(*v, tok.span))
             }
+            TokenKind::Float(v) => {
+                self.bump();
+                Ok(Expr::LitFloat(*v, tok.span))
+            }
             TokenKind::Bool(b) => {
                 self.bump();
                 Ok(Expr::LitBool(*b, tok.span))

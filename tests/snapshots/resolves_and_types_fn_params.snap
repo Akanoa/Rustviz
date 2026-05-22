@@ -146,42 +146,54 @@ Ok {
                 file: FileId(
                     1,
                 ),
-            }: I32,
+            }: Int(
+                I32,
+            ),
             Span {
                 start: 40,
                 end: 41,
                 file: FileId(
                     1,
                 ),
-            }: I32,
+            }: Int(
+                I32,
+            ),
             Span {
                 start: 36,
                 end: 41,
                 file: FileId(
                     1,
                 ),
-            }: I32,
+            }: Int(
+                I32,
+            ),
             Span {
                 start: 73,
                 end: 74,
                 file: FileId(
                     1,
                 ),
-            }: I32,
+            }: Int(
+                I32,
+            ),
             Span {
                 start: 76,
                 end: 77,
                 file: FileId(
                     1,
                 ),
-            }: I32,
+            }: Int(
+                I32,
+            ),
             Span {
                 start: 69,
                 end: 78,
                 file: FileId(
                     1,
                 ),
-            }: I32,
+            }: Int(
+                I32,
+            ),
         },
         binding_types: {
             BindingId(
@@ -189,10 +201,16 @@ Ok {
             ): Fn(
                 FnSig {
                     params: [
-                        I32,
-                        I32,
+                        Int(
+                            I32,
+                        ),
+                        Int(
+                            I32,
+                        ),
                     ],
-                    ret: I32,
+                    ret: Int(
+                        I32,
+                    ),
                 },
             ),
             BindingId(
@@ -206,17 +224,23 @@ Ok {
             BindingId(
                 2,
             ): Var(
-                I32,
+                Int(
+                    I32,
+                ),
             ),
             BindingId(
                 3,
             ): Var(
-                I32,
+                Int(
+                    I32,
+                ),
             ),
             BindingId(
                 4,
             ): Var(
-                I32,
+                Int(
+                    I32,
+                ),
             ),
         },
     },

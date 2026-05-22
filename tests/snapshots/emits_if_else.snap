@@ -22,7 +22,9 @@ Ok(
                 0,
             ),
             name: "v",
-            ty: I32,
+            ty: Int(
+                I32,
+            ),
             span: Span {
                 start: 16,
                 end: 50,
@@ -35,9 +37,10 @@ Ok(
             slot_id: SlotId(
                 0,
             ),
-            value: Int(
-                2,
-            ),
+            value: Int {
+                kind: I32,
+                bits: 2,
+            },
             span: Span {
                 start: 16,
                 end: 50,

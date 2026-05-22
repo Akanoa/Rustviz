@@ -108,6 +108,9 @@ pub struct LetStmt {
 pub enum Expr {
     /// Integer literal.
     LitInt(i64, Span),
+    /// **M03.2**: Float literal. Stores `f64`; narrowed to `f32` by typeck
+    /// when the surrounding annotation says `f32`.
+    LitFloat(f64, Span),
     /// Boolean literal.
     LitBool(bool, Span),
     /// Identifier reference (resolved in M02).
@@ -167,7 +170,10 @@ impl Expr {
     /// Source span of this expression.
     pub fn span(&self) -> Span {
         match self {
-            Self::LitInt(_, s) | Self::LitBool(_, s) | Self::Ident(_, s) => *s,
+            Self::LitInt(_, s)
+            | Self::LitFloat(_, s)
+            | Self::LitBool(_, s)
+            | Self::Ident(_, s) => *s,
             Self::Unary { span, .. }
             | Self::Binary { span, .. }
             | Self::Call { span, .. }

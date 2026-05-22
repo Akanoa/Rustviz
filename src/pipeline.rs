@@ -127,6 +127,122 @@ mod tests {
         assert!(!err.message.is_empty());
     }
 
+    // M03.2 / US1: integer-type tests covering the new IntKind variants.
+
+    #[test]
+    fn run_pipeline_u8_basic() {
+        let source = "fn main() { let a: u8 = 5; let b: u8 = 3; let c: u8 = a + b; }";
+        let events = run_pipeline(source).expect("u8 arithmetic compiles");
+        // Verify at least one SlotWrite with the new Value::Int { kind: U8 } form.
+        let has_u8 = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite {
+                value: crate::Value::Int { kind: crate::typeck::IntKind::U8, .. },
+                ..
+            }
+        ));
+        assert!(has_u8, "expected at least one u8 SlotWrite");
+    }
+
+    #[test]
+    fn run_pipeline_u8_overflow() {
+        let source = "fn main() { let a: u8 = 250; let b: u8 = a + 10; }";
+        let events = run_pipeline(source).expect("u8 overflow compiles fine; halts at runtime");
+        // Trace must end with a RuntimeError Note (overflow halt).
+        let last = events.last().expect("non-empty trace");
+        assert!(
+            matches!(last, crate::MemEvent::Note { kind: crate::NoteKind::RuntimeError, .. }),
+            "expected runtime-error halt, got {last:?}"
+        );
+    }
+
+    #[test]
+    fn run_pipeline_unsigned_negation_rejected() {
+        let err = run_pipeline("fn main() { let x: u8 = -1; }")
+            .expect_err("unsigned negation should fail typeck");
+        assert_eq!(err.stage, CompileStage::Typeck);
+    }
+
+    #[test]
+    fn run_pipeline_literal_out_of_range() {
+        let err = run_pipeline("fn main() { let x: u8 = 300; }")
+            .expect_err("literal 300 doesn't fit u8");
+        assert_eq!(err.stage, CompileStage::Typeck);
+    }
+
+    #[test]
+    fn run_pipeline_cross_type_error() {
+        let err = run_pipeline("fn main() { let a: u8 = 1; let b: i32 = 2; let c = a + b; }")
+            .expect_err("u8 + i32 is cross-type");
+        assert_eq!(err.stage, CompileStage::Typeck);
+    }
+
+    #[test]
+    fn run_pipeline_i64_arithmetic() {
+        let source = "fn main() { let a: i64 = 100; let b: i64 = 200; let c: i64 = a + b; }";
+        let events = run_pipeline(source).expect("i64 arithmetic compiles");
+        assert!(!events.is_empty());
+    }
+
+    // M03.2 / US2: float tests.
+
+    #[test]
+    fn run_pipeline_float_basic() {
+        let source = "fn main() { let a: f64 = 1.5; let b: f64 = 2.5; let c: f64 = a + b; }";
+        let events = run_pipeline(source).expect("f64 arithmetic compiles");
+        // Verify at least one Float SlotWrite with value 4.0.
+        let has_float = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite {
+                value: crate::Value::Float { kind: crate::typeck::FloatKind::F64, .. },
+                ..
+            }
+        ));
+        assert!(has_float, "expected an f64 SlotWrite");
+        // Trace must NOT end with a RuntimeError — normal arithmetic.
+        let last = events.last().expect("non-empty trace");
+        assert!(!matches!(last, crate::MemEvent::Note { kind: crate::NoteKind::RuntimeError, .. }));
+    }
+
+    #[test]
+    fn run_pipeline_float_nan() {
+        let source = "fn main() { let a: f64 = 0.0; let b: f64 = a / a; }";
+        let events = run_pipeline(source).expect("float division by zero compiles");
+        // Must contain at least one Info note (produced NaN).
+        let has_info = events.iter().any(|e| matches!(e,
+            crate::MemEvent::Note { kind: crate::NoteKind::Info, .. }
+        ));
+        assert!(has_info, "expected an Info note for NaN production");
+        // Trace must NOT halt (NaN is valid Rust).
+        let last = events.last().expect("non-empty trace");
+        assert!(!matches!(last, crate::MemEvent::Note { kind: crate::NoteKind::RuntimeError, .. }));
+    }
+
+    #[test]
+    fn run_pipeline_float_inf() {
+        let source = "fn main() { let a: f64 = 0.0; let b: f64 = 1.0; let c: f64 = b / a; }";
+        let events = run_pipeline(source).expect("1/0 compiles");
+        // Same Info-note + no halt expectation.
+        let has_info = events.iter().any(|e| matches!(e,
+            crate::MemEvent::Note { kind: crate::NoteKind::Info, message, .. } if message.contains("+Inf")
+        ));
+        assert!(has_info, "expected an Info note announcing +Inf");
+    }
+
+    #[test]
+    fn run_pipeline_float_propagation_no_redundant_note() {
+        // After `a` is NaN, `b = a + 1.0` propagates NaN — must NOT emit
+        // a second Info note (de-novo rule).
+        let source = "fn main() {
+            let a: f64 = 0.0;
+            let n: f64 = a / a;
+            let m: f64 = n + 1.0;
+        }";
+        let events = run_pipeline(source).expect("compiles");
+        let info_count = events.iter().filter(|e| matches!(e,
+            crate::MemEvent::Note { kind: crate::NoteKind::Info, .. }
+        )).count();
+        assert_eq!(info_count, 1, "expected exactly one Info note (no propagation re-emission)");
+    }
+
     #[test]
     fn compile_error_serde_roundtrip() {
         let err = run_pipeline("fn main() { let x = ; }").expect_err("parse error");

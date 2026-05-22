@@ -41,29 +41,52 @@ pub fn lex(file: FileId, source_map: &SourceMap) -> Result<Vec<Token>, ParseErro
 
         let start = pos;
 
-        // Integer literal: digit sequence.
+        // Numeric literal: digit sequence, optionally followed by `.digits`
+        // for a float literal (M03.2). The `.digits` form requires the `.` to
+        // be followed by at least one digit — otherwise the int literal ends
+        // and the `.` becomes a separate token (only relevant once L1 has
+        // method calls, which it doesn't yet).
         if b.is_ascii_digit() {
             while pos < len && src[pos as usize].is_ascii_digit() {
                 pos += 1;
             }
-            // Reject identifier characters immediately following (e.g. `12abc`).
+            // M03.2: float literal? Peek for `.digit`.
+            let is_float = pos + 1 < len
+                && src[pos as usize] == b'.'
+                && src[(pos + 1) as usize].is_ascii_digit();
+            if is_float {
+                pos += 1; // consume `.`
+                while pos < len && src[pos as usize].is_ascii_digit() {
+                    pos += 1;
+                }
+            }
+            // Reject identifier characters immediately following.
             if pos < len {
                 let n = src[pos as usize];
                 if n.is_ascii_alphabetic() || n == b'_' {
                     return Err(ParseError {
-                        message: "invalid suffix after integer literal".into(),
+                        message: "invalid suffix after numeric literal".into(),
                         span: Span::new(pos, pos + 1, file),
                     });
                 }
             }
             let s = std::str::from_utf8(&src[start as usize..pos as usize])
                 .expect("digits are valid UTF-8");
-            let val: i64 = s.parse().map_err(|_| ParseError {
-                message: format!("integer literal `{s}` does not fit in i64"),
-                span: Span::new(start, pos, file),
-            })?;
+            let kind = if is_float {
+                let val: f64 = s.parse().map_err(|_| ParseError {
+                    message: format!("float literal `{s}` is invalid"),
+                    span: Span::new(start, pos, file),
+                })?;
+                TokenKind::Float(val)
+            } else {
+                let val: i64 = s.parse().map_err(|_| ParseError {
+                    message: format!("integer literal `{s}` does not fit in i64"),
+                    span: Span::new(start, pos, file),
+                })?;
+                TokenKind::Int(val)
+            };
             tokens.push(Token {
-                kind: TokenKind::Int(val),
+                kind,
                 span: Span::new(start, pos, file),
             });
             continue;

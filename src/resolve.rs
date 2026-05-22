@@ -211,7 +211,9 @@ impl Resolver {
 
     fn resolve_expr(&mut self, expr: &ast::Expr) -> Result<(), ParseError> {
         match expr {
-            ast::Expr::LitInt(_, _) | ast::Expr::LitBool(_, _) => {}
+            ast::Expr::LitInt(_, _)
+            | ast::Expr::LitFloat(_, _)
+            | ast::Expr::LitBool(_, _) => {}
             ast::Expr::Ident(name, span) => match self.lookup(name) {
                 Some(id) => {
                     self.resolution.uses.insert(*span, id);

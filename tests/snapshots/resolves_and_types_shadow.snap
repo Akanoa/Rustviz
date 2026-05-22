@@ -143,28 +143,36 @@ Ok {
                 file: FileId(
                     1,
                 ),
-            }: I32,
+            }: Int(
+                I32,
+            ),
             Span {
                 start: 39,
                 end: 40,
                 file: FileId(
                     1,
                 ),
-            }: I32,
+            }: Int(
+                I32,
+            ),
             Span {
                 start: 43,
                 end: 44,
                 file: FileId(
                     1,
                 ),
-            }: I32,
+            }: Int(
+                I32,
+            ),
             Span {
                 start: 39,
                 end: 44,
                 file: FileId(
                     1,
                 ),
-            }: I32,
+            }: Int(
+                I32,
+            ),
             Span {
                 start: 58,
                 end: 62,
@@ -192,12 +200,16 @@ Ok {
             BindingId(
                 1,
             ): Var(
-                I32,
+                Int(
+                    I32,
+                ),
             ),
             BindingId(
                 2,
             ): Var(
-                I32,
+                Int(
+                    I32,
+                ),
             ),
             BindingId(
                 3,

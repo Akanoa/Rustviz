@@ -365,7 +365,23 @@ fn return_to_pending(event: &MemEvent) -> Option<PendingReturnView> {
 
 fn render_value(value: &Value) -> String {
     match value {
-        Value::Int(i) => i.to_string(),
+        // M03.2: type-tag suffix on numeric values (`5_i32`, `2.5_f64`, `NaN_f64`, ...).
+        Value::Int { kind, bits } => format!("{bits}_{}", kind.name()),
+        Value::Float { kind, value } => {
+            let v = *value;
+            let body = if v.is_nan() {
+                "NaN".to_owned()
+            } else if v.is_infinite() {
+                if v > 0.0 { "+Inf".to_owned() } else { "-Inf".to_owned() }
+            } else {
+                // Narrow to f32 for display when the value is an F32.
+                match kind {
+                    crate::typeck::FloatKind::F32 => (v as f32).to_string(),
+                    crate::typeck::FloatKind::F64 => v.to_string(),
+                }
+            };
+            format!("{body}_{}", kind.name())
+        }
         Value::Bool(b) => b.to_string(),
         Value::Unit => "()".to_owned(),
     }
@@ -643,8 +659,8 @@ mod tests {
         let trace = vec![
             frame_enter("main", 0),
             frame_enter("add", 1),
-            return_value(1, Value::Int(5)),
-            frame_leave(1, Value::Int(5)),
+            return_value(1, Value::Int { kind: crate::typeck::IntKind::I32, bits: 5 }),
+            frame_leave(1, Value::Int { kind: crate::typeck::IntKind::I32, bits: 5 }),
         ];
         let mut c = Cursor::new(trace);
         // After FrameEnter(main): main is the only frame, current.
@@ -682,8 +698,8 @@ mod tests {
     fn slot_alloc_then_write_then_drop() {
         let trace = vec![
             frame_enter("main", 0),
-            slot_alloc(0, "x", Ty::I32),
-            slot_write(0, Value::Int(5)),
+            slot_alloc(0, "x", Ty::Int(crate::typeck::IntKind::I32)),
+            slot_write(0, Value::Int { kind: crate::typeck::IntKind::I32, bits: 5 }),
             slot_drop(0),
         ];
         let mut c = Cursor::new(trace);
@@ -694,10 +710,10 @@ mod tests {
         let s = c.state_snapshot("");
         assert_eq!(s.frames[0].slots.len(), 1);
         assert_eq!(s.frames[0].slots[0].value, None);
-        // After SlotWrite: value Some("5").
+        // After SlotWrite: value Some("5_i32") — M03.2 type-tag suffix.
         c.step_forward();
         let s = c.state_snapshot("");
-        assert_eq!(s.frames[0].slots[0].value, Some("5".into()));
+        assert_eq!(s.frames[0].slots[0].value, Some("5_i32".into()));
         // After SlotDrop: slot gone.
         c.step_forward();
         let s = c.state_snapshot("");
@@ -710,10 +726,10 @@ mod tests {
     fn step_back_undoes_step_forward() {
         let trace = vec![
             frame_enter("main", 0),
-            slot_alloc(0, "x", Ty::I32),
-            slot_write(0, Value::Int(5)),
-            slot_alloc(1, "y", Ty::I32),
-            slot_write(1, Value::Int(6)),
+            slot_alloc(0, "x", Ty::Int(crate::typeck::IntKind::I32)),
+            slot_write(0, Value::Int { kind: crate::typeck::IntKind::I32, bits: 5 }),
+            slot_alloc(1, "y", Ty::Int(crate::typeck::IntKind::I32)),
+            slot_write(1, Value::Int { kind: crate::typeck::IntKind::I32, bits: 6 }),
         ];
         let mut c = Cursor::new(trace);
         // Step to position 3.
@@ -797,8 +813,8 @@ mod tests {
         let trace = vec![
             frame_enter("main", 0),
             frame_enter("add", 1),
-            return_value(1, Value::Int(5)),
-            frame_leave(1, Value::Int(5)),
+            return_value(1, Value::Int { kind: crate::typeck::IntKind::I32, bits: 5 }),
+            frame_leave(1, Value::Int { kind: crate::typeck::IntKind::I32, bits: 5 }),
             // Second call to add: should overwrite the grayed first add frame.
             frame_enter("add", 2),
         ];
@@ -825,8 +841,8 @@ mod tests {
     fn return_value_persists_on_grayed_frame() {
         let trace = vec![
             frame_enter("main", 0),
-            return_value(0, Value::Int(5)),
-            frame_leave(0, Value::Int(5)),
+            return_value(0, Value::Int { kind: crate::typeck::IntKind::I32, bits: 5 }),
+            frame_leave(0, Value::Int { kind: crate::typeck::IntKind::I32, bits: 5 }),
         ];
         let mut c = Cursor::new(trace);
         // Step to ReturnValue: frame still active, return_value set.
@@ -835,11 +851,11 @@ mod tests {
         let s = c.state_snapshot("");
         assert_eq!(s.frames.len(), 1);
         assert!(s.frames[0].active);
-        assert_eq!(s.frames[0].return_value.as_deref(), Some("5"));
+        assert_eq!(s.frames[0].return_value.as_deref(), Some("5_i32"));
         // pending_return still Some on the ReturnValue tick (transient highlight).
         let pending = s.pending_return.expect("pending_return on ReturnValue tick");
         assert_eq!(pending.frame_id, 0);
-        assert_eq!(pending.value, "5");
+        assert_eq!(pending.value, "5_i32");
         // Step past to FrameLeave: pending_return clears, but frame.return_value persists.
         c.step_forward();
         let s = c.state_snapshot("");
@@ -848,7 +864,7 @@ mod tests {
         assert!(!s.frames[0].active);
         assert_eq!(
             s.frames[0].return_value.as_deref(),
-            Some("5"),
+            Some("5_i32"),
             "return value persists on the grayed frame"
         );
     }

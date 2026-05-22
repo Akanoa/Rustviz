@@ -35,3 +35,12 @@ path = "tests/m03.rs"
 [[bin]]
 name = "gen_traces"
 path = "src/bin/gen_traces.rs"
+
+# M03.2: LTO + single codegen unit shrink the WASM bundle ~30% vs default
+# release. Trade: slightly longer build. Worth it for the browser-served
+# WASM; CI / local dev untouched (dev profile remains default).
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = "z"

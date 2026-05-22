@@ -58,21 +58,27 @@ Ok {
                 file: FileId(
                     1,
                 ),
-            }: I32,
+            }: Int(
+                I32,
+            ),
             Span {
                 start: 28,
                 end: 29,
                 file: FileId(
                     1,
                 ),
-            }: I32,
+            }: Int(
+                I32,
+            ),
             Span {
                 start: 24,
                 end: 29,
                 file: FileId(
                     1,
                 ),
-            }: I32,
+            }: Int(
+                I32,
+            ),
         },
         binding_types: {
             BindingId(
@@ -86,7 +92,9 @@ Ok {
             BindingId(
                 1,
             ): Var(
-                I32,
+                Int(
+                    I32,
+                ),
             ),
         },
     },

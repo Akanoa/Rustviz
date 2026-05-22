@@ -7,6 +7,7 @@ use crate::parse::ast;
 use crate::parse::error::ParseError;
 use crate::parse::span::Span;
 use crate::resolve::{BindingId, BindingKind, Resolution};
+use crate::typeck::IntKind;
 use crate::typeck::{BindingType, Ty, TypeMap};
 
 /// Maximum number of nested function frames before the evaluator emits a
@@ -421,7 +422,35 @@ impl<'a> Evaluator<'a> {
             return Value::Unit;
         }
         match expr {
-            ast::Expr::LitInt(v, _) => Value::Int(*v),
+            ast::Expr::LitInt(v, span) => {
+                // M03.2: consult typeck's recorded type for this literal —
+                // it may have been coerced from the default `I32` to a
+                // narrower `IntKind` by `try_coerce_to` (e.g. when this
+                // literal appears as `let x: u8 = 250` or as the RHS of
+                // `x: u8 + 10`).
+                let kind = match self.types.expr_types.get(span) {
+                    Some(crate::Ty::Int(k)) => *k,
+                    _ => IntKind::I32,
+                };
+                Value::Int { kind, bits: *v as i128 }
+            }
+            ast::Expr::LitFloat(v, span) => {
+                // M03.2: same coercion path for floats — typeck may have
+                // narrowed `f64` default to `f32` based on the surrounding
+                // annotation. f32 narrowing of the value itself happens
+                // here so subsequent arithmetic operates on f32-narrowed
+                // bits.
+                use crate::typeck::FloatKind;
+                let kind = match self.types.expr_types.get(span) {
+                    Some(crate::Ty::Float(k)) => *k,
+                    _ => FloatKind::F64,
+                };
+                let value = match kind {
+                    FloatKind::F32 => *v as f32 as f64,
+                    FloatKind::F64 => *v,
+                };
+                Value::Float { kind, value }
+            }
             ast::Expr::LitBool(b, _) => Value::Bool(*b),
             ast::Expr::Ident(_, span) => {
                 let binding_id = *self
@@ -480,13 +509,11 @@ impl<'a> Evaluator<'a> {
 
     fn apply_unary(&mut self, op: ast::UnOp, v: Value, span: Span) -> Value {
         match (op, v) {
-            (ast::UnOp::Neg, Value::Int(i)) => match i.checked_neg() {
-                Some(n) => self.bound_i32_or_overflow(n, span, "unary `-`"),
-                None => {
-                    self.emit_runtime_error(format!("integer overflow in unary `-{i}`"), span);
-                    Value::Unit
-                }
-            },
+            // M03.2: unary `-` on any signed-integer kind. typeck rejected
+            // unsigned negation already.
+            (ast::UnOp::Neg, Value::Int { kind, bits }) => {
+                self.int_checked(kind, bits.checked_neg(), span, "unary `-`")
+            }
             (ast::UnOp::Not, Value::Bool(b)) => Value::Bool(!b),
             _ => panic!("typeck should have rejected this unary application"),
         }
@@ -527,37 +554,103 @@ impl<'a> Evaluator<'a> {
         }
 
         match (op, lhs_v, rhs_v) {
-            (Add, Value::Int(a), Value::Int(b)) => {
-                self.checked_int(a.checked_add(b), span, "add")
+            // M03.2: integer arithmetic — dispatched over any IntKind that
+            // matches between the two operands (typeck guarantees the kinds
+            // agree). i128 checked_op handles wide-storage overflow; the
+            // kind.contains() gate enforces the actual type's range.
+            (Add, Value::Int { kind: a_k, bits: a }, Value::Int { kind: b_k, bits: b })
+                if a_k == b_k =>
+            {
+                self.int_checked(a_k, a.checked_add(b), span, "add")
             }
-            (Sub, Value::Int(a), Value::Int(b)) => {
-                self.checked_int(a.checked_sub(b), span, "subtract")
+            (Sub, Value::Int { kind: a_k, bits: a }, Value::Int { kind: b_k, bits: b })
+                if a_k == b_k =>
+            {
+                self.int_checked(a_k, a.checked_sub(b), span, "subtract")
             }
-            (Mul, Value::Int(a), Value::Int(b)) => {
-                self.checked_int(a.checked_mul(b), span, "multiply")
+            (Mul, Value::Int { kind: a_k, bits: a }, Value::Int { kind: b_k, bits: b })
+                if a_k == b_k =>
+            {
+                self.int_checked(a_k, a.checked_mul(b), span, "multiply")
             }
-            (Div, Value::Int(_), Value::Int(0)) => {
+            (Div, Value::Int { kind: a_k, .. }, Value::Int { kind: b_k, bits: 0 })
+                if a_k == b_k =>
+            {
                 self.emit_runtime_error("division by zero".into(), span);
                 Value::Unit
             }
-            (Div, Value::Int(a), Value::Int(b)) => {
-                self.checked_int(a.checked_div(b), span, "divide")
+            (Div, Value::Int { kind: a_k, bits: a }, Value::Int { kind: b_k, bits: b })
+                if a_k == b_k =>
+            {
+                self.int_checked(a_k, a.checked_div(b), span, "divide")
             }
-            (Rem, Value::Int(_), Value::Int(0)) => {
+            (Rem, Value::Int { kind: a_k, .. }, Value::Int { kind: b_k, bits: 0 })
+                if a_k == b_k =>
+            {
                 self.emit_runtime_error("remainder by zero".into(), span);
                 Value::Unit
             }
-            (Rem, Value::Int(a), Value::Int(b)) => {
-                self.checked_int(a.checked_rem(b), span, "remainder")
+            (Rem, Value::Int { kind: a_k, bits: a }, Value::Int { kind: b_k, bits: b })
+                if a_k == b_k =>
+            {
+                self.int_checked(a_k, a.checked_rem(b), span, "remainder")
             }
-            (Lt, Value::Int(a), Value::Int(b)) => Value::Bool(a < b),
-            (Le, Value::Int(a), Value::Int(b)) => Value::Bool(a <= b),
-            (Gt, Value::Int(a), Value::Int(b)) => Value::Bool(a > b),
-            (Ge, Value::Int(a), Value::Int(b)) => Value::Bool(a >= b),
-            (Eq, Value::Int(a), Value::Int(b)) => Value::Bool(a == b),
+            (Lt, Value::Int { kind: a_k, bits: a }, Value::Int { kind: b_k, bits: b })
+                if a_k == b_k => Value::Bool(a < b),
+            (Le, Value::Int { kind: a_k, bits: a }, Value::Int { kind: b_k, bits: b })
+                if a_k == b_k => Value::Bool(a <= b),
+            (Gt, Value::Int { kind: a_k, bits: a }, Value::Int { kind: b_k, bits: b })
+                if a_k == b_k => Value::Bool(a > b),
+            (Ge, Value::Int { kind: a_k, bits: a }, Value::Int { kind: b_k, bits: b })
+                if a_k == b_k => Value::Bool(a >= b),
+            (Eq, Value::Int { kind: a_k, bits: a }, Value::Int { kind: b_k, bits: b })
+                if a_k == b_k => Value::Bool(a == b),
             (Eq, Value::Bool(a), Value::Bool(b)) => Value::Bool(a == b),
-            (Neq, Value::Int(a), Value::Int(b)) => Value::Bool(a != b),
+            (Neq, Value::Int { kind: a_k, bits: a }, Value::Int { kind: b_k, bits: b })
+                if a_k == b_k => Value::Bool(a != b),
             (Neq, Value::Bool(a), Value::Bool(b)) => Value::Bool(a != b),
+
+            // M03.2: float arithmetic. f64 ops never panic; results may be
+            // NaN or ±Inf. The `float_arith` helper emits a `Note { Info }`
+            // when an operation produces a special value de novo (i.e.
+            // neither operand was already special).
+            (Add, Value::Float { kind: a_k, value: a }, Value::Float { kind: b_k, value: b })
+                if a_k == b_k =>
+            {
+                self.float_arith(a_k, a, b, |x, y| x + y, span)
+            }
+            (Sub, Value::Float { kind: a_k, value: a }, Value::Float { kind: b_k, value: b })
+                if a_k == b_k =>
+            {
+                self.float_arith(a_k, a, b, |x, y| x - y, span)
+            }
+            (Mul, Value::Float { kind: a_k, value: a }, Value::Float { kind: b_k, value: b })
+                if a_k == b_k =>
+            {
+                self.float_arith(a_k, a, b, |x, y| x * y, span)
+            }
+            (Div, Value::Float { kind: a_k, value: a }, Value::Float { kind: b_k, value: b })
+                if a_k == b_k =>
+            {
+                self.float_arith(a_k, a, b, |x, y| x / y, span)
+            }
+            (Rem, Value::Float { kind: a_k, value: a }, Value::Float { kind: b_k, value: b })
+                if a_k == b_k =>
+            {
+                self.float_arith(a_k, a, b, |x, y| x % y, span)
+            }
+            (Lt, Value::Float { kind: a_k, value: a }, Value::Float { kind: b_k, value: b })
+                if a_k == b_k => Value::Bool(a < b),
+            (Le, Value::Float { kind: a_k, value: a }, Value::Float { kind: b_k, value: b })
+                if a_k == b_k => Value::Bool(a <= b),
+            (Gt, Value::Float { kind: a_k, value: a }, Value::Float { kind: b_k, value: b })
+                if a_k == b_k => Value::Bool(a > b),
+            (Ge, Value::Float { kind: a_k, value: a }, Value::Float { kind: b_k, value: b })
+                if a_k == b_k => Value::Bool(a >= b),
+            (Eq, Value::Float { kind: a_k, value: a }, Value::Float { kind: b_k, value: b })
+                if a_k == b_k => Value::Bool(a == b),
+            (Neq, Value::Float { kind: a_k, value: a }, Value::Float { kind: b_k, value: b })
+                if a_k == b_k => Value::Bool(a != b),
             (And, Value::Bool(_), Value::Bool(b)) => Value::Bool(b),
             (Or, Value::Bool(_), Value::Bool(b)) => Value::Bool(b),
             (op, lhs, rhs) => panic!(
@@ -568,22 +661,53 @@ impl<'a> Evaluator<'a> {
         }
     }
 
-    fn checked_int(&mut self, result: Option<i64>, span: Span, op_name: &str) -> Value {
+    /// M03.2: range-check `result` against `kind`'s value range. On None
+    /// (i128 itself overflowed) or out-of-range, halt with a RuntimeError
+    /// note pointing at the op span.
+    fn int_checked(&mut self, kind: IntKind, result: Option<i128>, span: Span, op_name: &str) -> Value {
         match result {
-            Some(v) => self.bound_i32_or_overflow(v, span, op_name),
-            None => {
-                self.emit_runtime_error(format!("integer overflow in {op_name}"), span);
+            Some(v) if kind.contains(v) => Value::Int { kind, bits: v },
+            _ => {
+                self.emit_runtime_error(
+                    format!("{} overflow in {}", kind.name(), op_name),
+                    span,
+                );
                 Value::Unit
             }
         }
     }
 
-    fn bound_i32_or_overflow(&mut self, v: i64, span: Span, op_name: &str) -> Value {
-        if v >= i32::MIN as i64 && v <= i32::MAX as i64 {
-            Value::Int(v)
-        } else {
-            self.emit_runtime_error(format!("integer overflow in {op_name}"), span);
-            Value::Unit
+    /// M03.2: dispatch a float arithmetic op. Computes in f64 (with f32
+    /// narrowing after the op when `kind == F32` so f32-range overflow
+    /// surfaces). When the result is NaN/Inf de novo (neither operand was
+    /// already special), emits a `Note { Info }` describing the special
+    /// value. Trace does NOT halt — Inf/NaN are valid Rust.
+    fn float_arith<F>(&mut self, kind: crate::typeck::FloatKind, a: f64, b: f64, op: F, span: Span) -> Value
+    where
+        F: Fn(f64, f64) -> f64,
+    {
+        use crate::typeck::FloatKind;
+        let was_special = !a.is_finite() || !b.is_finite();
+        let raw = op(a, b);
+        let result = match kind {
+            FloatKind::F32 => raw as f32 as f64,
+            FloatKind::F64 => raw,
+        };
+        let now_special = result.is_nan() || result.is_infinite();
+        if now_special && !was_special {
+            let classify = if result.is_nan() {
+                "NaN"
+            } else if result > 0.0 {
+                "+Inf"
+            } else {
+                "-Inf"
+            };
+            self.events.push(MemEvent::Note {
+                kind: NoteKind::Info,
+                message: format!("produced {} ({})", classify, kind.name()),
+                span,
+            });
         }
+        Value::Float { kind, value: result }
     }
 }
