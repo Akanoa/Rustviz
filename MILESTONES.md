@@ -356,6 +356,56 @@ Acyclic. The drawn order is one valid topological sort. Edges from M03 to M05–
 
 ---
 
+### M06.1 — Mutation: assignment + deref read/write
+
+- **Kind**: feature (revision-style — extends M06 with the missing-half of borrow pedagogy)
+- **Status**: planned
+- **Complexity**: M (modules: 3, bullets: 4, boundaries: 2)
+- **Depends on**: M06
+- **Authority**: CLAUDE.md › Supported Rust subset › "Level 1: primitives, let/let mut, …" (the `let mut` keyword has been cosmetic since M03 — no assignment statement existed); CLAUDE.md › Supported Rust subset › "Level 2: & and &mut" (M06 ships `&mut` as observable arrows but without deref-write the mutability is invisible).
+
+**Goal.** Close M06's pedagogical loop by adding the three connected mutation forms: plain assignment `x = 5` (for `let mut` bindings — M03's `mut` keyword finally gains meaning), deref-as-rvalue `let y = *r;` (read through `&T` or `&mut T`), and deref-as-lvalue `*r = 5;` (write through `&mut T` — the mutation flows visibly into the borrowed slot, with the borrow arrow persisting through the change).
+
+**In scope.**
+- AST: `Expr::Deref { inner: Box<Expr>, span }` for both rvalue and lvalue positions. New `Stmt::Assign { lhs: Expr, rhs: Expr, span }` (or `Expr::Assign { ... }` — plan-phase decides). Place expressions on the lhs are: `Expr::Ident` (direct binding assign) and `Expr::Deref(Expr::Ident)` (through-ref assign).
+- Parser: prefix `*` (disambiguated from binary `*` by token position — prefix only at expression-start). `=` parsed as assignment at statement level.
+- Typeck:
+  - `*r` requires `r` to have type `Ty::Ref { inner, .. }`; the deref's type is `*inner`. Both `&T` and `&mut T` deref to `T`.
+  - Assignment `lhs = rhs`: lhs must be a place expression. For `Expr::Ident(x)`, `x` must be a `let mut` binding (typeck error otherwise: "cannot assign to immutable variable `x`"). For `Expr::Deref(Expr::Ident(r))`, `r` must have type `Ty::Ref { mutable: true, .. }` (typeck error otherwise: "cannot assign through `&T`; need `&mut T`"). Rhs type must match the lhs's type.
+  - Aliasing rules: an assignment through `*r` does NOT take a new borrow — it uses the existing `&mut` borrow. The borrow tracker's state is unchanged. (For direct `x = 5` on a mutable binding, no borrow is taken either.)
+- Eval:
+  - `Expr::Deref(r_expr)` as rvalue: resolve `r_expr` to a `Value::Ref { target_slot, .. }`; read `target_slot`'s current value; return it.
+  - `*r = v` as statement: resolve `r` to `Value::Ref { target_slot, mutable: true, .. }`; emit `MemEvent::SlotWrite { slot_id: target_slot, value: v, span }`. The existing visualization animates the slot value change — and the red arrow stays anchored on the source-slot through the change.
+  - `x = v` as statement: find the local for binding `x`; update its value; emit `SlotWrite { slot_id: x's slot, value: v, span }`.
+- Ship at least 3 new reference programs in `tests/samples/m06_1_*.rs` + `web/samples/`: (a) direct assignment to a `mut` binding, (b) read through a shared ref, (c) write through a mut ref with the arrow persisting through the mutation.
+
+**Out of scope.**
+- Compound assignment (`+=`, `-=`, etc.) — not needed for the mutation pedagogy.
+- `Box`/`Vec`/`String` (still M07).
+- Multi-level deref `**r` — only single-level deref.
+- Assignment to an arbitrary place expression (no fields, no array indexing — neither exists in the AST yet).
+- Method calls / `*self` — not in any L1–L2 milestone yet.
+
+**Entry criteria.**
+- M06 closed (borrow events + SVG overlay + aliasing rules on `main`).
+
+**Exit criteria.**
+- `cargo test --test m01 / m02 / m03` byte-identical (no events change; no new variants).
+- `cargo test --lib` passes with new tests covering: direct assignment, deref-read, deref-write, immutable-binding-assignment-rejected, deref-write-on-shared-rejected.
+- M06 page (manual QA): typing `let mut x = 5; let r = &mut x; *r = 10;` produces a trace where the cursor steps through the borrow being taken (red arrow), then `*r = 10` emits a SlotWrite for `x`'s slot, observably updating its value to `10_i32` WHILE the red arrow stays anchored.
+- ≥ 3 new `m06_1_*.rs` reference programs shipped.
+- WASM bundle growth ≤ +20% vs M06 baseline (87,354 B gzipped → ≤ 104,825 B). Adding deref + assignment is small surface change; should easily fit under +20%.
+
+**Demo.**
+- Format: browser (via M05's editor)
+- Inputs: `tests/samples/m06_1_*.rs` + live editing
+- Outputs (browser-observed steps): for `m06_1_mut_through_ref`: load → step → `let mut x = 5` shows `x = 5_i32` → `let r = &mut x` shows red arrow → `*r = 10` step shows `x`'s value animate to `10_i32` with the red arrow still pointing at `x`.
+- Command: `cd web && trunk serve --open`
+
+**Notes.** Closes M06's pedagogical gap discovered during QA: "&mut without deref-write is observation-only." M03's `let mut` keyword has been cosmetic since M03; M06.1 makes it actually do something. Reuses the existing `SlotWrite` event variant — no protocol changes, no new variants. The visualization improves "for free" because slot-value updates are already animated.
+
+---
+
 ### M07 — Level 3: heap (Box, Vec, String)
 
 - **Kind**: feature
