@@ -19,6 +19,7 @@ Ok(
                                     ty: None,
                                     init: LitInt(
                                         5,
+                                        None,
                                         Span {
                                             start: 101,
                                             end: 102,

@@ -257,13 +257,13 @@ impl Parser {
     fn parse_atom(&mut self) -> Result<Expr, ParseError> {
         let tok = self.peek().clone();
         match &tok.kind {
-            TokenKind::Int(v) => {
+            TokenKind::Int(v, suffix) => {
                 self.bump();
-                Ok(Expr::LitInt(*v, tok.span))
+                Ok(Expr::LitInt(*v, *suffix, tok.span))
             }
-            TokenKind::Float(v) => {
+            TokenKind::Float(v, suffix) => {
                 self.bump();
-                Ok(Expr::LitFloat(*v, tok.span))
+                Ok(Expr::LitFloat(*v, *suffix, tok.span))
             }
             TokenKind::Bool(b) => {
                 self.bump();

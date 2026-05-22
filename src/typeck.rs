@@ -391,8 +391,10 @@ impl<'a> Typechecker<'a> {
 
     fn typecheck_expr_inner(&mut self, expr: &ast::Expr) -> Result<Ty, ParseError> {
         match expr {
-            ast::Expr::LitInt(_, _) => Ok(Ty::Int(IntKind::I32)),
-            ast::Expr::LitFloat(_, _) => Ok(Ty::Float(FloatKind::F64)),
+            // **M03.2**: a literal with an explicit suffix uses that kind directly;
+            // no coercion needed. Without a suffix, default to I32 / F64.
+            ast::Expr::LitInt(_, suffix, _) => Ok(Ty::Int(suffix.unwrap_or(IntKind::I32))),
+            ast::Expr::LitFloat(_, suffix, _) => Ok(Ty::Float(suffix.unwrap_or(FloatKind::F64))),
             ast::Expr::LitBool(_, _) => Ok(Ty::Bool),
             ast::Expr::Ident(_, span) => {
                 let id = *self
@@ -676,7 +678,10 @@ impl<'a> Typechecker<'a> {
             return Some(target);
         }
         match (expr, target) {
-            (ast::Expr::LitInt(n, span), Ty::Int(k)) => {
+            // Suffixed literal: don't coerce, the kind is locked in by syntax.
+            (ast::Expr::LitInt(_, Some(_), _), _) => None,
+            (ast::Expr::LitFloat(_, Some(_), _), _) => None,
+            (ast::Expr::LitInt(n, None, span), Ty::Int(k)) => {
                 if k.contains(*n as i128) {
                     self.types.expr_types.insert(*span, Ty::Int(k));
                     Some(Ty::Int(k))
@@ -685,19 +690,19 @@ impl<'a> Typechecker<'a> {
                 }
             }
             // Integer literal annotated as float: `let x: f64 = 5;` is valid Rust.
-            (ast::Expr::LitInt(_, span), Ty::Float(k)) => {
+            (ast::Expr::LitInt(_, None, span), Ty::Float(k)) => {
                 self.types.expr_types.insert(*span, Ty::Float(k));
                 Some(Ty::Float(k))
             }
             // Float literal coerces between f32/f64 freely (narrowing happens at eval).
-            (ast::Expr::LitFloat(_, span), Ty::Float(k)) => {
+            (ast::Expr::LitFloat(_, None, span), Ty::Float(k)) => {
                 self.types.expr_types.insert(*span, Ty::Float(k));
                 Some(Ty::Float(k))
             }
             (ast::Expr::Unary { op: ast::UnOp::Neg, expr: inner, span }, Ty::Int(k))
                 if k.is_signed() =>
             {
-                if let ast::Expr::LitInt(n, inner_span) = inner.as_ref() {
+                if let ast::Expr::LitInt(n, None, inner_span) = inner.as_ref() {
                     let negated = -(*n as i128);
                     if k.contains(negated) {
                         self.types.expr_types.insert(*inner_span, Ty::Int(k));
@@ -709,13 +714,13 @@ impl<'a> Typechecker<'a> {
             }
             // Unary `-` on a float literal: coerce the float to the target kind.
             (ast::Expr::Unary { op: ast::UnOp::Neg, expr: inner, span }, Ty::Float(k)) => {
-                if let ast::Expr::LitFloat(_, inner_span) = inner.as_ref() {
+                if let ast::Expr::LitFloat(_, None, inner_span) = inner.as_ref() {
                     self.types.expr_types.insert(*inner_span, Ty::Float(k));
                     self.types.expr_types.insert(*span, Ty::Float(k));
                     return Some(Ty::Float(k));
                 }
                 // Also allow unary `-` on an int literal annotated as float.
-                if let ast::Expr::LitInt(_, inner_span) = inner.as_ref() {
+                if let ast::Expr::LitInt(_, None, inner_span) = inner.as_ref() {
                     self.types.expr_types.insert(*inner_span, Ty::Float(k));
                     self.types.expr_types.insert(*span, Ty::Float(k));
                     return Some(Ty::Float(k));

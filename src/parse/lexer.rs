@@ -42,10 +42,9 @@ pub fn lex(file: FileId, source_map: &SourceMap) -> Result<Vec<Token>, ParseErro
         let start = pos;
 
         // Numeric literal: digit sequence, optionally followed by `.digits`
-        // for a float literal (M03.2). The `.digits` form requires the `.` to
-        // be followed by at least one digit — otherwise the int literal ends
-        // and the `.` becomes a separate token (only relevant once L1 has
-        // method calls, which it doesn't yet).
+        // for a float literal (M03.2). Optionally followed by a type suffix
+        // (`5u8`, `2.5_f64`, etc.) — the suffix is parsed inline so the
+        // typeck doesn't have to coerce.
         if b.is_ascii_digit() {
             while pos < len && src[pos as usize].is_ascii_digit() {
                 pos += 1;
@@ -54,13 +53,65 @@ pub fn lex(file: FileId, source_map: &SourceMap) -> Result<Vec<Token>, ParseErro
             let is_float = pos + 1 < len
                 && src[pos as usize] == b'.'
                 && src[(pos + 1) as usize].is_ascii_digit();
-            if is_float {
+            let body_end = if is_float {
                 pos += 1; // consume `.`
                 while pos < len && src[pos as usize].is_ascii_digit() {
                     pos += 1;
                 }
+                pos
+            } else {
+                pos
+            };
+            // M03.2: parse optional type suffix. Allows `5u8`, `5_u8`,
+            // `2.5f32`, `2.5_f64`. Consume an optional `_` separator, then
+            // the suffix identifier, then validate against the 14 type names.
+            let suffix_start = pos;
+            if pos < len && src[pos as usize] == b'_' {
+                pos += 1;
             }
-            // Reject identifier characters immediately following.
+            let alpha_start = pos;
+            while pos < len {
+                let c = src[pos as usize];
+                if c.is_ascii_alphanumeric() {
+                    pos += 1;
+                } else {
+                    break;
+                }
+            }
+            let suffix_str = std::str::from_utf8(&src[alpha_start as usize..pos as usize])
+                .expect("ascii is valid UTF-8");
+            let (int_suffix, float_suffix) = if suffix_str.is_empty() {
+                (None, None)
+            } else {
+                let int_k = parse_int_suffix(suffix_str);
+                let float_k = parse_float_suffix(suffix_str);
+                if int_k.is_none() && float_k.is_none() {
+                    return Err(ParseError {
+                        message: format!("invalid suffix `{suffix_str}` after numeric literal"),
+                        span: Span::new(suffix_start, pos, file),
+                    });
+                }
+                (int_k, float_k)
+            };
+            // Check suffix matches literal kind: int suffix on int, float on float.
+            if is_float && int_suffix.is_some() {
+                return Err(ParseError {
+                    message: format!(
+                        "integer-type suffix `{suffix_str}` on a float literal"
+                    ),
+                    span: Span::new(suffix_start, pos, file),
+                });
+            }
+            if !is_float && float_suffix.is_some() {
+                return Err(ParseError {
+                    message: format!(
+                        "float-type suffix `{suffix_str}` on an integer literal"
+                    ),
+                    span: Span::new(suffix_start, pos, file),
+                });
+            }
+            // Reject identifier characters immediately after we've decided
+            // the literal is done (catches typos that aren't valid suffixes).
             if pos < len {
                 let n = src[pos as usize];
                 if n.is_ascii_alphabetic() || n == b'_' {
@@ -70,20 +121,20 @@ pub fn lex(file: FileId, source_map: &SourceMap) -> Result<Vec<Token>, ParseErro
                     });
                 }
             }
-            let s = std::str::from_utf8(&src[start as usize..pos as usize])
+            let body_str = std::str::from_utf8(&src[start as usize..body_end as usize])
                 .expect("digits are valid UTF-8");
             let kind = if is_float {
-                let val: f64 = s.parse().map_err(|_| ParseError {
-                    message: format!("float literal `{s}` is invalid"),
-                    span: Span::new(start, pos, file),
+                let val: f64 = body_str.parse().map_err(|_| ParseError {
+                    message: format!("float literal `{body_str}` is invalid"),
+                    span: Span::new(start, body_end, file),
                 })?;
-                TokenKind::Float(val)
+                TokenKind::Float(val, float_suffix)
             } else {
-                let val: i64 = s.parse().map_err(|_| ParseError {
-                    message: format!("integer literal `{s}` does not fit in i64"),
-                    span: Span::new(start, pos, file),
+                let val: i64 = body_str.parse().map_err(|_| ParseError {
+                    message: format!("integer literal `{body_str}` does not fit in i64"),
+                    span: Span::new(start, body_end, file),
                 })?;
-                TokenKind::Int(val)
+                TokenKind::Int(val, int_suffix)
             };
             tokens.push(Token {
                 kind,
@@ -190,6 +241,28 @@ pub fn lex(file: FileId, source_map: &SourceMap) -> Result<Vec<Token>, ParseErro
         span: Span::point(len, file),
     });
     Ok(tokens)
+}
+
+/// **M03.2**: map an integer-type suffix string to its `IntKind`. `None` if
+/// the string isn't one of the 12 integer type names.
+fn parse_int_suffix(s: &str) -> Option<crate::typeck::IntKind> {
+    use crate::typeck::IntKind::*;
+    Some(match s {
+        "i8" => I8, "i16" => I16, "i32" => I32, "i64" => I64, "i128" => I128,
+        "u8" => U8, "u16" => U16, "u32" => U32, "u64" => U64, "u128" => U128,
+        "isize" => ISize, "usize" => USize,
+        _ => return None,
+    })
+}
+
+/// **M03.2**: map a float-type suffix string to its `FloatKind`.
+fn parse_float_suffix(s: &str) -> Option<crate::typeck::FloatKind> {
+    use crate::typeck::FloatKind::*;
+    match s {
+        "f32" => Some(F32),
+        "f64" => Some(F64),
+        _ => None,
+    }
 }
 
 /// Byte index just after the UTF-8 character starting at `i`, capped at `src.len()`.

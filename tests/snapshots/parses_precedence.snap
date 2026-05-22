@@ -21,6 +21,7 @@ Ok(
                                         op: Add,
                                         lhs: LitInt(
                                             2,
+                                            None,
                                             Span {
                                                 start: 24,
                                                 end: 25,
@@ -33,6 +34,7 @@ Ok(
                                             op: Mul,
                                             lhs: LitInt(
                                                 3,
+                                                None,
                                                 Span {
                                                     start: 28,
                                                     end: 29,
@@ -43,6 +45,7 @@ Ok(
                                             ),
                                             rhs: LitInt(
                                                 4,
+                                                None,
                                                 Span {
                                                     start: 32,
                                                     end: 33,
@@ -88,6 +91,7 @@ Ok(
                                                 op: Add,
                                                 lhs: LitInt(
                                                     2,
+                                                    None,
                                                     Span {
                                                         start: 48,
                                                         end: 49,
@@ -98,6 +102,7 @@ Ok(
                                                 ),
                                                 rhs: LitInt(
                                                     3,
+                                                    None,
                                                     Span {
                                                         start: 52,
                                                         end: 53,
@@ -124,6 +129,7 @@ Ok(
                                         },
                                         rhs: LitInt(
                                             4,
+                                            None,
                                             Span {
                                                 start: 57,
                                                 end: 58,
@@ -224,6 +230,7 @@ Ok(
                                             op: Lt,
                                             lhs: LitInt(
                                                 1,
+                                                None,
                                                 Span {
                                                     start: 97,
                                                     end: 98,
@@ -234,6 +241,7 @@ Ok(
                                             ),
                                             rhs: LitInt(
                                                 2,
+                                                None,
                                                 Span {
                                                     start: 101,
                                                     end: 102,

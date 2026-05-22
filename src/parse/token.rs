@@ -18,10 +18,12 @@ pub struct Token {
 /// All token kinds the M01 lexer produces.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
-    /// Integer literal parsed to `i64`.
-    Int(i64),
-    /// **M03.2**: Float literal parsed to `f64`. Recognized as `digits.digits`.
-    Float(f64),
+    /// Integer literal parsed to `i64`. The optional kind suffix (`5u8`,
+    /// `5_i64`, etc.) is `Some` when the source provided one.
+    Int(i64, Option<crate::typeck::IntKind>),
+    /// **M03.2**: Float literal parsed to `f64`. Recognized as `digits.digits`,
+    /// optionally followed by an `_?f32` or `_?f64` suffix.
+    Float(f64, Option<crate::typeck::FloatKind>),
     /// Boolean literal `true` or `false`.
     Bool(bool),
     /// Identifier (non-keyword).
@@ -96,8 +98,8 @@ impl TokenKind {
     /// Human-readable name suitable for error messages (e.g. `"`;`"`, `"identifier"`).
     pub fn describe(&self) -> &'static str {
         match self {
-            Self::Int(_) => "integer literal",
-            Self::Float(_) => "float literal",
+            Self::Int(_, _) => "integer literal",
+            Self::Float(_, _) => "float literal",
             Self::Bool(_) => "boolean literal",
             Self::Ident(_) => "identifier",
             Self::Let => "`let`",

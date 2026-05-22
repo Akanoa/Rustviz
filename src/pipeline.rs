@@ -177,6 +177,64 @@ mod tests {
     }
 
     #[test]
+    fn run_pipeline_literal_suffix_u8() {
+        // M03.2 enhancement: literal suffix `5u8` works without annotation.
+        let source = "fn main() { let x = 5u8 + 3u8; }";
+        let events = run_pipeline(source).expect("suffixed literal arithmetic compiles");
+        let has_u8 = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite {
+                value: crate::Value::Int { kind: crate::typeck::IntKind::U8, .. },
+                ..
+            }
+        ));
+        assert!(has_u8, "expected u8 SlotWrite from `5u8 + 3u8`");
+    }
+
+    #[test]
+    fn run_pipeline_literal_suffix_underscore() {
+        // Underscore separator: `5_u8` works the same as `5u8`.
+        let source = "fn main() { let x = 5_u8 + 3_u8; }";
+        let events = run_pipeline(source).expect("underscore-separated suffix compiles");
+        assert!(!events.is_empty());
+    }
+
+    #[test]
+    fn run_pipeline_literal_suffix_f64() {
+        // Float suffix: `2.5_f64` (with or without separator).
+        let source = "fn main() { let x = 2.5f64 + 1.5f64; }";
+        let events = run_pipeline(source).expect("float-suffixed literals compile");
+        let has_f64 = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite {
+                value: crate::Value::Float { kind: crate::typeck::FloatKind::F64, .. },
+                ..
+            }
+        ));
+        assert!(has_f64);
+    }
+
+    #[test]
+    fn run_pipeline_literal_suffix_mismatch_rejected() {
+        // Conflicting annotation vs. suffix: `let x: i32 = 5u8;` — typeck error.
+        let err = run_pipeline("fn main() { let x: i32 = 5u8; }")
+            .expect_err("u8 suffix conflicts with i32 annotation");
+        assert_eq!(err.stage, CompileStage::Typeck);
+    }
+
+    #[test]
+    fn run_pipeline_invalid_suffix_rejected() {
+        let err = run_pipeline("fn main() { let x = 5u7; }")
+            .expect_err("u7 isn't a valid type");
+        assert_eq!(err.stage, CompileStage::Parse);
+    }
+
+    #[test]
+    fn run_pipeline_int_suffix_on_float_literal_rejected() {
+        let err = run_pipeline("fn main() { let x = 2.5u8; }")
+            .expect_err("u8 suffix on float literal is invalid");
+        assert_eq!(err.stage, CompileStage::Parse);
+    }
+
+    #[test]
     fn run_pipeline_i64_arithmetic() {
         let source = "fn main() { let a: i64 = 100; let b: i64 = 200; let c: i64 = a + b; }";
         let events = run_pipeline(source).expect("i64 arithmetic compiles");

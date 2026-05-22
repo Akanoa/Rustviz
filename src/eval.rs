@@ -422,7 +422,7 @@ impl<'a> Evaluator<'a> {
             return Value::Unit;
         }
         match expr {
-            ast::Expr::LitInt(v, span) => {
+            ast::Expr::LitInt(v, _suffix, span) => {
                 // M03.2: consult typeck's recorded type for this literal —
                 // it may have been coerced from the default `I32` to a
                 // narrower `IntKind` by `try_coerce_to` (e.g. when this
@@ -434,7 +434,7 @@ impl<'a> Evaluator<'a> {
                 };
                 Value::Int { kind, bits: *v as i128 }
             }
-            ast::Expr::LitFloat(v, span) => {
+            ast::Expr::LitFloat(v, _suffix, span) => {
                 // M03.2: same coercion path for floats — typeck may have
                 // narrowed `f64` default to `f32` based on the surrounding
                 // annotation. f32 narrowing of the value itself happens

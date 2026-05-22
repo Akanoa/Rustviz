@@ -106,11 +106,14 @@ pub struct LetStmt {
 /// An expression.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
-    /// Integer literal.
-    LitInt(i64, Span),
+    /// Integer literal. The optional kind suffix (`5u8`, `5_i64`, …) is
+    /// `Some` when the source provided one; typeck then uses it directly
+    /// instead of coercing from default.
+    LitInt(i64, Option<crate::typeck::IntKind>, Span),
     /// **M03.2**: Float literal. Stores `f64`; narrowed to `f32` by typeck
-    /// when the surrounding annotation says `f32`.
-    LitFloat(f64, Span),
+    /// when the surrounding annotation says `f32` or when a `f32` suffix
+    /// is present.
+    LitFloat(f64, Option<crate::typeck::FloatKind>, Span),
     /// Boolean literal.
     LitBool(bool, Span),
     /// Identifier reference (resolved in M02).
@@ -170,8 +173,8 @@ impl Expr {
     /// Source span of this expression.
     pub fn span(&self) -> Span {
         match self {
-            Self::LitInt(_, s)
-            | Self::LitFloat(_, s)
+            Self::LitInt(_, _, s)
+            | Self::LitFloat(_, _, s)
             | Self::LitBool(_, s)
             | Self::Ident(_, s) => *s,
             Self::Unary { span, .. }
