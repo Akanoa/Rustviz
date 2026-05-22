@@ -65,6 +65,15 @@ pub enum Type {
         /// Span covering `()`.
         span: Span,
     },
+    /// **M06**: `&T` or `&mut T` reference type.
+    Ref {
+        /// Pointed-to type.
+        inner: Box<Type>,
+        /// `true` for `&mut T`, `false` for `&T`.
+        mutable: bool,
+        /// Span covering the `&` (or `&mut`) plus the inner type.
+        span: Span,
+    },
 }
 
 /// A block: zero or more statements followed by an optional tail expression.
@@ -167,6 +176,16 @@ pub enum Expr {
         /// Span from `if` keyword through end of last branch.
         span: Span,
     },
+    /// **M06**: `&place` or `&mut place`. The `inner` must be a place
+    /// expression (currently only `Expr::Ident(_, _)` in L2).
+    Borrow {
+        /// The expression being borrowed.
+        inner: Box<Expr>,
+        /// `true` for `&mut`, `false` for `&`.
+        mutable: bool,
+        /// Span from `&` (or `&mut`) through end of `inner`.
+        span: Span,
+    },
 }
 
 impl Expr {
@@ -181,7 +200,8 @@ impl Expr {
             | Self::Binary { span, .. }
             | Self::Call { span, .. }
             | Self::Paren { span, .. }
-            | Self::If { span, .. } => *span,
+            | Self::If { span, .. }
+            | Self::Borrow { span, .. } => *span,
             Self::Block(b) => b.span,
         }
     }

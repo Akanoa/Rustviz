@@ -87,7 +87,7 @@ Ok(
             ),
             value: Unit,
             span: Span {
-                start: 10,
+                start: 43,
                 end: 44,
                 file: FileId(
                     1,
@@ -100,7 +100,7 @@ Ok(
             ),
             return_value: Unit,
             span: Span {
-                start: 10,
+                start: 43,
                 end: 44,
                 file: FileId(
                     1,

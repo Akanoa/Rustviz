@@ -45,6 +45,7 @@ sample_test!(parses_empty, "m01_empty");
 sample_test!(errors_on_unexpected_token, "m01_unexpected_token");
 sample_test!(errors_on_first_of_multi, "m01_multi_error");
 
-// US3 — lexer rejects `&` with a "Level 2" pedagogical message.
-sample_test!(lexer_rejects_ampersand, "m01_reject_ampersand");
+// M06: the M01 `&`-rejection test was removed when `&` and `&mut` became
+// valid borrow expressions. The "ampersand in comment" test stays — comments
+// still ignore their contents, so `&` inside a `//` line is unchanged.
 sample_test!(lexer_ignores_ampersand_in_comment, "m01_ampersand_in_comment");

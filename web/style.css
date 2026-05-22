@@ -63,6 +63,7 @@ main {
   display: flex;
   height: calc(100vh - 96px); /* header ~48px + status (auto) + toolbar ~48px */
   border-bottom: 1px solid var(--border);
+  position: relative; /* anchor for the absolute-positioned SVG overlay */
 }
 
 main > section {
@@ -70,6 +71,33 @@ main > section {
   min-width: 0;
   overflow: auto;
   border-right: 1px solid var(--border);
+}
+
+/* M06: SVG overlay drawing borrow arrows. Absolutely positioned to overlap
+   the panels, no pointer events so clicks pass through to the panels. */
+#arrow-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 10;
+}
+
+/* M06: borrow arrows. Blue for shared (`&`), red for mutable (`&mut`). */
+#arrow-overlay .arrow-shared {
+  stroke: #2a6fa5;
+  fill: none;
+  stroke-width: 1.5;
+  marker-end: url(#arrow-head-shared);
+}
+
+#arrow-overlay .arrow-mut {
+  stroke: #c62828;
+  fill: none;
+  stroke-width: 1.5;
+  marker-end: url(#arrow-head-mut);
 }
 
 main > section:last-child {

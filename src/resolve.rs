@@ -226,6 +226,7 @@ impl Resolver {
                 }
             },
             ast::Expr::Unary { expr, .. } => self.resolve_expr(expr)?,
+            ast::Expr::Borrow { inner, .. } => self.resolve_expr(inner)?,
             ast::Expr::Binary { lhs, rhs, .. } => {
                 self.resolve_expr(lhs)?;
                 self.resolve_expr(rhs)?;

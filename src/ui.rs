@@ -49,10 +49,26 @@ pub struct StateSnapshot {
     /// The JS renderer decorates the matching frame card with a transient
     /// return-value annotation. `None` on any other event.
     pub pending_return: Option<PendingReturnView>,
+    /// **M06**: active borrows at this cursor position. The JS renderer
+    /// reads this to draw blue (shared) and red (mut) arrows in the SVG
+    /// overlay between slot cards.
+    pub borrows: Vec<BorrowView>,
     /// Cursor position (mirrors `Cursor::position`).
     pub position: usize,
     /// Total events in the trace.
     pub total: usize,
+}
+
+/// **M06**: one active borrow as seen by the renderer. Source is the slot
+/// holding the reference; target is the slot being borrowed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BorrowView {
+    /// Slot holding the reference value (arrow origin).
+    pub source_slot: u32,
+    /// Slot being borrowed (arrow tip).
+    pub target_slot: u32,
+    /// `true` for `&mut` (red), `false` for `&` (blue).
+    pub mutable: bool,
 }
 
 /// One function-call frame's view.
@@ -174,6 +190,19 @@ impl Cursor {
         } else {
             None
         };
+        // M06: derive the BorrowView list. Skip borrows whose source_slot
+        // hasn't been bound yet (SlotWrite of the Value::Ref hasn't happened).
+        let borrows: Vec<BorrowView> = world
+            .borrows
+            .iter()
+            .filter_map(|b| {
+                b.source_slot.map(|src| BorrowView {
+                    source_slot: src,
+                    target_slot: b.target_slot,
+                    mutable: b.mutable,
+                })
+            })
+            .collect();
         StateSnapshot {
             frames: world
                 .frames
@@ -184,6 +213,7 @@ impl Cursor {
             current_call_span,
             status,
             pending_return,
+            borrows,
             position: self.position,
             total: self.trace.len(),
         }
@@ -196,6 +226,18 @@ impl Cursor {
 struct World {
     /// Active frames, outermost first.
     frames: Vec<FrameInProgress>,
+    /// **M06**: active borrows. Push on BorrowShared/Mut, remove on BorrowEnd.
+    /// The source_slot is filled in when a `SlotWrite` lands a `Value::Ref`
+    /// with the matching borrow_id.
+    borrows: Vec<ActiveBorrowState>,
+}
+
+struct ActiveBorrowState {
+    borrow_id: u32,
+    /// `None` until a `SlotWrite` of `Value::Ref` binds the reference to a slot.
+    source_slot: Option<u32>,
+    target_slot: u32,
+    mutable: bool,
 }
 
 struct FrameInProgress {
@@ -261,12 +303,22 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                 frame.slots.push(LiveSlot {
                     slot_id: slot_id.0,
                     name: name.clone(),
-                    ty: render_ty(*ty),
+                    ty: render_ty(ty),
                     value: None,
                 });
             }
         }
         MemEvent::SlotWrite { slot_id, value, .. } => {
+            // M06: if this write lands a Value::Ref, bind the borrow's source_slot.
+            if let Value::Ref { borrow_id, .. } = value {
+                if let Some(borrow) = world
+                    .borrows
+                    .iter_mut()
+                    .find(|b| b.borrow_id == borrow_id.0)
+                {
+                    borrow.source_slot = Some(slot_id.0);
+                }
+            }
             for frame in &mut world.frames {
                 if let Some(slot) = frame.slots.iter_mut().find(|s| s.slot_id == slot_id.0) {
                     slot.value = Some(render_value(value));
@@ -294,16 +346,37 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                 frame.return_value = Some(render_value(value));
             }
         }
+        // **M06**: borrow events update World.borrows.
+        MemEvent::BorrowShared { borrow_id, target, .. } => {
+            if let crate::event::Pointee::Slot(slot_id) = target {
+                world.borrows.push(ActiveBorrowState {
+                    borrow_id: borrow_id.0,
+                    source_slot: None,
+                    target_slot: slot_id.0,
+                    mutable: false,
+                });
+            }
+        }
+        MemEvent::BorrowMut { borrow_id, target, .. } => {
+            if let crate::event::Pointee::Slot(slot_id) = target {
+                world.borrows.push(ActiveBorrowState {
+                    borrow_id: borrow_id.0,
+                    source_slot: None,
+                    target_slot: slot_id.0,
+                    mutable: true,
+                });
+            }
+        }
+        MemEvent::BorrowEnd { borrow_id, .. } => {
+            world.borrows.retain(|b| b.borrow_id != borrow_id.0);
+        }
         // The remaining variants don't modify world state. `Note` surfaces via
         // `note_to_status` on the most-recent-event side path. The others are
-        // forward-compat placeholders for M06+ events that L1 traces don't emit.
+        // forward-compat placeholders for M07+ events.
         MemEvent::SlotMove { .. }
         | MemEvent::HeapAlloc { .. }
         | MemEvent::HeapRealloc { .. }
         | MemEvent::HeapFree { .. }
-        | MemEvent::BorrowShared { .. }
-        | MemEvent::BorrowMut { .. }
-        | MemEvent::BorrowEnd { .. }
         | MemEvent::LockAcquire { .. }
         | MemEvent::LockRelease { .. }
         | MemEvent::ArcClone { .. }
@@ -384,10 +457,18 @@ fn render_value(value: &Value) -> String {
         }
         Value::Bool(b) => b.to_string(),
         Value::Unit => "()".to_owned(),
+        // M06: reference value renders as `&slot{N}` or `&mut slot{N}`.
+        Value::Ref { target_slot, mutable, .. } => {
+            if *mutable {
+                format!("&mut slot{}", target_slot.0)
+            } else {
+                format!("&slot{}", target_slot.0)
+            }
+        }
     }
 }
 
-fn render_ty(ty: Ty) -> String {
+fn render_ty(ty: &Ty) -> String {
     ty.name().to_owned()
 }
 

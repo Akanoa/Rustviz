@@ -169,7 +169,12 @@ function render(state) {
     const slotGrid = el("div", { class: "slots" });
     for (const slot of frame.slots) {
       const row = el("div", { class: "slot-row" });
-      row.appendChild(el("span", { class: "slot-name", text: slot.name }));
+      // M06: data-slot-id lives on the .slot-name child (the row itself uses
+      // `display: contents` so it has no own bounding box — getBoundingClientRect
+      // on the row returns zero coords. Anchor on a child that has real layout).
+      const nameEl = el("span", { class: "slot-name", text: slot.name });
+      nameEl.setAttribute("data-slot-id", String(slot.slot_id));
+      row.appendChild(nameEl);
       row.appendChild(el("span", { class: "slot-ty", text: `: ${slot.ty}` }));
       const valueEl = el("span", { class: "slot-value" });
       if (slot.value === null || slot.value === undefined) {
@@ -183,6 +188,9 @@ function render(state) {
     card.appendChild(slotGrid);
     stacksEl.appendChild(card);
   }
+
+  // M06: draw borrow arrows after slot rows exist in the DOM.
+  renderArrows(state.borrows || []);
 
   // Editor span highlight (yellow, most-recent event).
   if (state.editor_highlight) {
@@ -245,8 +253,44 @@ function renderError(error) {
 }
 
 // M05 / US2: toggle Play / Step Forward / Step Back disabled state. Rewind
-// stays always enabled because rewinding an empty trace is a meaningful
-// no-op.
+// M06: draw an SVG arrow for each active borrow. Source and target slot
+// positions are queried from the DOM via getBoundingClientRect, then a
+// quadratic Bezier path is added to the overlay. Cleared and rebuilt on
+// every render. Pass `borrows` from the StateSnapshot.
+function renderArrows(borrows) {
+  const overlay = document.getElementById("arrow-overlay");
+  if (!overlay) return;
+  // Clear previous arrows (everything except the <defs>).
+  for (const child of [...overlay.children]) {
+    if (child.tagName.toLowerCase() !== "defs") overlay.removeChild(child);
+  }
+  if (!borrows || borrows.length === 0) return;
+
+  const overlayBox = overlay.getBoundingClientRect();
+  const NS = "http://www.w3.org/2000/svg";
+
+  for (const b of borrows) {
+    const srcEl = document.querySelector(`[data-slot-id="${b.source_slot}"]`);
+    const tgtEl = document.querySelector(`[data-slot-id="${b.target_slot}"]`);
+    if (!srcEl || !tgtEl) continue;
+    const src = srcEl.getBoundingClientRect();
+    const tgt = tgtEl.getBoundingClientRect();
+    // Anchor from the right edge of source to the right edge of target,
+    // both vertically centered. Curve outward to the right for visibility.
+    const x1 = src.right - overlayBox.left;
+    const y1 = src.top + src.height / 2 - overlayBox.top;
+    const x2 = tgt.right - overlayBox.left;
+    const y2 = tgt.top + tgt.height / 2 - overlayBox.top;
+    // Control point offset to the right of both endpoints for a clean curve.
+    const cx = Math.max(x1, x2) + 40;
+    const cy = (y1 + y2) / 2;
+    const path = document.createElementNS(NS, "path");
+    path.setAttribute("d", `M${x1},${y1} Q${cx},${cy} ${x2},${y2}`);
+    path.setAttribute("class", b.mutable ? "arrow-mut" : "arrow-shared");
+    overlay.appendChild(path);
+  }
+}
+
 function setControlsEnabled(enabled) {
   for (const id of ["btn-play-pause", "btn-step-back", "btn-step-forward"]) {
     document.getElementById(id).disabled = !enabled;

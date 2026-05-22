@@ -157,10 +157,12 @@ impl FloatKind {
     }
 }
 
-/// L1 value types. **M03.2**: restructured into nested kind enums.
-/// Function signatures live in [`FnSig`], not here, because functions are not
-/// first-class values in L1.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+/// L1+L2 value types. **M03.2**: restructured into nested kind enums.
+/// **M06**: adds `Ref { inner, mutable }`. `Box<Ty>` makes the recursive
+/// `Ty::Ref` shape work, dropping the `Copy` derive — methods now take
+/// `&self`. Function signatures live in [`FnSig`], not here, because
+/// functions are not first-class values in L1.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Ty {
     /// Signed or unsigned integer. Width is carried by [`IntKind`].
     Int(IntKind),
@@ -170,30 +172,43 @@ pub enum Ty {
     Bool,
     /// Unit `()`.
     Unit,
+    /// **M06**: reference type. `&T` if `mutable == false`, `&mut T` otherwise.
+    Ref {
+        /// Pointed-to type.
+        inner: Box<Ty>,
+        /// `true` for `&mut`, `false` for `&`.
+        mutable: bool,
+    },
 }
 
 impl Ty {
-    /// Render this type as a user-facing string (`"u8"`, `"f64"`, `"bool"`, `"()"`).
-    pub fn name(self) -> &'static str {
+    /// Render this type as a user-facing string (`"u8"`, `"f64"`, `"&i32"`,
+    /// `"&mut bool"`, `"bool"`, `"()"`). Allocates because of `Ref`'s
+    /// recursive inner.
+    pub fn name(&self) -> String {
         match self {
-            Self::Int(k) => k.name(),
-            Self::Float(k) => k.name(),
-            Self::Bool => "bool",
-            Self::Unit => "()",
+            Self::Int(k) => k.name().to_owned(),
+            Self::Float(k) => k.name().to_owned(),
+            Self::Bool => "bool".to_owned(),
+            Self::Unit => "()".to_owned(),
+            Self::Ref { inner, mutable } => {
+                if *mutable {
+                    format!("&mut {}", inner.name())
+                } else {
+                    format!("&{}", inner.name())
+                }
+            }
         }
     }
 
-    /// Whether values of this type are `Copy` (no destructor, bytes physically
-    /// persist on the stack until storage is reused).
-    ///
-    /// L1's lattice — every integer width, both floats, `bool`, `()` — is
-    /// entirely Copy. M07+ will add non-Copy heap-allocated variants
-    /// (e.g. `Box`, `Vec`, `String`) that return `false`. The exhaustive
-    /// `match` below ensures any new variant forces a deliberate
-    /// classification — there is intentionally no `_` catch-all.
-    pub fn is_copy(self) -> bool {
+    /// Whether values of this type are `Copy` (no destructor; bytes physically
+    /// persist on the stack until storage is reused). M06: `&T` is Copy;
+    /// `&mut T` is not (matches Rust). Exhaustive match — no `_` catch-all.
+    pub fn is_copy(&self) -> bool {
         match self {
             Self::Int(_) | Self::Float(_) | Self::Bool | Self::Unit => true,
+            Self::Ref { mutable: false, .. } => true,
+            Self::Ref { mutable: true, .. } => false,
         }
     }
 }
@@ -259,11 +274,109 @@ pub fn typeck(program: &ast::Program, resolution: &Resolution) -> Result<TypeMap
     Ok(t.types)
 }
 
+/// **M06**: borrow-checker module. Tracks active borrows per binding and
+/// enforces Rust's aliasing rules statically (scope-level lifetimes).
+#[allow(unreachable_pub)] // private mod; pub items are inner-visible from typeck.
+mod borrow_tracker {
+    use crate::parse::span::Span;
+    use crate::resolve::BindingId;
+    use indexmap::IndexMap;
+
+    /// What kind of borrow is active.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub enum BorrowKind {
+        Shared,
+        Mut,
+    }
+
+    /// One active borrow recorded against a binding.
+    #[derive(Clone, Debug)]
+    pub struct ActiveBorrow {
+        pub kind: BorrowKind,
+        pub scope_depth: u32,
+        pub borrow_span: Span,
+    }
+
+    /// Result of a failed `try_take_*` — carries the conflicting existing borrow.
+    #[derive(Clone, Debug)]
+    pub struct AliasConflict {
+        pub existing_kind: BorrowKind,
+        #[allow(dead_code)] // reserved for richer error messages
+        pub existing_span: Span,
+    }
+
+    #[derive(Default)]
+    pub struct BorrowTracker {
+        active: IndexMap<BindingId, Vec<ActiveBorrow>>,
+    }
+
+    impl BorrowTracker {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Take a shared borrow. Fails if any active borrow of `b` is `Mut`.
+        pub fn try_take_shared(
+            &mut self,
+            b: BindingId,
+            depth: u32,
+            span: Span,
+        ) -> Result<(), AliasConflict> {
+            let stack = self.active.entry(b).or_default();
+            if let Some(existing) = stack.iter().find(|a| a.kind == BorrowKind::Mut) {
+                return Err(AliasConflict {
+                    existing_kind: existing.kind,
+                    existing_span: existing.borrow_span,
+                });
+            }
+            stack.push(ActiveBorrow {
+                kind: BorrowKind::Shared,
+                scope_depth: depth,
+                borrow_span: span,
+            });
+            Ok(())
+        }
+
+        /// Take a mutable borrow. Fails if any active borrow of `b` exists.
+        pub fn try_take_mut(
+            &mut self,
+            b: BindingId,
+            depth: u32,
+            span: Span,
+        ) -> Result<(), AliasConflict> {
+            let stack = self.active.entry(b).or_default();
+            if let Some(existing) = stack.last() {
+                return Err(AliasConflict {
+                    existing_kind: existing.kind,
+                    existing_span: existing.borrow_span,
+                });
+            }
+            stack.push(ActiveBorrow {
+                kind: BorrowKind::Mut,
+                scope_depth: depth,
+                borrow_span: span,
+            });
+            Ok(())
+        }
+
+        /// Drop all borrows recorded at or deeper than `leaving_depth`.
+        pub fn pop_scope(&mut self, leaving_depth: u32) {
+            for stack in self.active.values_mut() {
+                stack.retain(|a| a.scope_depth < leaving_depth);
+            }
+        }
+    }
+}
+
 struct Typechecker<'a> {
     resolution: &'a Resolution,
     types: TypeMap,
     /// Expected return type of the function currently being checked.
     current_fn_ret: Option<Ty>,
+    /// **M06**: active borrows for static aliasing-rule enforcement.
+    borrow_tracker: borrow_tracker::BorrowTracker,
+    /// **M06**: current scope depth (incremented on block enter, decremented on exit).
+    scope_depth: u32,
 }
 
 impl<'a> Typechecker<'a> {
@@ -272,6 +385,8 @@ impl<'a> Typechecker<'a> {
             resolution,
             types: TypeMap::default(),
             current_fn_ret: None,
+            borrow_tracker: borrow_tracker::BorrowTracker::new(),
+            scope_depth: 0,
         }
     }
 
@@ -302,15 +417,15 @@ impl<'a> Typechecker<'a> {
             Some(BindingType::Fn(s)) => s.clone(),
             _ => panic!("fn sig must be set in Phase 1"),
         };
-        for (param, &param_ty) in decl.params.iter().zip(sig.params.iter()) {
+        for (param, param_ty) in decl.params.iter().zip(sig.params.iter()) {
             let pid = self
                 .lookup_binding(|d| matches!(d.kind, BindingKind::Param) && d.name_span == param.span)
                 .expect("param binding present");
             self.types
                 .binding_types
-                .insert(pid, BindingType::Var(param_ty));
+                .insert(pid, BindingType::Var(param_ty.clone()));
         }
-        let prev = self.current_fn_ret.replace(sig.ret);
+        let prev = self.current_fn_ret.replace(sig.ret.clone());
         let body_ty = self.typecheck_block(&decl.body)?;
         if body_ty != sig.ret {
             return Err(ParseError {
@@ -332,14 +447,22 @@ impl<'a> Typechecker<'a> {
     }
 
     fn typecheck_block(&mut self, block: &ast::Block) -> Result<Ty, ParseError> {
-        for stmt in &block.stmts {
-            self.typecheck_stmt(stmt)?;
-        }
-        if let Some(tail) = &block.tail {
-            self.typecheck_expr(tail)
-        } else {
-            Ok(Ty::Unit)
-        }
+        // M06: scope-level lifetime tracking. Increment depth on entry, drop
+        // borrows recorded at this depth on exit.
+        self.scope_depth += 1;
+        let result = (|| -> Result<Ty, ParseError> {
+            for stmt in &block.stmts {
+                self.typecheck_stmt(stmt)?;
+            }
+            if let Some(tail) = &block.tail {
+                self.typecheck_expr(tail)
+            } else {
+                Ok(Ty::Unit)
+            }
+        })();
+        self.borrow_tracker.pop_scope(self.scope_depth);
+        self.scope_depth -= 1;
+        result
     }
 
     fn typecheck_stmt(&mut self, stmt: &ast::Stmt) -> Result<(), ParseError> {
@@ -352,8 +475,13 @@ impl<'a> Typechecker<'a> {
                         // M03.2: attempt to coerce a literal init to the annotated
                         // type before checking equality. Allows `let x: u8 = 5;`.
                         let init_ty = self
-                            .try_coerce_to(&let_stmt.init, init_ty, annot_ty)
-                            .unwrap_or(init_ty);
+                            .try_coerce_to(&let_stmt.init, init_ty, annot_ty.clone())
+                            .unwrap_or_else(|| self
+                                .types
+                                .expr_types
+                                .get(&let_stmt.init.span())
+                                .cloned()
+                                .unwrap_or(annot_ty.clone()));
                         if annot_ty != init_ty {
                             return Err(ParseError {
                                 message: format!(
@@ -385,7 +513,7 @@ impl<'a> Typechecker<'a> {
     /// Typecheck an expression and record its type in `expr_types`. Returns the type.
     fn typecheck_expr(&mut self, expr: &ast::Expr) -> Result<Ty, ParseError> {
         let ty = self.typecheck_expr_inner(expr)?;
-        self.types.expr_types.insert(expr.span(), ty);
+        self.types.expr_types.insert(expr.span(), ty.clone());
         Ok(ty)
     }
 
@@ -403,7 +531,7 @@ impl<'a> Typechecker<'a> {
                     .get(span)
                     .expect("ident use resolved during resolve()");
                 match self.types.binding_types.get(&id) {
-                    Some(BindingType::Var(ty)) => Ok(*ty),
+                    Some(BindingType::Var(ty)) => Ok(ty.clone()),
                     Some(BindingType::Fn(_)) => {
                         let name = self.resolution.bindings[&id].name.clone();
                         Err(ParseError {
@@ -513,7 +641,83 @@ impl<'a> Typechecker<'a> {
                     }
                 }
             }
+            // **M06**: borrow expressions `&place` and `&mut place`.
+            ast::Expr::Borrow { inner, mutable, span } => {
+                self.typecheck_borrow(inner, *mutable, *span)
+            }
         }
+    }
+
+    /// **M06**: typecheck a borrow expression. Verifies inner is a place
+    /// expression (Ident only in L2), takes a borrow via the borrow tracker
+    /// (enforcing aliasing rules), and returns `Ty::Ref { inner, mutable }`.
+    fn typecheck_borrow(
+        &mut self,
+        inner: &ast::Expr,
+        mutable: bool,
+        span: Span,
+    ) -> Result<Ty, ParseError> {
+        // Place-expression check: only identifiers in L2.
+        let ident_span = match inner {
+            ast::Expr::Ident(_, sp) => *sp,
+            other => {
+                return Err(ParseError {
+                    message: "expected place expression for borrow (identifier required)".into(),
+                    span: other.span(),
+                });
+            }
+        };
+        // Resolve the target binding.
+        let target_binding = *self
+            .resolution
+            .uses
+            .get(&ident_span)
+            .expect("ident resolved");
+        let target_decl = &self.resolution.bindings[&target_binding];
+        let target_name = target_decl.name.clone();
+        // For `&mut x`, the binding must be declared `mut`.
+        if mutable {
+            let is_mut_let = matches!(
+                target_decl.kind,
+                BindingKind::Let { mutable: true, .. },
+            );
+            // Function parameters are not `mut` in our L1; treat as non-mut.
+            if !is_mut_let {
+                return Err(ParseError {
+                    message: format!(
+                        "cannot borrow `{target_name}` as mutable; it is not declared as `mut`"
+                    ),
+                    span,
+                });
+            }
+        }
+        // Typecheck the inner expression to get T.
+        let inner_ty = self.typecheck_expr(inner)?;
+        // Aliasing check via the borrow tracker.
+        let depth = self.scope_depth;
+        let check = if mutable {
+            self.borrow_tracker.try_take_mut(target_binding, depth, span)
+        } else {
+            self.borrow_tracker
+                .try_take_shared(target_binding, depth, span)
+        };
+        if let Err(conflict) = check {
+            return Err(ParseError {
+                message: format!(
+                    "cannot borrow `{target_name}` as {new_kind} because it is already borrowed as {existing_kind}",
+                    new_kind = if mutable { "mutable" } else { "immutable" },
+                    existing_kind = match conflict.existing_kind {
+                        borrow_tracker::BorrowKind::Shared => "immutable",
+                        borrow_tracker::BorrowKind::Mut => "mutable",
+                    }
+                ),
+                span,
+            });
+        }
+        Ok(Ty::Ref {
+            inner: Box::new(inner_ty),
+            mutable,
+        })
     }
 
     fn typecheck_binary(
@@ -528,13 +732,10 @@ impl<'a> Typechecker<'a> {
         use ast::BinOp::*;
         match op {
             Add | Sub | Mul | Div | Rem => {
-                // M03.2: any same-Int-kind arithmetic is allowed, plus literal
-                // coercion to bring an untyped literal into agreement with the
-                // other operand.
                 let (lhs_ty, rhs_ty) = self.unify_numeric_operands(lhs, rhs, lhs_ty, rhs_ty);
-                let unified = match (lhs_ty, rhs_ty) {
-                    (Ty::Int(a), Ty::Int(b)) if a == b => Ty::Int(a),
-                    (Ty::Float(a), Ty::Float(b)) if a == b => Ty::Float(a),
+                let unified = match (&lhs_ty, &rhs_ty) {
+                    (Ty::Int(a), Ty::Int(b)) if a == b => Ty::Int(*a),
+                    (Ty::Float(a), Ty::Float(b)) if a == b => Ty::Float(*a),
                     _ => {
                         return Err(ParseError {
                             message: format!(
@@ -551,9 +752,9 @@ impl<'a> Typechecker<'a> {
             }
             Lt | Le | Gt | Ge => {
                 let (lhs_ty, rhs_ty) = self.unify_numeric_operands(lhs, rhs, lhs_ty, rhs_ty);
-                let ok = matches!((lhs_ty, rhs_ty),
+                let ok = matches!((&lhs_ty, &rhs_ty),
                     (Ty::Int(a), Ty::Int(b)) if a == b)
-                    || matches!((lhs_ty, rhs_ty),
+                    || matches!((&lhs_ty, &rhs_ty),
                         (Ty::Float(a), Ty::Float(b)) if a == b);
                 if !ok {
                     return Err(ParseError {
@@ -651,9 +852,9 @@ impl<'a> Typechecker<'a> {
                 span: call_span,
             });
         }
-        for (i, (arg, &param_ty)) in args.iter().zip(sig.params.iter()).enumerate() {
+        for (i, (arg, param_ty)) in args.iter().zip(sig.params.iter()).enumerate() {
             let arg_ty = self.typecheck_expr(arg)?;
-            if arg_ty != param_ty {
+            if arg_ty != *param_ty {
                 return Err(ParseError {
                     message: format!(
                         "argument {}: expected `{}`, found `{}`",
@@ -745,10 +946,10 @@ impl<'a> Typechecker<'a> {
         if lhs_ty == rhs_ty {
             return (lhs_ty, rhs_ty);
         }
-        if let Some(new_rhs) = self.try_coerce_to(rhs, rhs_ty, lhs_ty) {
+        if let Some(new_rhs) = self.try_coerce_to(rhs, rhs_ty.clone(), lhs_ty.clone()) {
             return (lhs_ty, new_rhs);
         }
-        if let Some(new_lhs) = self.try_coerce_to(lhs, lhs_ty, rhs_ty) {
+        if let Some(new_lhs) = self.try_coerce_to(lhs, lhs_ty.clone(), rhs_ty.clone()) {
             return (new_lhs, rhs_ty);
         }
         (lhs_ty, rhs_ty)
@@ -758,6 +959,14 @@ impl<'a> Typechecker<'a> {
 fn ty_from_ast(t: &ast::Type) -> Result<Ty, ParseError> {
     match t {
         ast::Type::Unit { .. } => Ok(Ty::Unit),
+        // **M06**: `&T` or `&mut T`. Inner is recursively resolved.
+        ast::Type::Ref { inner, mutable, .. } => {
+            let inner_ty = ty_from_ast(inner)?;
+            Ok(Ty::Ref {
+                inner: Box::new(inner_ty),
+                mutable: *mutable,
+            })
+        }
         ast::Type::Path { segments, span } => {
             if segments.len() != 1 {
                 return Err(ParseError {

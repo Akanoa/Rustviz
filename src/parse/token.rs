@@ -74,6 +74,10 @@ pub enum TokenKind {
     Bang,
     /// `->`
     Arrow,
+    /// **M06**: `&` — shared borrow / reference type prefix.
+    Amp,
+    /// **M06**: `&mut` (no whitespace between `&` and `mut`) — mutable borrow.
+    AmpMut,
 
     /// `(`
     LParen,
@@ -101,6 +105,8 @@ impl TokenKind {
             Self::Int(_, _) => "integer literal",
             Self::Float(_, _) => "float literal",
             Self::Bool(_) => "boolean literal",
+            Self::Amp => "`&`",
+            Self::AmpMut => "`&mut`",
             Self::Ident(_) => "identifier",
             Self::Let => "`let`",
             Self::Mut => "`mut`",

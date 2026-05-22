@@ -48,6 +48,8 @@ struct Evaluator<'a> {
     frames: Vec<Frame>,
     next_slot_id: u32,
     next_frame_id: u32,
+    /// **M06**: monotonic counter for borrow ids.
+    next_borrow_id: u32,
     /// Emitted events in source-execution order.
     events: Vec<MemEvent>,
     /// Set to true on runtime error to stop further evaluation.
@@ -64,6 +66,9 @@ struct Frame {
 struct Scope {
     /// Locals in declaration order. LIFO drop at scope exit.
     locals: Vec<LocalSlot>,
+    /// **M06**: BorrowIds created in this scope. On scope exit, emit
+    /// `BorrowEnd` for each (in reverse order).
+    borrows: Vec<crate::event::BorrowId>,
 }
 
 struct LocalSlot {
@@ -108,9 +113,17 @@ impl<'a> Evaluator<'a> {
             frames: Vec::new(),
             next_slot_id: 0,
             next_frame_id: 0,
+            next_borrow_id: 0,
             events: Vec::new(),
             halted: false,
         })
+    }
+
+    /// **M06**: allocate a fresh borrow id.
+    fn alloc_borrow_id(&mut self) -> crate::event::BorrowId {
+        let id = crate::event::BorrowId(self.next_borrow_id);
+        self.next_borrow_id += 1;
+        id
     }
 
     // ─── id allocators ─────────────────────────────────────────────────────
@@ -142,7 +155,7 @@ impl<'a> Evaluator<'a> {
 
     fn lookup_var_ty(&self, binding_id: BindingId) -> Option<Ty> {
         match self.types.binding_types.get(&binding_id) {
-            Some(BindingType::Var(ty)) => Some(*ty),
+            Some(BindingType::Var(ty)) => Some(ty.clone()),
             _ => None,
         }
     }
@@ -235,7 +248,7 @@ impl<'a> Evaluator<'a> {
         // Push the frame with an outer (param) scope.
         self.frames.push(Frame {
             frame_id,
-            scopes: vec![Scope { locals: Vec::new() }],
+            scopes: vec![Scope { locals: Vec::new(), borrows: Vec::new() }],
         });
 
         // Emit per-param SlotAlloc + SlotWrite and push the locals.
@@ -270,8 +283,11 @@ impl<'a> Evaluator<'a> {
                 });
         }
 
-        // Evaluate the body. Returns Value::Unit on halt.
-        let body_value = self.eval_block(&decl.body);
+        // **M06**: evaluate the body WITHOUT letting eval_block drop its scope.
+        // The body's scope drop must happen AFTER ReturnValue so borrows
+        // (BorrowEnd events) appear in the correct order — between
+        // ReturnValue and FrameLeave, not before ReturnValue.
+        let body_value = self.eval_fn_body(&decl.body);
 
         if self.halted {
             // Frame did not return — no ReturnValue, no FrameLeave. Stream ends
@@ -282,34 +298,44 @@ impl<'a> Evaluator<'a> {
         // M03.1: emit ReturnValue between body completion and scope teardown.
         // Pedagogically: the value is now visible for one cursor tick before
         // any drops fire or the frame closes.
+        // M06: when the body has no tail expression (implicit unit return),
+        // anchor the span at the closing `}` rather than the entire body
+        // block — otherwise the editor highlight spans the whole function.
         let return_span = decl
             .body
             .tail
             .as_ref()
             .map(|t| t.span())
-            .unwrap_or(decl.body.span);
+            .unwrap_or_else(|| closing_brace_span(decl.body.span));
         self.events.push(MemEvent::ReturnValue {
             frame_id,
             value: body_value.clone(),
             span: return_span,
         });
 
-        // Drop the param scope (LIFO). For L1 / Copy types this emits no
-        // events (gated in M03.1); M07+ non-Copy types still drop here.
-        self.drop_current_scope();
+        // M06: drop the body scope NOW (after ReturnValue). Emits BorrowEnd
+        // and SlotDrop (M07+) events. Use the closing `}` of the body block
+        // as the BorrowEnd span (1-char span at the end of the block).
+        let body_close = closing_brace_span(decl.body.span);
+        self.drop_current_scope(body_close);
+        // Drop the param scope (LIFO). The param scope's "closing brace" is
+        // the function decl's closing brace.
+        self.drop_current_scope(closing_brace_span(decl.span));
 
         // Pop the frame and emit FrameLeave.
         let frame = self.frames.pop().expect("frame still active");
         self.events.push(MemEvent::FrameLeave {
             frame_id: frame.frame_id,
             return_value: body_value.clone(),
-            span: decl.body.span,
+            // M06: anchor at the closing `}` for a precise editor highlight,
+            // matching ReturnValue + BorrowEnd's span treatment.
+            span: closing_brace_span(decl.body.span),
         });
 
         body_value
     }
 
-    fn drop_current_scope(&mut self) {
+    fn drop_current_scope(&mut self, end_span: Span) {
         let scope = self
             .frames
             .last_mut()
@@ -317,6 +343,16 @@ impl<'a> Evaluator<'a> {
             .scopes
             .pop()
             .expect("scope active");
+        // M06: emit BorrowEnd for each borrow created in this scope, in
+        // reverse-allocation order. The caller supplies the span of the
+        // scope's closing brace so the editor highlights `}` not the first
+        // local's declaration.
+        for borrow_id in scope.borrows.into_iter().rev() {
+            self.events.push(MemEvent::BorrowEnd {
+                borrow_id,
+                span: end_span,
+            });
+        }
         for local in scope.locals.into_iter().rev() {
             // M03.1: Copy types have no destructor; their bytes persist on the
             // stack until the frame is reused. Skipping the SlotDrop event for
@@ -337,6 +373,34 @@ impl<'a> Evaluator<'a> {
 
     // ─── block / stmt / expr evaluation ────────────────────────────────────
 
+    /// **M06**: evaluate a function body without dropping its scope. The
+    /// caller (call_fn) is responsible for dropping the scope after emitting
+    /// ReturnValue, so BorrowEnd events appear in the correct order.
+    fn eval_fn_body(&mut self, block: &ast::Block) -> Value {
+        if self.halted {
+            return Value::Unit;
+        }
+        self.frames
+            .last_mut()
+            .expect("frame active")
+            .scopes
+            .push(Scope { locals: Vec::new(), borrows: Vec::new() });
+        for stmt in &block.stmts {
+            if self.halted {
+                break;
+            }
+            self.eval_stmt(stmt);
+        }
+        if !self.halted {
+            match &block.tail {
+                Some(tail) => self.eval_expr(tail),
+                None => Value::Unit,
+            }
+        } else {
+            Value::Unit
+        }
+    }
+
     fn eval_block(&mut self, block: &ast::Block) -> Value {
         if self.halted {
             return Value::Unit;
@@ -346,7 +410,7 @@ impl<'a> Evaluator<'a> {
             .last_mut()
             .expect("frame active")
             .scopes
-            .push(Scope { locals: Vec::new() });
+            .push(Scope { locals: Vec::new(), borrows: Vec::new() });
 
         for stmt in &block.stmts {
             if self.halted {
@@ -365,7 +429,7 @@ impl<'a> Evaluator<'a> {
         };
 
         if !self.halted {
-            self.drop_current_scope();
+            self.drop_current_scope(closing_brace_span(block.span));
         }
 
         tail_value
@@ -504,7 +568,65 @@ impl<'a> Evaluator<'a> {
                     _ => panic!("typeck should have rejected non-bool conditions"),
                 }
             }
+            // M06: `&place` / `&mut place`. typeck guarantees inner is an Ident.
+            ast::Expr::Borrow { inner, mutable, span } => {
+                let target_binding = match inner.as_ref() {
+                    ast::Expr::Ident(_, sp) => *self
+                        .resolution
+                        .uses
+                        .get(sp)
+                        .expect("ident resolved"),
+                    _ => panic!("typeck should have rejected non-Ident place"),
+                };
+                let target_slot = self
+                    .lookup_local_slot(target_binding)
+                    .expect("local slot exists for borrowed binding");
+                let borrow_id = self.alloc_borrow_id();
+                // Emit the borrow event.
+                let event = if *mutable {
+                    MemEvent::BorrowMut {
+                        borrow_id,
+                        target: crate::event::Pointee::Slot(target_slot),
+                        span: *span,
+                    }
+                } else {
+                    MemEvent::BorrowShared {
+                        borrow_id,
+                        target: crate::event::Pointee::Slot(target_slot),
+                        span: *span,
+                    }
+                };
+                self.events.push(event);
+                // Track this borrow against the current scope for BorrowEnd.
+                self.frames
+                    .last_mut()
+                    .expect("frame active")
+                    .scopes
+                    .last_mut()
+                    .expect("scope active")
+                    .borrows
+                    .push(borrow_id);
+                Value::Ref {
+                    borrow_id,
+                    target_slot,
+                    mutable: *mutable,
+                }
+            }
         }
+    }
+
+    /// **M06**: look up the SlotId of the local holding `binding_id`.
+    fn lookup_local_slot(&self, binding_id: BindingId) -> Option<SlotId> {
+        for frame in self.frames.iter().rev() {
+            for scope in frame.scopes.iter().rev() {
+                for local in scope.locals.iter().rev() {
+                    if local.binding_id == binding_id {
+                        return Some(local.slot_id);
+                    }
+                }
+            }
+        }
+        None
     }
 
     fn apply_unary(&mut self, op: ast::UnOp, v: Value, span: Span) -> Value {
@@ -710,4 +832,14 @@ impl<'a> Evaluator<'a> {
         }
         Value::Float { kind, value: result }
     }
+}
+
+/// **M06**: synthesize a span pointing at the closing `}` of a block whose
+/// span covers `{...}`. The 1-char span at the end of the block is what
+/// `BorrowEnd` events use so the editor highlight lands on the brace rather
+/// than the block's first statement.
+fn closing_brace_span(block_span: Span) -> Span {
+    let end = block_span.end;
+    let start = end.saturating_sub(1);
+    Span::new(start, end, block_span.file)
 }

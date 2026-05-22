@@ -301,6 +301,98 @@ mod tests {
         assert_eq!(info_count, 1, "expected exactly one Info note (no propagation re-emission)");
     }
 
+    // M06 / US1: shared borrow.
+    #[test]
+    fn run_pipeline_shared_borrow() {
+        let source = "fn main() { let x = 5; let r = &x; }";
+        let events = run_pipeline(source).expect("shared borrow compiles");
+        let has_shared = events.iter().any(|e| matches!(e,
+            crate::MemEvent::BorrowShared { .. }));
+        let has_end = events.iter().any(|e| matches!(e,
+            crate::MemEvent::BorrowEnd { .. }));
+        assert!(has_shared, "expected a BorrowShared event");
+        assert!(has_end, "expected a BorrowEnd event");
+    }
+
+    #[test]
+    fn run_pipeline_shared_borrow_multiple() {
+        // Multiple shared borrows OK in Rust.
+        let source = "fn main() { let x = 5; let r1 = &x; let r2 = &x; }";
+        let events = run_pipeline(source).expect("two shared borrows are valid");
+        let shared_count = events.iter().filter(|e| matches!(e,
+            crate::MemEvent::BorrowShared { .. })).count();
+        assert_eq!(shared_count, 2);
+    }
+
+    // M06 / US2: mutable borrow.
+    #[test]
+    fn run_pipeline_mut_borrow() {
+        let source = "fn main() { let mut x = 5; let r = &mut x; }";
+        let events = run_pipeline(source).expect("mut borrow compiles");
+        let has_mut = events.iter().any(|e| matches!(e,
+            crate::MemEvent::BorrowMut { .. }));
+        assert!(has_mut, "expected a BorrowMut event");
+    }
+
+    #[test]
+    fn run_pipeline_mut_borrow_on_non_mut_rejected() {
+        let err = run_pipeline("fn main() { let x = 5; let r = &mut x; }")
+            .expect_err("cannot &mut a non-mut binding");
+        assert_eq!(err.stage, CompileStage::Typeck);
+    }
+
+    // M06 / US3: aliasing rule violations.
+    #[test]
+    fn run_pipeline_shared_then_mut_rejected() {
+        let err = run_pipeline("fn main() { let mut x = 5; let r1 = &x; let r2 = &mut x; }")
+            .expect_err("&mut while & exists is invalid");
+        assert_eq!(err.stage, CompileStage::Typeck);
+    }
+
+    #[test]
+    fn run_pipeline_two_mut_rejected() {
+        let err = run_pipeline("fn main() { let mut x = 5; let r1 = &mut x; let r2 = &mut x; }")
+            .expect_err("two &mut on same binding is invalid");
+        assert_eq!(err.stage, CompileStage::Typeck);
+    }
+
+    #[test]
+    fn run_pipeline_mut_then_shared_rejected() {
+        let err = run_pipeline("fn main() { let mut x = 5; let r1 = &mut x; let r2 = &x; }")
+            .expect_err("& while &mut exists is invalid");
+        assert_eq!(err.stage, CompileStage::Typeck);
+    }
+
+    // M06 / US4: scope-level lifetime end.
+    #[test]
+    fn run_pipeline_scoped_borrow_ends_at_inner_brace() {
+        let source = "fn main() { let x = 5; { let r = &x; } }";
+        let events = run_pipeline(source).expect("scoped borrow compiles");
+        // Find positions of BorrowShared and BorrowEnd; BorrowEnd must come
+        // before the outer SlotDrop for x (if any), but more concretely,
+        // before the function's FrameLeave.
+        let mut borrow_end_idx = None;
+        let mut frame_leave_idx = None;
+        for (i, e) in events.iter().enumerate() {
+            match e {
+                crate::MemEvent::BorrowEnd { .. } => borrow_end_idx = Some(i),
+                crate::MemEvent::FrameLeave { .. } => frame_leave_idx = Some(i),
+                _ => {}
+            }
+        }
+        let end = borrow_end_idx.expect("BorrowEnd should fire");
+        let leave = frame_leave_idx.expect("FrameLeave should fire");
+        assert!(end < leave, "BorrowEnd at inner `}}` should precede main's FrameLeave");
+    }
+
+    // M06: place-expression check — borrowing a non-place is rejected.
+    #[test]
+    fn run_pipeline_borrow_of_literal_rejected() {
+        let err = run_pipeline("fn main() { let r = &5; }")
+            .expect_err("&literal is invalid (not a place)");
+        assert_eq!(err.stage, CompileStage::Typeck);
+    }
+
     #[test]
     fn compile_error_serde_roundtrip() {
         let err = run_pipeline("fn main() { let x = ; }").expect_err("parse error");

@@ -117,6 +117,8 @@ src/
 - in-memory; no new files. `web/traces/*.json` files become deprecated artifacts (FR-010); trunk's pre-build `gen_traces` hook is dropped. (007-live-l1-editing)
 - Rust 2024 edition (same toolchain as M01–M05). No new toolchain requirements. + existing `indexmap`, `serde`, `serde_json`, `wasm-bindgen`, `js-sys`, `console_error_panic_hook`. **No new Rust deps**. No JS dep changes. (008-m03-2-scalar-lattice)
 - in-memory; no new files. M03 snapshot tests re-baselined (Value's Debug format changes); `web/traces/` remains obsolete (M05 already removed the trunk hook). (008-m03-2-scalar-lattice)
+- Rust 2024 edition (same toolchain as M01–M05). No new toolchain requirements. + existing `indexmap`, `serde`, `serde_json`, `wasm-bindgen`, `js-sys`, `console_error_panic_hook`. **No new Rust deps**. No JS dep changes (existing `@codemirror/*` import map sufficient). (009-m06-borrows)
+- in-memory; no new files. M03 snapshot tests should stay byte-identical (existing samples don't construct `Value::Ref` or `Ty::Ref`). M02 may re-baseline if any TypeMap snapshot Debug output shifts (unlikely — additive enum variants don't change existing variant formats). (009-m06-borrows)
 
 ## Recent Changes
 - 001-milestone-roadmap: Added N/A — deliverable is markdown documentation + `CLAUDE.md` (authoritative scope source); `specs/001-milestone-roadmap/spec.md` (this feature's spec)

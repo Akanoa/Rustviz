@@ -50,6 +50,10 @@
         <option value="m03_2_basic_u8">u8 arithmetic (M03.2)</option>
         <option value="m03_2_u8_overflow">u8 overflow (M03.2)</option>
         <option value="m03_2_float_nan">f64 NaN (M03.2)</option>
+        <option value="m06_shared_borrow">Shared borrow (M06)</option>
+        <option value="m06_mut_borrow">Mutable borrow (M06)</option>
+        <option value="m06_aliasing_error">Aliasing error (M06)</option>
+        <option value="m06_scoped_borrow">Scoped borrow (M06)</option>
       </select>
     </header>
 
@@ -59,6 +63,20 @@
       <section id="heap" aria-label="heap panel">
         <p class="placeholder">Heap (Level 3+)</p>
       </section>
+      <!-- M06: SVG arrow overlay drawn above all panels. pointer-events:none
+           so clicks pass through to the underlying panels. -->
+      <svg id="arrow-overlay" aria-hidden="true">
+        <defs>
+          <marker id="arrow-head-shared" viewBox="0 0 10 10" refX="9" refY="5"
+                  markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="#2a6fa5" />
+          </marker>
+          <marker id="arrow-head-mut" viewBox="0 0 10 10" refX="9" refY="5"
+                  markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="#c62828" />
+          </marker>
+        </defs>
+      </svg>
     </main>
 
     <div id="status" hidden></div>

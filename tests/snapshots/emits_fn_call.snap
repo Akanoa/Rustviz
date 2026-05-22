@@ -119,7 +119,7 @@ Ok(
                 bits: 5,
             },
             span: Span {
-                start: 30,
+                start: 42,
                 end: 43,
                 file: FileId(
                     1,
@@ -164,7 +164,7 @@ Ok(
             ),
             value: Unit,
             span: Span {
-                start: 55,
+                start: 80,
                 end: 81,
                 file: FileId(
                     1,
@@ -177,7 +177,7 @@ Ok(
             ),
             return_value: Unit,
             span: Span {
-                start: 55,
+                start: 80,
                 end: 81,
                 file: FileId(
                     1,

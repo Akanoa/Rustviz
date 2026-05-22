@@ -141,6 +141,20 @@ impl Parser {
                 span: lparen.span.merge(rparen.span),
             });
         }
+        // M06: `&T` and `&mut T` reference types.
+        if self.at(&TokenKind::Amp) || self.at(&TokenKind::AmpMut) {
+            let amp = self.bump();
+            let mutable = matches!(amp.kind, TokenKind::AmpMut);
+            let inner = self.parse_type()?;
+            let inner_span = match &inner {
+                Type::Path { span, .. } | Type::Unit { span } | Type::Ref { span, .. } => *span,
+            };
+            return Ok(Type::Ref {
+                inner: Box::new(inner),
+                mutable,
+                span: amp.span.merge(inner_span),
+            });
+        }
         // M01 supports single-segment paths only; `::` tokenizer support is M02+.
         let segment_span = self.peek().span;
         let segment = self.expect_ident("type")?;
@@ -309,6 +323,7 @@ impl Parser {
             }
             TokenKind::Minus => self.parse_unary(UnOp::Neg),
             TokenKind::Bang => self.parse_unary(UnOp::Not),
+            TokenKind::Amp | TokenKind::AmpMut => self.parse_borrow_expr(),
             _ => Err(self.error_expected("expression")),
         }
     }
@@ -321,6 +336,21 @@ impl Parser {
         Ok(Expr::Unary {
             op,
             expr: Box::new(expr),
+            span,
+        })
+    }
+
+    /// **M06**: `&expr` or `&mut expr`. Place-expression check happens at
+    /// typeck (parser accepts any expression after the `&` for now).
+    fn parse_borrow_expr(&mut self) -> Result<Expr, ParseError> {
+        let amp = self.bump();
+        let mutable = matches!(amp.kind, TokenKind::AmpMut);
+        // Borrows bind tighter than binary ops, like other unary prefixes.
+        let inner = self.parse_expr(70)?;
+        let span = amp.span.merge(inner.span());
+        Ok(Expr::Borrow {
+            inner: Box::new(inner),
+            mutable,
             span,
         })
     }
@@ -353,6 +383,6 @@ fn item_span(item: &Item) -> Span {
 
 fn type_span(ty: &Type) -> Span {
     match ty {
-        Type::Path { span, .. } | Type::Unit { span } => *span,
+        Type::Path { span, .. } | Type::Unit { span } | Type::Ref { span, .. } => *span,
     }
 }

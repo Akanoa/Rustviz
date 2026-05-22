@@ -186,15 +186,23 @@ pub fn lex(file: FileId, source_map: &SourceMap) -> Result<Vec<Token>, ParseErro
             (b'>', Some(b'=')) => (TokenKind::Ge, 2),
             (b'&', Some(b'&')) => (TokenKind::AndAnd, 2),
             (b'&', _) => {
-                // Single `&` (and `&mut`) — references are Level 2.
-                // Pedagogical message points learners at the level concept;
-                // M06 will replace this with `Amp`/`AmpMut` tokenization.
-                return Err(ParseError {
-                    message:
-                        "references are a Level 2 feature, not yet supported in this version of rustviz"
-                            .into(),
-                    span: Span::new(start, start + 1, file),
-                });
+                // M06: `&mut` requires no whitespace between `&` and `mut`,
+                // AND the `mut` must be a complete identifier (not followed
+                // by another alphanumeric/underscore). Otherwise it's a plain `&`.
+                let is_mut = (pos + 3) < len
+                    && src[(pos + 1) as usize] == b'm'
+                    && src[(pos + 2) as usize] == b'u'
+                    && src[(pos + 3) as usize] == b't'
+                    && (
+                        (pos + 4) >= len
+                            || !(src[(pos + 4) as usize].is_ascii_alphanumeric()
+                                || src[(pos + 4) as usize] == b'_')
+                    );
+                if is_mut {
+                    (TokenKind::AmpMut, 4)
+                } else {
+                    (TokenKind::Amp, 1)
+                }
             }
             (b'|', Some(b'|')) => (TokenKind::OrOr, 2),
             (b'-', Some(b'>')) => (TokenKind::Arrow, 2),

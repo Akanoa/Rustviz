@@ -69,16 +69,30 @@ pub enum Value {
     Bool(bool),
     /// Unit `()`.
     Unit,
+    /// **M06**: a borrow value held in a stack slot. Created by an
+    /// `Expr::Borrow` evaluation; identified by `borrow_id` matching a
+    /// `BorrowShared` or `BorrowMut` event. `target_slot` denormalizes
+    /// the borrow's target so the StateSnapshot is self-contained.
+    Ref {
+        /// Identifier of the active borrow.
+        borrow_id: BorrowId,
+        /// Slot being borrowed.
+        target_slot: SlotId,
+        /// `true` for `&mut`, `false` for `&`.
+        mutable: bool,
+    },
 }
 
 impl Value {
-    /// User-facing type name of this value (`"u8"`, `"f64"`, `"bool"`, `"()"`).
+    /// User-facing type name of this value (`"u8"`, `"f64"`, `"bool"`, `"()"`, `"&"`, `"&mut"`).
     pub fn type_name(&self) -> &'static str {
         match self {
             Self::Int { kind, .. } => kind.name(),
             Self::Float { kind, .. } => kind.name(),
             Self::Bool(_) => "bool",
             Self::Unit => "()",
+            Self::Ref { mutable: false, .. } => "&",
+            Self::Ref { mutable: true, .. } => "&mut",
         }
     }
 }
