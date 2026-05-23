@@ -446,6 +446,83 @@ Acyclic. The drawn order is one valid topological sort. Edges from M03 to M05–
 
 ---
 
+### M07.1 — Slices (`&[T]`, range indexing, fat pointers)
+
+- **Kind**: feature (revision-style — fills a gap in M07 by introducing the slice primitive that M07.2 builds on)
+- **Status**: planned
+- **Complexity**: L (modules: 4, bullets: 5, boundaries: 2)
+- **Depends on**: M07
+- **Authority**: Rust language reference for slice types `&[T]`; the existing M06 borrow infrastructure (slices are borrows with extra metadata).
+
+**Goal.** Introduce the slice primitive end to end. Slices are Rust's "view into contiguous memory" — represented at runtime as a fat pointer (data ptr + length). M07 had no slice support; the existing `&[T]` shape from heap allocations couldn't be expressed. M07.1 adds the slice type, range expressions, range indexing on Vec/array, and the fat-pointer visual.
+
+**In scope.**
+- New AST: range expression `a..b`, `..b`, `a..`, `..` (parser + Expr::Range or four explicit forms).
+- New Ty: slice type — `Ty::Slice(Box<Ty>)` for `&[T]` / `&mut [T]` representation. The unsized `[T]` itself need not be a first-class Ty if all uses go through references.
+- Range indexing: `&v[1..3]` produces `&[i32]`. Typeck enforces receiver = `Vec<T>` or already-a-slice. Borrow-tracker integration.
+- Vec/array `len()` returns `usize`; same for slice.
+- Fat-pointer visual: the existing blue/red borrow arrow gains a small `[len: N]` annotation when the borrow's type is a slice (vs a single-element ref). Plan-phase decides whether to render two arrows (ptr + len) or a single arrow with metadata.
+- New reference samples: ≥ 3 covering vector slicing, range bounds, len() on a slice.
+
+**Out of scope.**
+- `&str` (M07.2 — built on this slice infrastructure).
+- Iterator methods (`v.iter()`, `for x in slice`) — keep this milestone focused.
+- Mutable slices `&mut [T]` with element mutation — single-element borrows already deferred index-write; same here. Slices borrowed immutably only.
+- Multi-dimensional slices.
+
+**Entry criteria.**
+- M07 closed.
+
+**Exit criteria.**
+- `let v = vec![…]; let s = &v[1..3];` typechecks; `s.len()` returns the correct length.
+- The blue borrow arrow from `s` to the heap shows a length annotation.
+- A slice taken before a Vec realloc becomes dangling (reuses M07's dangling-borrow detection on the underlying Vec's HeapAddr).
+- ≥ 3 new `m07_1_*.rs` samples ship.
+
+**Demo.** Browser. `m07_1_slice_basic.rs`: take `&v[..]`, observe slice arrow with length annotation. `m07_1_slice_range.rs`: `&v[1..3]`, observe partial-slice arrow. `m07_1_slice_dangling.rs`: slice survives a Vec push that reallocates — RuntimeError note.
+
+**Notes.** Foundational for M07.2 — `&str` is "a slice into static memory" and reuses this milestone's fat-pointer + slice-type infrastructure.
+
+---
+
+### M07.2 — `&str` + static memory
+
+- **Kind**: feature (revision-style — fixes M07's incorrect-but-pragmatic shortcut where string literals became `String` instead of `&'static str`)
+- **Status**: planned
+- **Complexity**: M (modules: 3, bullets: 4, boundaries: 2)
+- **Depends on**: M07.1
+- **Authority**: Rust language reference for `&'static str`; the slice infrastructure from M07.1.
+
+**Goal.** Make string literals typecheck correctly as `&'static str` and visualize the static read-only memory region they live in. Currently M07 treats `let s = "toto"` as creating a `String` (heap-allocated, owned) — wrong type, wrong allocation behavior. M07.2 introduces a static-memory panel/region; literals get a slice into it; `String::from("toto")` is what actually allocates on the heap and copies the bytes.
+
+**In scope.**
+- New visual region: static-memory panel (or annotation within the existing heap panel) showing read-only bytes for each unique string literal.
+- New Ty: `Ty::Ref { inner: Ty::Slice(Box::new(Ty::Int(U8))), mutable: false }` or a sugar `Ty::Str` (plan-phase decides). Borrowed-from-rodata pedagogy.
+- String literal typing: `"toto"` is `&'static str` (a slice pointing into the static region), NOT `String`.
+- `String::from(s: &str) -> String` heap-allocates a fresh chunk and copies the bytes from the static region.
+- `String::push_str(s: &str)` takes &str.
+- New reference samples: ≥ 2 covering the static-memory + heap distinction.
+
+**Out of scope.**
+- `&str` slicing (`&"hello"[1..3]`) — M07.1 already covers the range-indexing mechanics; could be tested but not the focus.
+- `format!`, `print!`, owned string concatenation operators — these are separate features.
+- Unicode handling beyond ASCII bytes — same as M07.
+
+**Entry criteria.**
+- M07.1 closed.
+
+**Exit criteria.**
+- `let s = "hi";` produces `s: &'static str`, NOT `s: String`. The visualization shows `s`'s borrow arrow pointing into the static-memory region.
+- `String::from("hi")` produces a heap allocation; the trace contains a `HeapAlloc` event and the bytes are copied (visible as the static `"hi"` and the heap `"hi"` both showing the same content).
+- The static-memory region persists across the whole trace; no allocations / no frees within it.
+- ≥ 2 new `m07_2_*.rs` samples ship.
+
+**Demo.** Browser. `m07_2_str_literal.rs`: `let s = "toto";`, observe the static-memory region + the &str arrow. `m07_2_string_from.rs`: `String::from("hi")` shows the static "hi" PLUS the new heap allocation with a copy.
+
+**Notes.** Closes M07's known type-incorrectness (string literals shouldn't be `String`). The static-memory region is a new visual concept worth its own pedagogy — distinguishes "this binding's bytes are baked into the binary" from "this binding owns a heap allocation."
+
+---
+
 ### M08 — Level 4: threads (thread::spawn, Arc, Mutex)
 
 - **Kind**: feature
