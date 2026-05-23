@@ -274,32 +274,23 @@ impl<'a> Evaluator<'a> {
                 }
             }
         }
-        // Update LocalSlot owning-values to point at the new addr; emit
-        // SlotWrite for each so the UI's owning arrow follows.
-        let mut writes_needed = Vec::new();
+        // Update LocalSlot owning-values to point at the new addr. No
+        // SlotWrite event emitted: the ui's apply_event for HeapRealloc
+        // already updates owning relationships from `from` to `to`, so
+        // a separate SlotWrite would just create a redundant cursor step
+        // with no visible change (the slot value cell is empty for
+        // heap-owning bindings anyway — the black arrow is the visual).
         for frame in self.frames.iter_mut() {
             for scope in frame.scopes.iter_mut() {
                 for local in scope.locals.iter_mut() {
                     match &mut local.value {
-                        Value::Vec { addr } if *addr == from => {
-                            *addr = to;
-                            writes_needed.push((local.slot_id, local.value.clone()));
-                        }
-                        Value::String { addr } if *addr == from => {
-                            *addr = to;
-                            writes_needed.push((local.slot_id, local.value.clone()));
-                        }
-                        Value::Box { addr } if *addr == from => {
-                            *addr = to;
-                            writes_needed.push((local.slot_id, local.value.clone()));
-                        }
+                        Value::Vec { addr } if *addr == from => *addr = to,
+                        Value::String { addr } if *addr == from => *addr = to,
+                        Value::Box { addr } if *addr == from => *addr = to,
                         _ => {}
                     }
                 }
             }
-        }
-        for (slot_id, val) in writes_needed {
-            self.events.push(MemEvent::SlotWrite { slot_id, value: val, span });
         }
         // Dangling-borrow detection: scan locals for Value::Ref with
         // target = Pointee::Heap(from). After the addr change, these refs

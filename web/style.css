@@ -117,8 +117,14 @@ main > section {
 #heap {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.5rem;
-  padding: 1rem;
+  column-gap: 0.5rem;
+  /* M07: extra vertical row-gap leaves room for arrow lanes above each
+     heap row (renderArrows() places lanes at heap.top - 12 - 6*i for the
+     i-th arrow). The top padding gives the first row similar breathing
+     room — large enough that even 5+ stacked lanes for arrows aimed at
+     row-1 heap boxes never get clipped above the panel's visible area. */
+  row-gap: 2.5rem;
+  padding: 4rem 1rem 1rem 1rem;
   align-content: flex-start;
 }
 
@@ -214,7 +220,9 @@ main > section:last-child {
 }
 
 #heap {
-  padding: 1rem;
+  /* M07: the later #heap rule above defines padding for the active heap
+     panel (4rem top to give arrow lanes room). This rule only contributes
+     the muted color (carried from the M04 placeholder era). */
   color: var(--muted);
 }
 

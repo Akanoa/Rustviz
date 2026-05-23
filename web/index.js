@@ -277,27 +277,86 @@ function renderArrows(arrows) {
   const overlayBox = overlay.getBoundingClientRect();
   const NS = "http://www.w3.org/2000/svg";
 
+  // M07 cosmetic: group arrows by target so we can vertically distribute
+  // multiple arrows ending at the same DOM element (otherwise their final
+  // H segments overlap into a single line). Same idea for source.
+  const targetKey = (a) =>
+    a.target && a.target.Slot !== undefined ? `s${a.target.Slot}`
+    : a.target && a.target.Heap !== undefined ? `h${a.target.Heap}`
+    : "?";
+  const sourceKey = (a) => `s${a.source_slot}`;
+  const byTarget = new Map();
+  const bySource = new Map();
+  for (const a of arrows) {
+    const tk = targetKey(a);
+    if (!byTarget.has(tk)) byTarget.set(tk, []);
+    byTarget.get(tk).push(a);
+    const sk = sourceKey(a);
+    if (!bySource.has(sk)) bySource.set(sk, []);
+    bySource.get(sk).push(a);
+  }
+  // Distribute n arrows vertically across a box of height h: with 1 arrow
+  // anchor at center; with 2+ space them evenly avoiding edges.
+  const distOffset = (h, i, n) => {
+    if (n <= 1) return 0;
+    const slot = h / (n + 1);
+    return slot * (i + 1) - h / 2;
+  };
+
   for (const a of arrows) {
     const srcEl = document.querySelector(`[data-slot-id="${a.source_slot}"]`);
     // M07: target can be Slot(id) or Heap(addr). The wire format is
     // { "Slot": <id> } or { "Heap": <addr> } (serde tag-by-key).
     let tgtEl = null;
+    let targetIsHeap = false;
     if (a.target && a.target.Slot !== undefined) {
       tgtEl = document.querySelector(`[data-slot-id="${a.target.Slot}"]`);
     } else if (a.target && a.target.Heap !== undefined) {
       tgtEl = document.querySelector(`[data-heap-addr="${a.target.Heap}"]`);
+      targetIsHeap = true;
     }
     if (!srcEl || !tgtEl) continue;
     const src = srcEl.getBoundingClientRect();
     const tgt = tgtEl.getBoundingClientRect();
+
+    // Per-arrow distribution at source end (co-sourced arrows space out
+    // vertically across the source slot's height).
+    const sList = bySource.get(sourceKey(a));
+    const sIdx = sList.indexOf(a);
+    const yOffsetSrc = distOffset(src.height, sIdx, sList.length);
     const x1 = src.left - overlayBox.left;
-    const y1 = src.top + src.height / 2 - overlayBox.top;
-    const x2 = tgt.left - overlayBox.left;
-    const y2 = tgt.top + tgt.height / 2 - overlayBox.top;
-    const lane = 10 + (arrows.indexOf(a) * 6);
-    const gutterX = Math.min(x1, x2) - lane;
+    const y1 = src.top + src.height / 2 + yOffsetSrc - overlayBox.top;
+
+    const arrIdx = arrows.indexOf(a);
     const path = document.createElementNS(NS, "path");
-    path.setAttribute("d", `M${x1},${y1} H${gutterX} V${y2} H${x2}`);
+    let d;
+
+    if (targetIsHeap) {
+      // **M07**: enter heap target from ABOVE. Closest lane is heap.top − 20
+      // — empirically the arrowhead marker (6×6 px with refX=9) needs at
+      // least ~15px of clean V segment so its body doesn't overlap the
+      // H→V bend (which made some arrows look like a T-shaped tip).
+      // +6 per additional arrow keeps lanes from merging when multiple
+      // arrows share the heap row.
+      const laneY = tgt.top - 20 - arrIdx * 6 - overlayBox.top;
+      const targetX = tgt.left + tgt.width / 2 - overlayBox.left;
+      const targetTopY = tgt.top - overlayBox.top;
+      const laneX = Math.min(x1, targetX) - (10 + arrIdx * 6);
+      d = `M${x1},${y1} H${laneX} V${laneY} H${targetX} V${targetTopY}`;
+    } else {
+      // Slot target: original left-gutter routing (enter from left edge).
+      const tList = byTarget.get(targetKey(a));
+      const tIdx = tList.indexOf(a);
+      const yOffsetTgt = distOffset(tgt.height, tIdx, tList.length);
+      const globalNudge = (arrIdx - (arrows.length - 1) / 2) * 4;
+      const x2 = tgt.left - overlayBox.left;
+      const y2 = tgt.top + tgt.height / 2 + yOffsetTgt + globalNudge - overlayBox.top;
+      const lane = 10 + arrIdx * 6;
+      const gutterX = Math.min(x1, x2) - lane;
+      d = `M${x1},${y1 + globalNudge} H${gutterX} V${y2} H${x2}`;
+    }
+
+    path.setAttribute("d", d);
     const cls = a.kind === "Mut" ? "arrow-mut"
               : a.kind === "Owning" ? "arrow-owning"
               : "arrow-shared";
@@ -502,8 +561,50 @@ function start() {
   });
 }
 
+// **Cache-debug aid**: display the hashes of the currently-loaded CSS and
+// WASM bootstrap. Compare against `web/dist/style-*.css` / `web/dist/*.js`
+// filenames on disk to confirm the browser has the latest build.
+function showBuildId() {
+  const cssLink = document.querySelector('link[rel="stylesheet"]');
+  const cssMatch = cssLink?.href?.match(/style-([a-f0-9]+)\.css/);
+  // Trunk's WASM bootstrap is loaded as an inline module + modulepreload;
+  // the modulepreload link carries the hashed filename.
+  const preload = document.querySelector('link[rel="modulepreload"][href*="rustviz-"]');
+  const wasmMatch = preload?.href?.match(/rustviz-([a-f0-9]+)\.js/);
+  const cssHash = cssMatch ? cssMatch[1].slice(0, 8) : "?";
+  const wasmHash = wasmMatch ? wasmMatch[1].slice(0, 8) : "?";
+  const el = document.createElement("div");
+  el.id = "build-id";
+  el.textContent = `build: css ${cssHash} / wasm ${wasmHash}`;
+  el.title = "Click to copy";
+  el.style.cssText =
+    "position:fixed; bottom:4px; right:4px; font-size:10px; color:#555; " +
+    "font-family:ui-monospace,monospace; user-select:text; cursor:copy; " +
+    "z-index:9999; background:rgba(255,255,255,0.85); " +
+    "border:1px solid #ccc; padding:2px 6px; border-radius:3px;";
+  el.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(el.textContent);
+      const old = el.textContent;
+      el.textContent = "✓ copied";
+      setTimeout(() => { el.textContent = old; }, 800);
+    } catch (e) {
+      // Fallback: select the text so the user can Ctrl+C.
+      const range = document.createRange();
+      range.selectNode(el);
+      window.getSelection().removeAllRanges();
+      window.getSelection().addRange(range);
+    }
+  });
+  document.body.appendChild(el);
+}
+
 if (window.wasmBindings) {
   start();
+  showBuildId();
 } else {
-  window.addEventListener("TrunkApplicationStarted", start, { once: true });
+  window.addEventListener("TrunkApplicationStarted", () => {
+    start();
+    showBuildId();
+  }, { once: true });
 }
