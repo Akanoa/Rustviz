@@ -82,8 +82,10 @@ mod tests {
     fn run_pipeline_minimal() {
         let events = run_pipeline("fn main() { let x = 5; }")
             .expect("minimal program compiles");
-        // Expect at minimum: FrameEnter, SlotAlloc, SlotWrite, ReturnValue, FrameLeave.
-        assert!(events.len() >= 5);
+        // Expect at minimum: FrameEnter, SlotAlloc, SlotWrite, FrameLeave.
+        // M07.2: ReturnValue(Unit) for implicit-unit returns is skipped
+        // (no caller to flash; would produce a silent cursor step).
+        assert!(events.len() >= 4);
         assert!(matches!(events[0], MemEvent::FrameEnter { .. }));
     }
 
@@ -98,8 +100,11 @@ mod tests {
     fn run_pipeline_fn_call() {
         let source = "fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\nfn main() {\n    let r = add(2, 3);\n}\n";
         let events = run_pipeline(source).expect("fn call compiles");
-        // M03.1 post-revision: m03_fn_call's trace has 12 events.
-        assert_eq!(events.len(), 12);
+        // M03.1 post-revision: 12 events.
+        // M07.2: -1 because main's implicit-unit ReturnValue is now skipped.
+        // `add` still emits ReturnValue(Int 5) because it has an explicit
+        // tail expression returning a non-unit value.
+        assert_eq!(events.len(), 11);
     }
 
     #[test]
@@ -664,16 +669,17 @@ mod tests {
         // Zero HeapAlloc — string literals don't allocate at runtime.
         let heap_count = events.iter().filter(|e| matches!(e, crate::MemEvent::HeapAlloc { .. })).count();
         assert_eq!(heap_count, 0, "expected zero HeapAlloc events for a bare literal");
-        // BorrowShared with Pointee::Static target.
-        let shared_static = events.iter().any(|e| matches!(e,
-            crate::MemEvent::BorrowShared { target: crate::event::Pointee::Static(_), .. }
-        ));
-        assert!(shared_static, "expected BorrowShared with Pointee::Static target");
-        // s's SlotWrite carries Value::Slice with len 4.
+        // **M07.2**: Pointee::Static borrows no longer emit BorrowShared
+        // events (lifecycle is invisible — silent no-op cursor steps).
+        // The arrow is materialized lazily at SlotWrite time. Verify via
+        // the SlotWrite carrying Value::Slice with Pointee::Static target.
         let slice_write = events.iter().any(|e| matches!(e,
             crate::MemEvent::SlotWrite { value: crate::Value::Slice { len: 4, target: crate::event::Pointee::Static(_), .. }, .. }
         ));
         assert!(slice_write, "expected SlotWrite of Value::Slice {{ len: 4, target: Pointee::Static(_), .. }}");
+        // And zero BorrowShared events should be present.
+        let shared_count = events.iter().filter(|e| matches!(e, crate::MemEvent::BorrowShared { .. })).count();
+        assert_eq!(shared_count, 0, "M07.2: static-target borrows no longer emit BorrowShared");
     }
 
     /// `String::from(s)` where `s` is an existing `&str` binding (not a
@@ -768,13 +774,14 @@ mod tests {
         // (it shares the same static block).
         let static_count = events.iter().filter(|e| matches!(e, crate::MemEvent::StaticAlloc { .. })).count();
         assert_eq!(static_count, 1, "sub-slice should reuse the parent's static block");
-        // Two BorrowShared events targeting the same Pointee::Static — one
-        // for the literal `s`, one for the sub-slice `s2`.
-        let shared_static_count = events.iter().filter(|e| matches!(e,
-            crate::MemEvent::BorrowShared { target: crate::event::Pointee::Static(_), .. }
-        )).count();
-        assert_eq!(shared_static_count, 2, "expected two static-targeted borrows (literal + sub-slice)");
-        // s2's SlotWrite has Value::Slice with len 2 + byte_offset 0 + byte_len 2.
+        // M07.2: Pointee::Static borrows skip BorrowShared/BorrowEnd
+        // entirely. Verify via SlotWrites for both s and s2.
+        let slice_writes: Vec<u64> = events.iter().filter_map(|e| match e {
+            crate::MemEvent::SlotWrite { value: crate::Value::Slice { target: crate::event::Pointee::Static(_), len, .. }, .. } => Some(*len),
+            _ => None,
+        }).collect();
+        assert_eq!(slice_writes, vec![5, 2], "expected SlotWrites for s (len 5) and s2 (len 2)");
+        // s2's specific shape: Value::Slice with byte_offset 0, byte_len 2.
         let s2_write = events.iter().any(|e| matches!(e,
             crate::MemEvent::SlotWrite {
                 value: crate::Value::Slice {
@@ -831,10 +838,15 @@ mod tests {
         let events = run_pipeline(source).expect("literal dedup compiles");
         let static_count = events.iter().filter(|e| matches!(e, crate::MemEvent::StaticAlloc { .. })).count();
         assert_eq!(static_count, 1, "two identical literals should share one StaticAlloc");
-        let shared_count = events.iter().filter(|e| matches!(e,
-            crate::MemEvent::BorrowShared { target: crate::event::Pointee::Static(_), .. }
-        )).count();
-        assert_eq!(shared_count, 2, "each literal occurrence should fire its own BorrowShared");
+        // M07.2: Pointee::Static borrows no longer emit BorrowShared events.
+        // Verify dedup via SlotWrites instead — both `a` and `b` should
+        // carry Value::Slice targeting the same StaticAddr.
+        let slice_writes: Vec<crate::event::StaticAddr> = events.iter().filter_map(|e| match e {
+            crate::MemEvent::SlotWrite { value: crate::Value::Slice { target: crate::event::Pointee::Static(addr), .. }, .. } => Some(*addr),
+            _ => None,
+        }).collect();
+        assert_eq!(slice_writes.len(), 2, "expected SlotWrite for both a and b");
+        assert_eq!(slice_writes[0], slice_writes[1], "both should reference the same deduped static addr");
     }
 
     // ─── M07.1 / US1: partial-range slice ────────────────────────────────

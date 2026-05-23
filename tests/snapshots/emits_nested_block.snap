@@ -81,19 +81,6 @@ Ok(
                 ),
             },
         },
-        ReturnValue {
-            frame_id: FrameId(
-                0,
-            ),
-            value: Unit,
-            span: Span {
-                start: 59,
-                end: 60,
-                file: FileId(
-                    1,
-                ),
-            },
-        },
         FrameLeave {
             frame_id: FrameId(
                 0,

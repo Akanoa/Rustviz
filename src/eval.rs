@@ -363,38 +363,6 @@ impl<'a> Evaluator<'a> {
             .expect("static block must exist for any Pointee::Static value")
     }
 
-    /// **M07.2**: snapshot the current scope's borrow count. Paired with
-    /// `end_transient_borrows_since` to end any borrows that came into
-    /// existence during a transient sub-evaluation (e.g. evaluating a
-    /// function-call arg). Without this, transient literal borrows (like
-    /// the `"hi"` in `String::from("hi")`) sit in the scope tracker until
-    /// the function returns, producing silent no-op cursor steps at
-    /// scope-exit BorrowEnd time — the borrows were never bound to any
-    /// visible slot, so their end is invisible.
-    fn scope_borrows_snapshot(&self) -> usize {
-        self.frames
-            .last()
-            .and_then(|f| f.scopes.last())
-            .map(|s| s.borrows.len())
-            .unwrap_or(0)
-    }
-
-    /// **M07.2**: end any borrows added to the current scope since the
-    /// given snapshot was taken. Fires BorrowEnd inline for each and
-    /// removes the ids from the scope tracker so scope-exit doesn't
-    /// double-emit. Used by `String::from` / `push_str` to release
-    /// literal/sub-slice args' transient borrows at the call's end.
-    fn end_transient_borrows_since(&mut self, snapshot: usize, span: Span) {
-        let to_end: Vec<crate::event::BorrowId> = self
-            .frames
-            .last_mut()
-            .and_then(|f| f.scopes.last_mut())
-            .map(|s| s.borrows.split_off(snapshot))
-            .unwrap_or_default();
-        for borrow_id in to_end.into_iter().rev() {
-            self.events.push(MemEvent::BorrowEnd { borrow_id, span });
-        }
-    }
 
     /// **M07**: allocate a heap object and emit `HeapAlloc`. Returns the
     /// new addr. Tracks the addr in the current scope for HeapFree on exit.
@@ -722,17 +690,31 @@ impl<'a> Evaluator<'a> {
         // M06: when the body has no tail expression (implicit unit return),
         // anchor the span at the closing `}` rather than the entire body
         // block — otherwise the editor highlight spans the whole function.
-        let return_span = decl
-            .body
-            .tail
-            .as_ref()
-            .map(|t| t.span())
-            .unwrap_or_else(|| closing_brace_span(decl.body.span));
-        self.events.push(MemEvent::ReturnValue {
-            frame_id,
-            value: body_value.clone(),
-            span: return_span,
-        });
+        // **M07.2**: skip ReturnValue when the function returns `()` AND
+        // there's no caller frame to flash the annotation on (i.e. this
+        // is the entry frame, typically `main`). In that case the
+        // ReturnValue event would just produce a silent cursor step
+        // between the last real action and the scope-exit drops.
+        // Non-unit returns (any tail expr or non-Unit value) still fire
+        // so M03's snapshots and the caller-side `→ value` annotation
+        // continue to work.
+        let is_entry_frame = self.frames.len() == 1;
+        let skip_return = is_entry_frame
+            && decl.body.tail.is_none()
+            && matches!(body_value, Value::Unit);
+        if !skip_return {
+            let return_span = decl
+                .body
+                .tail
+                .as_ref()
+                .map(|t| t.span())
+                .unwrap_or_else(|| closing_brace_span(decl.body.span));
+            self.events.push(MemEvent::ReturnValue {
+                frame_id,
+                value: body_value.clone(),
+                span: return_span,
+            });
+        }
 
         // M06: drop the body scope NOW (after ReturnValue). Emits BorrowEnd
         // and SlotDrop (M07+) events. Use the closing `}` of the body block
@@ -1286,24 +1268,26 @@ impl<'a> Evaluator<'a> {
             // allocated, BorrowShared fires with `Pointee::Static(addr)`,
             // and the returned Value::Slice covers the full literal length.
             ast::Expr::StrLit(s, span) => {
+                // **M07.2**: emit StaticAlloc on first interning; allocate a
+                // borrow_id; build the `Value::Slice`. We DO NOT emit a
+                // `BorrowShared` event nor register in scope.borrows.
+                //
+                // Why: a literal slice's borrow lifecycle is invisible unless
+                // the value gets bound to a slot. For transient consumption
+                // (`String::from("hi")`, `push_str("!")`, etc.) the value is
+                // consumed in-place; a paired BorrowShared/BorrowEnd would
+                // produce two silent no-op cursor steps the learner can't
+                // distinguish from each other. For let-bound use
+                // (`let s = "hi"`), the UI materializes the arrow lazily in
+                // apply_event's SlotWrite arm — it sees Value::Slice landing
+                // in a slot with no prior borrow entry and creates one. Since
+                // `Pointee::Static` borrows never go dangling, there's no
+                // safety / scan reason to track them in the active-borrow
+                // registry the way Heap borrows are tracked.
                 let bytes_len = s.len() as u64;
                 let addr = self.intern_static(s.clone(), *span);
                 let target = crate::event::Pointee::Static(addr);
                 let borrow_id = self.alloc_borrow_id();
-                self.events.push(MemEvent::BorrowShared {
-                    borrow_id,
-                    target,
-                    span: *span,
-                });
-                // Register the borrow in the current scope so BorrowEnd
-                // fires at scope exit (same path as M07.1 slice borrows).
-                if let Some(scope) = self
-                    .frames
-                    .last_mut()
-                    .and_then(|f| f.scopes.last_mut())
-                {
-                    scope.borrows.push(borrow_id);
-                }
                 Value::Slice {
                     borrow_id,
                     target,
@@ -1379,12 +1363,7 @@ impl<'a> Evaluator<'a> {
                 // targeting the static region. Extract the slice's bytes
                 // (respecting its byte_offset/byte_len so sub-slices like
                 // `String::from(&"hello"[..2])` copy just the visible window
-                // "he", not the whole "hello"). Snapshot the scope's borrow
-                // count BEFORE arg eval so any transient borrows created
-                // for the arg (literal `"hi"`, sub-slice `&s[..2]`, ...)
-                // can be released inline after the call instead of lingering
-                // to scope-exit and producing silent no-op cursor steps.
-                let borrows_before = self.scope_borrows_snapshot();
+                // "he", not the whole "hello").
                 let (source, source_offset, s) = match self.eval_expr(&args[0]) {
                     Value::Slice {
                         target: crate::event::Pointee::Static(saddr),
@@ -1436,9 +1415,6 @@ impl<'a> Evaluator<'a> {
                     n_bytes,
                     span,
                 });
-                // M07.2: release the arg's transient borrow inline (literal
-                // `"hi"`, sub-slice `&s[..2]`, etc.) — already consumed.
-                self.end_transient_borrows_since(borrows_before, span);
                 Value::String { addr }
             }
             _ => panic!("typeck should have rejected unknown path"),
@@ -1471,8 +1447,6 @@ impl<'a> Evaluator<'a> {
                 // **M07 → M07.2**: arg evaluation produces `Value::Slice`
                 // targeting the static region. Look up bytes via the slice's
                 // byte_offset/byte_len so sub-slices push just their window.
-                // Same transient-borrow snapshot pattern as `String::from`.
-                let borrows_before = self.scope_borrows_snapshot();
                 let (source, source_offset, suffix) = match self.eval_expr(&args[0]) {
                     Value::Slice {
                         target: crate::event::Pointee::Static(saddr),
@@ -1519,8 +1493,6 @@ impl<'a> Evaluator<'a> {
                     span,
                 });
                 self.string_push_str(dest_addr, &suffix, span);
-                // M07.2: release the arg's transient borrow inline.
-                self.end_transient_borrows_since(borrows_before, span);
                 Value::Unit
             }
             // M07.1: `Slice::len()` returns the slice's stored length as u64.
@@ -1850,21 +1822,30 @@ impl<'a> Evaluator<'a> {
         // Allocate a borrow_id, emit BorrowShared targeting the receiver's
         // memory region (Heap or Static — Slot reserved for M07.3 arrays).
         // mutable=false enforced (typeck rejects mutable slices in M07.1).
+        //
+        // **M07.2**: skip the BorrowShared/scope-registration for Static
+        // targets — same reasoning as the `Expr::StrLit` arm: the UI
+        // materializes a static-target arrow lazily at SlotWrite time, so
+        // a paired BorrowShared/BorrowEnd would just produce silent no-op
+        // cursor steps for any transient sub-slice consumed in a call.
         let _ = mutable; // forward-compat marker
         let borrow_id = self.alloc_borrow_id();
-        self.events.push(MemEvent::BorrowShared {
-            borrow_id,
-            target,
-            span: borrow_span,
-        });
-        self.frames
-            .last_mut()
-            .expect("frame active")
-            .scopes
-            .last_mut()
-            .expect("scope active")
-            .borrows
-            .push(borrow_id);
+        let is_static = matches!(target, crate::event::Pointee::Static(_));
+        if !is_static {
+            self.events.push(MemEvent::BorrowShared {
+                borrow_id,
+                target,
+                span: borrow_span,
+            });
+            self.frames
+                .last_mut()
+                .expect("frame active")
+                .scopes
+                .last_mut()
+                .expect("scope active")
+                .borrows
+                .push(borrow_id);
+        }
         // Snapshot heap generation for the dangling-borrow detection scan
         // (only meaningful for Heap targets; Static never goes dangling).
         if let crate::event::Pointee::Heap(addr) = target {

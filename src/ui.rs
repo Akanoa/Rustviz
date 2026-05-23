@@ -527,7 +527,7 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                     borrow.source_slot = Some(slot_id.0);
                 }
             }
-            if let Value::Slice { borrow_id, start, len, byte_offset, byte_len, .. } = value {
+            if let Value::Slice { borrow_id, start, len, byte_offset, byte_len, target, mutable } = value {
                 if let Some(borrow) = world
                     .borrows
                     .iter_mut()
@@ -538,6 +538,29 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                     borrow.slice_byte_offset = Some(*byte_offset);
                     borrow.slice_byte_len = Some(*byte_len);
                     borrow.slice_elem_start = Some(*start);
+                } else {
+                    // **M07.2**: no prior BorrowShared event. Static-target
+                    // slices skip BorrowShared/BorrowEnd entirely (the
+                    // borrow lifecycle would only produce silent no-op
+                    // cursor steps since the borrow's arrow never existed
+                    // before this SlotWrite). Materialize the borrow entry
+                    // lazily here with source_slot already bound, so the
+                    // arrow renders.
+                    let t = match target {
+                        crate::event::Pointee::Slot(id) => BorrowTarget::Slot(id.0),
+                        crate::event::Pointee::Heap(addr) => BorrowTarget::Heap(addr.0),
+                        crate::event::Pointee::Static(addr) => BorrowTarget::Static(addr.0),
+                    };
+                    world.borrows.push(ActiveBorrowState {
+                        borrow_id: borrow_id.0,
+                        source_slot: Some(slot_id.0),
+                        target: t,
+                        mutable: *mutable,
+                        slice_len: Some(*len),
+                        slice_byte_offset: Some(*byte_offset),
+                        slice_byte_len: Some(*byte_len),
+                        slice_elem_start: Some(*start),
+                    });
                 }
             }
             // M06.1: render Value::Ref using the *binding name* of the target
