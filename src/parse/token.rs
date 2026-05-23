@@ -79,6 +79,17 @@ pub enum TokenKind {
     /// **M06**: `&mut` (no whitespace between `&` and `mut`) — mutable borrow.
     AmpMut,
 
+    /// **M07**: `::` — path separator (e.g. `Vec::new`).
+    ColonColon,
+    /// **M07**: `.` — method-call dot (e.g. `v.push(x)`).
+    Dot,
+    /// **M07**: `[`
+    LBracket,
+    /// **M07**: `]`
+    RBracket,
+    /// **M07**: String literal contents (escapes already processed).
+    Str(String),
+
     /// `(`
     LParen,
     /// `)`
@@ -107,6 +118,11 @@ impl TokenKind {
             Self::Bool(_) => "boolean literal",
             Self::Amp => "`&`",
             Self::AmpMut => "`&mut`",
+            Self::ColonColon => "`::`",
+            Self::Dot => "`.`",
+            Self::LBracket => "`[`",
+            Self::RBracket => "`]`",
+            Self::Str(_) => "string literal",
             Self::Ident(_) => "identifier",
             Self::Let => "`let`",
             Self::Mut => "`mut`",

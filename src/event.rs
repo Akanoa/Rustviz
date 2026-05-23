@@ -69,18 +69,38 @@ pub enum Value {
     Bool(bool),
     /// Unit `()`.
     Unit,
-    /// **M06**: a borrow value held in a stack slot. Created by an
-    /// `Expr::Borrow` evaluation; identified by `borrow_id` matching a
-    /// `BorrowShared` or `BorrowMut` event. `target_slot` denormalizes
-    /// the borrow's target so the StateSnapshot is self-contained.
+    /// **M06 (restructured in M07)**: a borrow value held in a stack slot.
+    /// Created by an `Expr::Borrow` evaluation; identified by `borrow_id`
+    /// matching a `BorrowShared` or `BorrowMut` event. `target` was
+    /// `target_slot: SlotId` in M06; M07 widens to `Pointee` so heap
+    /// borrows (`&v[0]` into a Vec's allocation) are representable.
     Ref {
         /// Identifier of the active borrow.
         borrow_id: BorrowId,
-        /// Slot being borrowed.
-        target_slot: SlotId,
+        /// What's being borrowed — a stack slot OR a heap allocation.
+        target: Pointee,
         /// `true` for `&mut`, `false` for `&`.
         mutable: bool,
     },
+    /// **M07**: owns a Box-allocated value. The actual value lives in the
+    /// evaluator's heap state at `addr`.
+    Box {
+        /// Heap address of the Box's allocation.
+        addr: HeapAddr,
+    },
+    /// **M07**: owns a Vec allocation.
+    Vec {
+        /// Heap address of the Vec's underlying buffer.
+        addr: HeapAddr,
+    },
+    /// **M07**: owns a String allocation.
+    String {
+        /// Heap address of the String's underlying buffer.
+        addr: HeapAddr,
+    },
+    /// **M07**: transient string value for string-literal arguments to
+    /// `String::from(...)` / `String::push_str(...)`. NOT stored in slots.
+    Str(String),
 }
 
 impl Value {
@@ -93,6 +113,13 @@ impl Value {
             Self::Unit => "()",
             Self::Ref { mutable: false, .. } => "&",
             Self::Ref { mutable: true, .. } => "&mut",
+            // **M07**: heap-owning types. Inner type info isn't carried at
+            // the Value layer (it's in the heap state map); these short
+            // names suffice for status messages.
+            Self::Box { .. } => "Box",
+            Self::Vec { .. } => "Vec",
+            Self::String { .. } => "String",
+            Self::Str(_) => "&str",
         }
     }
 }
@@ -243,6 +270,11 @@ pub enum MemEvent {
         to: HeapAddr,
         /// New size in bytes.
         new_size: u32,
+        /// **M07 polish**: human-readable display of the new contents
+        /// (e.g. `"Vec [1_i32, 2_i32] (cap=2)"`). The UI updates the heap
+        /// panel's box label with this string so the learner sees the
+        /// updated contents after realloc, not the original alloc's label.
+        new_display: String,
         /// Source location of the operation triggering the realloc.
         span: Span,
     },

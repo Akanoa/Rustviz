@@ -218,7 +218,9 @@ impl Resolver {
         match expr {
             ast::Expr::LitInt(_, _, _)
             | ast::Expr::LitFloat(_, _, _)
-            | ast::Expr::LitBool(_, _) => {}
+            | ast::Expr::LitBool(_, _)
+            | ast::Expr::StrLit(_, _)
+            | ast::Expr::Path { .. } => {}
             ast::Expr::Ident(name, span) => match self.lookup(name) {
                 Some(id) => {
                     self.resolution.uses.insert(*span, id);
@@ -233,6 +235,16 @@ impl Resolver {
             ast::Expr::Unary { expr, .. } => self.resolve_expr(expr)?,
             ast::Expr::Borrow { inner, .. } => self.resolve_expr(inner)?,
             ast::Expr::Deref { inner, .. } => self.resolve_expr(inner)?,
+            ast::Expr::MethodCall { receiver, args, .. } => {
+                self.resolve_expr(receiver)?;
+                for arg in args {
+                    self.resolve_expr(arg)?;
+                }
+            }
+            ast::Expr::Index { receiver, index, .. } => {
+                self.resolve_expr(receiver)?;
+                self.resolve_expr(index)?;
+            }
             ast::Expr::Binary { lhs, rhs, .. } => {
                 self.resolve_expr(lhs)?;
                 self.resolve_expr(rhs)?;

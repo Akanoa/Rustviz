@@ -147,7 +147,10 @@ impl Parser {
             let mutable = matches!(amp.kind, TokenKind::AmpMut);
             let inner = self.parse_type()?;
             let inner_span = match &inner {
-                Type::Path { span, .. } | Type::Unit { span } | Type::Ref { span, .. } => *span,
+                Type::Path { span, .. }
+                | Type::Unit { span }
+                | Type::Ref { span, .. }
+                | Type::Generic { span, .. } => *span,
             };
             return Ok(Type::Ref {
                 inner: Box::new(inner),
@@ -158,6 +161,25 @@ impl Parser {
         // M01 supports single-segment paths only; `::` tokenizer support is M02+.
         let segment_span = self.peek().span;
         let segment = self.expect_ident("type")?;
+        // **M07**: optional generic args `<T>` after the type name.
+        // Recognized for `Box<T>` and `Vec<T>`; typeck validates the segment
+        // name + arity. `String` parses as a bare Path with no generics.
+        if self.at(&TokenKind::Lt) {
+            let lt = self.bump();
+            let mut args = Vec::new();
+            loop {
+                args.push(self.parse_type()?);
+                if self.bump_if(&TokenKind::Comma).is_none() {
+                    break;
+                }
+            }
+            let gt = self.expect(&TokenKind::Gt, "`>`")?;
+            return Ok(Type::Generic {
+                segments: vec![segment],
+                args,
+                span: segment_span.merge(gt.span).merge(lt.span),
+            });
+        }
         Ok(Type::Path {
             segments: vec![segment],
             span: segment_span,
@@ -224,6 +246,41 @@ impl Parser {
     fn parse_expr(&mut self, min_bp: u8) -> Result<Expr, ParseError> {
         let mut lhs = self.parse_atom()?;
         loop {
+            // **M07**: postfix method call `expr.method(args)`.
+            if self.at(&TokenKind::Dot) {
+                self.bump(); // `.`
+                let name = self.expect_ident("method name")?;
+                self.expect(&TokenKind::LParen, "`(`")?;
+                let mut args = Vec::new();
+                while !self.at(&TokenKind::RParen) {
+                    args.push(self.parse_expr(0)?);
+                    if self.bump_if(&TokenKind::Comma).is_none() {
+                        break;
+                    }
+                }
+                let rparen = self.expect(&TokenKind::RParen, "`)`")?;
+                let span = lhs.span().merge(rparen.span);
+                lhs = Expr::MethodCall {
+                    receiver: Box::new(lhs),
+                    name,
+                    args,
+                    span,
+                };
+                continue;
+            }
+            // **M07**: postfix indexing `expr[index]`.
+            if self.at(&TokenKind::LBracket) {
+                self.bump(); // `[`
+                let index = self.parse_expr(0)?;
+                let rbracket = self.expect(&TokenKind::RBracket, "`]`")?;
+                let span = lhs.span().merge(rbracket.span);
+                lhs = Expr::Index {
+                    receiver: Box::new(lhs),
+                    index: Box::new(index),
+                    span,
+                };
+                continue;
+            }
             // Postfix call: `expr(args, ...)`.
             if self.at(&TokenKind::LParen) {
                 self.bump(); // `(`
@@ -293,8 +350,30 @@ impl Parser {
             }
             TokenKind::Ident(name) => {
                 let name = name.clone();
+                let start_tok = self.bump();
+                // **M07**: if followed by `::Ident`, parse as multi-segment Path.
+                if self.at(&TokenKind::ColonColon) {
+                    let mut segments = vec![name];
+                    let mut end_span = start_tok.span;
+                    while self.bump_if(&TokenKind::ColonColon).is_some() {
+                        let seg_tok = self.peek().clone();
+                        let seg = self.expect_ident("path segment")?;
+                        segments.push(seg);
+                        end_span = seg_tok.span;
+                    }
+                    Ok(Expr::Path {
+                        segments,
+                        span: start_tok.span.merge(end_span),
+                    })
+                } else {
+                    Ok(Expr::Ident(name, tok.span))
+                }
+            }
+            // **M07**: string literal.
+            TokenKind::Str(s) => {
+                let s = s.clone();
                 self.bump();
-                Ok(Expr::Ident(name, tok.span))
+                Ok(Expr::StrLit(s, tok.span))
             }
             TokenKind::LParen => {
                 let lparen = self.bump();
@@ -405,6 +484,9 @@ fn item_span(item: &Item) -> Span {
 
 fn type_span(ty: &Type) -> Span {
     match ty {
-        Type::Path { span, .. } | Type::Unit { span } | Type::Ref { span, .. } => *span,
+        Type::Path { span, .. }
+        | Type::Unit { span }
+        | Type::Ref { span, .. }
+        | Type::Generic { span, .. } => *span,
     }
 }

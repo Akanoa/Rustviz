@@ -179,6 +179,12 @@ pub enum Ty {
         /// `true` for `&mut`, `false` for `&`.
         mutable: bool,
     },
+    /// **M07**: heap-owning `Box<T>`. Non-Copy.
+    Box(Box<Ty>),
+    /// **M07**: heap-owning `Vec<T>`. Non-Copy.
+    Vec(Box<Ty>),
+    /// **M07**: heap-owning UTF-8 byte sequence. Non-Copy.
+    String,
 }
 
 impl Ty {
@@ -198,17 +204,22 @@ impl Ty {
                     format!("&{}", inner.name())
                 }
             }
+            Self::Box(inner) => format!("Box<{}>", inner.name()),
+            Self::Vec(inner) => format!("Vec<{}>", inner.name()),
+            Self::String => "String".to_owned(),
         }
     }
 
     /// Whether values of this type are `Copy` (no destructor; bytes physically
     /// persist on the stack until storage is reused). M06: `&T` is Copy;
-    /// `&mut T` is not (matches Rust). Exhaustive match — no `_` catch-all.
+    /// `&mut T` is not (matches Rust). **M07**: Box, Vec, String are
+    /// non-Copy (heap-owning types with destructors). Exhaustive match.
     pub fn is_copy(&self) -> bool {
         match self {
             Self::Int(_) | Self::Float(_) | Self::Bool | Self::Unit => true,
             Self::Ref { mutable: false, .. } => true,
             Self::Ref { mutable: true, .. } => false,
+            Self::Box(_) | Self::Vec(_) | Self::String => false,
         }
     }
 }
@@ -771,6 +782,8 @@ impl<'a> Typechecker<'a> {
                 let inner_ty = self.typecheck_expr(inner)?;
                 match inner_ty {
                     Ty::Ref { inner: target, .. } => Ok(*target),
+                    // M07: `*b` where b: Box<T> also derefs to T (auto-deref simplification).
+                    Ty::Box(inner) => Ok(*inner),
                     other => Err(ParseError {
                         message: format!(
                             "cannot dereference value of type `{}`; expected a reference",
@@ -780,6 +793,182 @@ impl<'a> Typechecker<'a> {
                     }),
                 }
             }
+            // **M07**: string literal — transient `&str-like` type. Modeled as
+            // Ty::String for typeck simplicity; only consumed by String methods.
+            ast::Expr::StrLit(_, _) => Ok(Ty::String),
+            // **M07**: path expression (Vec::new, Box::new, String::from). These
+            // ARE callable identifiers; when invoked via Expr::Call the call
+            // arm consults the path-fn dispatch table. Bare path (no Call) is
+            // not a valid expression on its own in M07.
+            ast::Expr::Path { span, .. } => Err(ParseError {
+                message: "path expression must be called (e.g. `Vec::new()`, `Box::new(v)`)".into(),
+                span: *span,
+            }),
+            // **M07**: method call — dispatched via `typecheck_method_call`.
+            ast::Expr::MethodCall { receiver, name, args, span } => {
+                let receiver_ty = self.typecheck_expr(receiver)?;
+                self.typecheck_method_call(&receiver_ty, name, args, *span)
+            }
+            // **M07**: indexing — receiver must be Vec, index must be Int.
+            ast::Expr::Index { receiver, index, span } => {
+                let receiver_ty = self.typecheck_expr(receiver)?;
+                let index_ty = self.typecheck_expr(index)?;
+                let elem_ty = match receiver_ty {
+                    Ty::Vec(inner) => *inner,
+                    other => {
+                        return Err(ParseError {
+                            message: format!("cannot index value of type `{}`; expected Vec", other.name()),
+                            span: receiver.span(),
+                        });
+                    }
+                };
+                if !matches!(index_ty, Ty::Int(_)) {
+                    return Err(ParseError {
+                        message: format!("expected integer index, found `{}`", index_ty.name()),
+                        span: index.span(),
+                    });
+                }
+                let _ = span;
+                Ok(elem_ty)
+            }
+        }
+    }
+
+    /// **M07**: dispatch a path-fn call against the hardcoded static-fn table.
+    /// Recognized paths: `Box::new(v) -> Box<T>`, `Vec::new() -> Vec<T>`,
+    /// `String::from(s: StrLit) -> String`.
+    fn typecheck_path_call(
+        &mut self,
+        segments: &[String],
+        path_span: Span,
+        args: &[ast::Expr],
+        call_span: Span,
+    ) -> Result<Ty, ParseError> {
+        let seg_strs: Vec<&str> = segments.iter().map(|s| s.as_str()).collect();
+        match seg_strs.as_slice() {
+            ["Box", "new"] => {
+                if args.len() != 1 {
+                    return Err(ParseError {
+                        message: format!("Box::new takes 1 arg, found {}", args.len()),
+                        span: call_span,
+                    });
+                }
+                let arg_ty = self.typecheck_expr(&args[0])?;
+                Ok(Ty::Box(Box::new(arg_ty)))
+            }
+            ["Vec", "new"] => {
+                if !args.is_empty() {
+                    return Err(ParseError {
+                        message: "Vec::new takes no args".into(),
+                        span: call_span,
+                    });
+                }
+                // Type inference: Vec::new()'s T comes from the let-annotation
+                // (handled at the let-stmt level via the annotation match).
+                // Here we return a placeholder `Vec<Unit>` that the caller
+                // overrides via try_coerce_to or the let-stmt annotation path.
+                // Simpler approach: require annotation on the let binding by
+                // returning Ty::Vec(Box::new(Ty::Unit)) as a sentinel; the
+                // typecheck_stmt let-arm coerces it. Plan-phase R-013.
+                //
+                // M07 simplification: peek up the AST to find the enclosing
+                // let-annotation isn't easy here, so we use a Ty::Vec(Unit)
+                // sentinel and rely on the let-stmt's annotation comparison
+                // to override (via a new coercion case below).
+                Ok(Ty::Vec(Box::new(Ty::Unit)))
+            }
+            ["String", "from"] => {
+                if args.len() != 1 {
+                    return Err(ParseError {
+                        message: format!("String::from takes 1 arg, found {}", args.len()),
+                        span: call_span,
+                    });
+                }
+                if !matches!(&args[0], ast::Expr::StrLit(_, _)) {
+                    return Err(ParseError {
+                        message: "String::from: expected a string literal argument".into(),
+                        span: args[0].span(),
+                    });
+                }
+                let _ = self.typecheck_expr(&args[0])?;
+                Ok(Ty::String)
+            }
+            _ => Err(ParseError {
+                message: format!(
+                    "unknown path `{}` (M07 supports `Box::new`, `Vec::new`, `String::from`)",
+                    segments.join("::")
+                ),
+                span: path_span,
+            }),
+        }
+    }
+
+    /// **M07**: dispatch a method call against the hardcoded structural table.
+    fn typecheck_method_call(
+        &mut self,
+        receiver_ty: &Ty,
+        name: &str,
+        args: &[ast::Expr],
+        span: Span,
+    ) -> Result<Ty, ParseError> {
+        match (receiver_ty, name) {
+            (Ty::Vec(elem_ty), "push") => {
+                if args.len() != 1 {
+                    return Err(ParseError {
+                        message: format!("Vec::push takes 1 arg, found {}", args.len()),
+                        span,
+                    });
+                }
+                let arg_ty = self.typecheck_expr(&args[0])?;
+                // Allow literal coercion to the Vec's element type.
+                let arg_ty = self
+                    .try_coerce_to(&args[0], arg_ty.clone(), (**elem_ty).clone())
+                    .unwrap_or(arg_ty);
+                if arg_ty != **elem_ty {
+                    return Err(ParseError {
+                        message: format!(
+                            "Vec::push: expected `{}`, found `{}`",
+                            elem_ty.name(),
+                            arg_ty.name()
+                        ),
+                        span: args[0].span(),
+                    });
+                }
+                Ok(Ty::Unit)
+            }
+            (Ty::Vec(_), "len") => {
+                if !args.is_empty() {
+                    return Err(ParseError {
+                        message: "Vec::len takes no args".into(),
+                        span,
+                    });
+                }
+                Ok(Ty::Int(IntKind::U64))
+            }
+            (Ty::String, "push_str") => {
+                if args.len() != 1 {
+                    return Err(ParseError {
+                        message: format!("String::push_str takes 1 arg, found {}", args.len()),
+                        span,
+                    });
+                }
+                // arg must be a string literal (no `&str` first-class type).
+                if !matches!(&args[0], ast::Expr::StrLit(_, _)) {
+                    return Err(ParseError {
+                        message: "String::push_str: expected a string literal argument".into(),
+                        span: args[0].span(),
+                    });
+                }
+                let _arg_ty = self.typecheck_expr(&args[0])?;
+                Ok(Ty::Unit)
+            }
+            _ => Err(ParseError {
+                message: format!(
+                    "no method `{name}` on type `{}` (M07 supports only Vec::push/len, String::push_str)",
+                    receiver_ty.name()
+                ),
+                span,
+            }),
         }
     }
 
@@ -792,26 +981,30 @@ impl<'a> Typechecker<'a> {
         mutable: bool,
         span: Span,
     ) -> Result<Ty, ParseError> {
-        // Place-expression check: only identifiers in L2.
-        let ident_span = match inner {
-            ast::Expr::Ident(_, sp) => *sp,
+        // Place-expression check: Ident (M06), or Index of an Ident (M07: `&v[i]`).
+        let target_binding = match inner {
+            ast::Expr::Ident(_, sp) => *self.resolution.uses.get(sp).expect("ident resolved"),
+            // **M07**: `&v[i]` borrows the Vec's heap allocation. The target
+            // binding for mut-checking + tracker is `v`.
+            ast::Expr::Index { receiver, .. } => match receiver.as_ref() {
+                ast::Expr::Ident(_, sp) => *self.resolution.uses.get(sp).expect("ident resolved"),
+                _ => return Err(ParseError {
+                    message: "expected `&place[index]` with a binding name as the receiver".into(),
+                    span: receiver.span(),
+                }),
+            },
             other => {
                 return Err(ParseError {
-                    message: "expected place expression for borrow (identifier required)".into(),
+                    message: "expected place expression for borrow (identifier or `&place[index]`)".into(),
                     span: other.span(),
                 });
             }
         };
-        // Resolve the target binding.
-        let target_binding = *self
-            .resolution
-            .uses
-            .get(&ident_span)
-            .expect("ident resolved");
         let target_decl = &self.resolution.bindings[&target_binding];
         let target_name = target_decl.name.clone();
-        // For `&mut x`, the binding must be declared `mut`.
-        if mutable {
+        // For `&mut x`, the binding must be declared `mut`. (Skip for `&v[i]`
+        // — M07 simplification: heap-element mutable borrows out of scope.)
+        if mutable && matches!(inner, ast::Expr::Ident(_, _)) {
             let is_mut_let = matches!(
                 target_decl.kind,
                 BindingKind::Let { mutable: true, .. },
@@ -950,12 +1143,16 @@ impl<'a> Typechecker<'a> {
         args: &[ast::Expr],
         call_span: Span,
     ) -> Result<Ty, ParseError> {
-        // L1 only supports direct function calls (callee must be an Ident).
+        // **M07**: Path-callee → dispatch the static-fn table (Box::new, Vec::new, String::from).
+        if let ast::Expr::Path { segments, span: path_span } = callee {
+            return self.typecheck_path_call(segments, *path_span, args, call_span);
+        }
+        // L1 supports direct function calls (callee must be an Ident).
         let (callee_name, callee_span) = match callee {
             ast::Expr::Ident(name, sp) => (name.clone(), *sp),
             _ => {
                 return Err(ParseError {
-                    message: "L1 only supports direct function calls (callee must be a function name)".into(),
+                    message: "callee must be a function name or path (e.g. `Box::new(v)`)".into(),
                     span: callee.span(),
                 });
             }
@@ -1012,6 +1209,19 @@ impl<'a> Typechecker<'a> {
     fn try_coerce_to(&mut self, expr: &ast::Expr, current: Ty, target: Ty) -> Option<Ty> {
         if current == target {
             return Some(target);
+        }
+        // **M07**: `Vec::new()` typechecks to the sentinel `Ty::Vec(Box::new(Ty::Unit))`;
+        // the surrounding let-annotation provides the real element type.
+        if let Ty::Vec(inner) = &current {
+            if let Ty::Vec(target_inner) = &target {
+                if **inner == Ty::Unit {
+                    // Override the placeholder Vec<Unit> with the annotation's element type.
+                    let span = expr.span();
+                    let new_ty = Ty::Vec(target_inner.clone());
+                    self.types.expr_types.insert(span, new_ty.clone());
+                    return Some(new_ty);
+                }
+            }
         }
         match (expr, target) {
             // Suffixed literal: don't coerce, the kind is locked in by syntax.
@@ -1125,8 +1335,29 @@ fn ty_from_ast(t: &ast::Type) -> Result<Ty, ParseError> {
                 "f32" => Ok(Ty::Float(FloatKind::F32)),
                 "f64" => Ok(Ty::Float(FloatKind::F64)),
                 "bool" => Ok(Ty::Bool),
+                // **M07**: `String` as a bare path (no generics).
+                "String" => Ok(Ty::String),
                 other => Err(ParseError {
                     message: format!("unknown type `{other}`"),
+                    span: *span,
+                }),
+            }
+        }
+        // **M07**: generic type paths `Box<T>`, `Vec<T>`. Validates segment
+        // name + arity, recurses on the inner type.
+        ast::Type::Generic { segments, args, span } => {
+            if segments.len() != 1 || args.len() != 1 {
+                return Err(ParseError {
+                    message: "only single-segment generics with one type arg are supported".into(),
+                    span: *span,
+                });
+            }
+            let inner = ty_from_ast(&args[0])?;
+            match segments[0].as_str() {
+                "Box" => Ok(Ty::Box(Box::new(inner))),
+                "Vec" => Ok(Ty::Vec(Box::new(inner))),
+                other => Err(ParseError {
+                    message: format!("unknown generic type `{other}`"),
                     span: *span,
                 }),
             }

@@ -49,26 +49,65 @@ pub struct StateSnapshot {
     /// The JS renderer decorates the matching frame card with a transient
     /// return-value annotation. `None` on any other event.
     pub pending_return: Option<PendingReturnView>,
-    /// **M06**: active borrows at this cursor position. The JS renderer
-    /// reads this to draw blue (shared) and red (mut) arrows in the SVG
-    /// overlay between slot cards.
-    pub borrows: Vec<BorrowView>,
+    /// **M06 (renamed in M07)**: active arrows at this cursor position. The
+    /// JS renderer reads this to draw blue (shared), red (mut), and black
+    /// (owning) arrows in the SVG overlay.
+    pub arrows: Vec<ArrowView>,
+    /// **M07**: live heap allocations at this cursor position. JS renders
+    /// these as boxes in the heap panel.
+    pub heap: Vec<HeapView>,
     /// Cursor position (mirrors `Cursor::position`).
     pub position: usize,
     /// Total events in the trace.
     pub total: usize,
 }
 
-/// **M06**: one active borrow as seen by the renderer. Source is the slot
-/// holding the reference; target is the slot being borrowed.
+/// **M06 (restructured in M07)**: one active arrow as seen by the renderer.
+/// Unifies borrow arrows (blue/red) and owning arrows (black).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct BorrowView {
-    /// Slot holding the reference value (arrow origin).
+pub struct ArrowView {
+    /// Slot holding the source value (arrow origin).
     pub source_slot: u32,
-    /// Slot being borrowed (arrow tip).
-    pub target_slot: u32,
-    /// `true` for `&mut` (red), `false` for `&` (blue).
-    pub mutable: bool,
+    /// What the arrow points at — a stack slot OR a heap allocation.
+    pub target: ArrowTarget,
+    /// Visual style.
+    pub kind: ArrowKind,
+}
+
+/// **M07**: arrow target — slot (for borrows-of-locals) or heap (for borrows-of-heap and ownership).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum ArrowTarget {
+    /// Stack slot (M06's case, kept).
+    Slot(u32),
+    /// Heap allocation (M07's case).
+    Heap(u32),
+}
+
+/// **M07**: arrow visual kind.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum ArrowKind {
+    /// `&T` borrow — blue.
+    Shared,
+    /// `&mut T` borrow — red.
+    Mut,
+    /// Ownership (`Box`/`Vec`/`String`) — black.
+    Owning,
+}
+
+/// **M07**: one heap allocation (live OR freed).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HeapView {
+    /// HeapAddr (M03's identifier).
+    pub addr: u32,
+    /// Type name (e.g. `"Box<i32>"`, `"Vec<i32>"`, `"String"`).
+    pub ty_name: String,
+    /// Renderer-ready content display.
+    pub display: String,
+    /// Size in bytes.
+    pub size: u32,
+    /// **M07**: `true` if the block has been freed. Renderer shows a grayed
+    /// "freed, ready to be reused" visual instead of removing the DOM element.
+    pub freed: bool,
 }
 
 /// One function-call frame's view.
@@ -190,19 +229,38 @@ impl Cursor {
         } else {
             None
         };
-        // M06: derive the BorrowView list. Skip borrows whose source_slot
-        // hasn't been bound yet (SlotWrite of the Value::Ref hasn't happened).
-        let borrows: Vec<BorrowView> = world
+        // M06 → M07: derive arrow list from active borrows (skip ones whose
+        // source_slot isn't bound yet) PLUS owning relationships.
+        let arrows_from_borrows: Vec<ArrowView> = world
             .borrows
             .iter()
             .filter_map(|b| {
-                b.source_slot.map(|src| BorrowView {
+                b.source_slot.map(|src| ArrowView {
                     source_slot: src,
-                    target_slot: b.target_slot,
-                    mutable: b.mutable,
+                    target: match b.target {
+                        BorrowTarget::Slot(id) => ArrowTarget::Slot(id),
+                        BorrowTarget::Heap(addr) => ArrowTarget::Heap(addr),
+                    },
+                    kind: if b.mutable { ArrowKind::Mut } else { ArrowKind::Shared },
                 })
             })
-            .collect();
+            .collect::<Vec<ArrowView>>();
+        // M07: owning arrows (black) from world.owning.
+        let mut arrows = arrows_from_borrows;
+        for o in &world.owning {
+            arrows.push(ArrowView {
+                source_slot: o.source_slot,
+                target: ArrowTarget::Heap(o.target_heap),
+                kind: ArrowKind::Owning,
+            });
+        }
+        let heap = world.heap.iter().map(|h| HeapView {
+            addr: h.addr,
+            ty_name: h.ty_name.clone(),
+            display: h.display.clone(),
+            size: h.size,
+            freed: h.freed,
+        }).collect::<Vec<HeapView>>();
         StateSnapshot {
             frames: world
                 .frames
@@ -213,7 +271,8 @@ impl Cursor {
             current_call_span,
             status,
             pending_return,
-            borrows,
+            arrows,
+            heap,
             position: self.position,
             total: self.trace.len(),
         }
@@ -227,17 +286,46 @@ struct World {
     /// Active frames, outermost first.
     frames: Vec<FrameInProgress>,
     /// **M06**: active borrows. Push on BorrowShared/Mut, remove on BorrowEnd.
-    /// The source_slot is filled in when a `SlotWrite` lands a `Value::Ref`
-    /// with the matching borrow_id.
+    /// **M07**: target widened to support heap allocations.
     borrows: Vec<ActiveBorrowState>,
+    /// **M07**: live heap allocations.
+    heap: Vec<HeapAllocState>,
+    /// **M07**: owning relationships (slot → heap). Push on SlotWrite of a
+    /// Value::Box/Vec/String. Removed when the heap addr is freed OR when
+    /// the slot is overwritten with a different value.
+    owning: Vec<OwningState>,
 }
 
 struct ActiveBorrowState {
     borrow_id: u32,
     /// `None` until a `SlotWrite` of `Value::Ref` binds the reference to a slot.
     source_slot: Option<u32>,
-    target_slot: u32,
+    /// M07: a borrow can target a slot OR a heap allocation.
+    target: BorrowTarget,
     mutable: bool,
+}
+
+#[derive(Copy, Clone)]
+enum BorrowTarget {
+    Slot(u32),
+    Heap(u32),
+}
+
+struct HeapAllocState {
+    addr: u32,
+    ty_name: String,
+    display: String,
+    size: u32,
+    /// **M07**: true after the allocation has been freed but kept visible
+    /// in the heap panel (grayed) to convey "memory still physically there,
+    /// just available for the allocator to reuse." Same pedagogy as M03.1's
+    /// "stack slots persist in grayed frames until reused."
+    freed: bool,
+}
+
+struct OwningState {
+    source_slot: u32,
+    target_heap: u32,
 }
 
 struct FrameInProgress {
@@ -324,7 +412,8 @@ fn apply_event(world: &mut World, event: &MemEvent) {
             // SlotId is implementation jargon; learners think in binding names.
             // Fall back to `slot{N}` only if the target slot isn't found.
             let rendered = match value {
-                Value::Ref { target_slot, mutable, .. } => {
+                // M06.1 → M07: target widened from SlotId to Pointee.
+                Value::Ref { target: crate::event::Pointee::Slot(target_slot), mutable, .. } => {
                     let name = lookup_slot_name(&world.frames, target_slot.0)
                         .unwrap_or_else(|| format!("slot{}", target_slot.0));
                     if *mutable {
@@ -333,7 +422,28 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                         format!("&{name}")
                     }
                 }
+                Value::Ref { target: crate::event::Pointee::Heap(addr), mutable, .. } => {
+                    if *mutable {
+                        format!("&mut heap[{}]", addr.0)
+                    } else {
+                        format!("&heap[{}]", addr.0)
+                    }
+                }
                 _ => render_value(value),
+            };
+            // M07: if this write lands a Value::Box/Vec/String, register the
+            // owning relationship AND suppress the redundant value-cell text
+            // (the black owning arrow + the type column already convey the
+            // pointer; `Vec→heap[2]` adds noise without adding info).
+            let rendered = if let Value::Box { addr } | Value::Vec { addr } | Value::String { addr } = value {
+                world.owning.retain(|o| o.source_slot != slot_id.0);
+                world.owning.push(OwningState {
+                    source_slot: slot_id.0,
+                    target_heap: addr.0,
+                });
+                String::new() // empty value cell — arrow says it all
+            } else {
+                rendered
             };
             for frame in &mut world.frames {
                 if let Some(slot) = frame.slots.iter_mut().find(|s| s.slot_id == slot_id.0) {
@@ -362,37 +472,87 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                 frame.return_value = Some(render_value(value));
             }
         }
-        // **M06**: borrow events update World.borrows.
+        // **M06 → M07**: borrow events update World.borrows. Target widened
+        // to support both Slot and Heap pointees.
         MemEvent::BorrowShared { borrow_id, target, .. } => {
-            if let crate::event::Pointee::Slot(slot_id) = target {
-                world.borrows.push(ActiveBorrowState {
-                    borrow_id: borrow_id.0,
-                    source_slot: None,
-                    target_slot: slot_id.0,
-                    mutable: false,
-                });
-            }
+            let t = match target {
+                crate::event::Pointee::Slot(id) => BorrowTarget::Slot(id.0),
+                crate::event::Pointee::Heap(addr) => BorrowTarget::Heap(addr.0),
+            };
+            world.borrows.push(ActiveBorrowState {
+                borrow_id: borrow_id.0,
+                source_slot: None,
+                target: t,
+                mutable: false,
+            });
         }
         MemEvent::BorrowMut { borrow_id, target, .. } => {
-            if let crate::event::Pointee::Slot(slot_id) = target {
-                world.borrows.push(ActiveBorrowState {
-                    borrow_id: borrow_id.0,
-                    source_slot: None,
-                    target_slot: slot_id.0,
-                    mutable: true,
-                });
-            }
+            let t = match target {
+                crate::event::Pointee::Slot(id) => BorrowTarget::Slot(id.0),
+                crate::event::Pointee::Heap(addr) => BorrowTarget::Heap(addr.0),
+            };
+            world.borrows.push(ActiveBorrowState {
+                borrow_id: borrow_id.0,
+                source_slot: None,
+                target: t,
+                mutable: true,
+            });
         }
         MemEvent::BorrowEnd { borrow_id, .. } => {
             world.borrows.retain(|b| b.borrow_id != borrow_id.0);
         }
+        // **M07**: heap events.
+        MemEvent::HeapAlloc { addr, size, ty_name, .. } => {
+            world.heap.push(HeapAllocState {
+                addr: addr.0,
+                ty_name: ty_name.clone(),
+                display: ty_name.clone(),
+                size: *size,
+                freed: false,
+            });
+        }
+        MemEvent::HeapRealloc { from, to, new_size, new_display, .. } => {
+            if from == to {
+                // **In-place** update: just refresh display + size.
+                if let Some(h) = world.heap.iter_mut().find(|h| h.addr == from.0 && !h.freed) {
+                    h.size = *new_size;
+                    h.display = new_display.clone();
+                }
+            } else {
+                // **Real realloc** — `from` is freed (kept visible, grayed);
+                // `to` is a new live block with the copied contents.
+                if let Some(h) = world.heap.iter_mut().find(|h| h.addr == from.0 && !h.freed) {
+                    h.freed = true;
+                }
+                world.heap.push(HeapAllocState {
+                    addr: to.0,
+                    ty_name: new_display.clone(),
+                    display: new_display.clone(),
+                    size: *new_size,
+                    freed: false,
+                });
+                // Update owning relationships from `from` to `to`.
+                for o in world.owning.iter_mut() {
+                    if o.target_heap == from.0 {
+                        o.target_heap = to.0;
+                    }
+                }
+            }
+            // M07 simplification: borrows pointing at the old addr stay
+            // pointing at the old addr (which is gone) — visually shows as
+            // a dangling arrow. The dangling-borrow Note (emitted by eval)
+            // delivers the pedagogy.
+        }
+        MemEvent::HeapFree { addr, .. } => {
+            // M07: mark freed (keep visible, grayed) instead of removing.
+            if let Some(h) = world.heap.iter_mut().find(|h| h.addr == addr.0 && !h.freed) {
+                h.freed = true;
+            }
+            world.owning.retain(|o| o.target_heap != addr.0);
+        }
         // The remaining variants don't modify world state. `Note` surfaces via
-        // `note_to_status` on the most-recent-event side path. The others are
-        // forward-compat placeholders for M07+ events.
+        // `note_to_status` on the most-recent-event side path.
         MemEvent::SlotMove { .. }
-        | MemEvent::HeapAlloc { .. }
-        | MemEvent::HeapRealloc { .. }
-        | MemEvent::HeapFree { .. }
         | MemEvent::LockAcquire { .. }
         | MemEvent::LockRelease { .. }
         | MemEvent::ArcClone { .. }
@@ -493,13 +653,23 @@ fn render_value(value: &Value) -> String {
         // (`&x`, `&mut x`) via `lookup_slot_name`. This fallback is reached
         // only if the value is rendered outside the SlotWrite path (e.g.
         // future ReturnValue of a ref — not constructible in M06.1).
-        Value::Ref { target_slot, mutable, .. } => {
+        Value::Ref { target, mutable, .. } => {
+            let target_str = match target {
+                crate::event::Pointee::Slot(id) => format!("slot{}", id.0),
+                crate::event::Pointee::Heap(addr) => format!("heap[{}]", addr.0),
+            };
             if *mutable {
-                format!("&mut slot{}", target_slot.0)
+                format!("&mut {target_str}")
             } else {
-                format!("&slot{}", target_slot.0)
+                format!("&{target_str}")
             }
         }
+        // M07: heap-owning values in the fallback render path (typically not
+        // used since SlotWrite path is specialized for these too).
+        Value::Box { addr } => format!("Box→heap[{}]", addr.0),
+        Value::Vec { addr } => format!("Vec→heap[{}]", addr.0),
+        Value::String { addr } => format!("String→heap[{}]", addr.0),
+        Value::Str(s) => format!("\"{s}\""),
     }
 }
 

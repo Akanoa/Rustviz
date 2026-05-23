@@ -4,7 +4,7 @@ expression: result
 ---
 Err(
     ParseError {
-        message: "L1 only supports direct function calls (callee must be a function name)",
+        message: "callee must be a function name or path (e.g. `Box::new(v)`)",
         span: Span {
             start: 24,
             end: 27,

@@ -179,6 +179,9 @@ function render(state) {
       const valueEl = el("span", { class: "slot-value" });
       if (slot.value === null || slot.value === undefined) {
         valueEl.classList.add("slot-pending");
+      } else if (slot.value === "") {
+        // M07: empty value cell for heap-owning slots. The owning arrow +
+        // the type column carry the pointer info; no `= ...` text needed.
       } else {
         valueEl.textContent = `= ${slot.value}`;
       }
@@ -224,12 +227,14 @@ function render(state) {
   editorView.dispatch({ effects: setError.of(null) });
   setControlsEnabled(true);
 
-  // M06.1: render borrow arrows LAST, after the status bar has taken its
-  // final size. Otherwise the arrows are positioned against the pre-status
-  // layout and visibly drift when a Note appears/disappears between steps.
-  // Use requestAnimationFrame so the browser has flushed all DOM mutations
-  // into a settled layout before getBoundingClientRect runs.
-  requestAnimationFrame(() => renderArrows(state.borrows || []));
+  // **M07**: render the heap panel BEFORE arrows so the heap-box DOM
+  // elements exist when renderArrows queries `data-heap-addr` positions.
+  renderHeap(state.heap || []);
+
+  // M06.1 → M07: render arrows LAST, after the status bar AND heap have
+  // taken their final layout. Use requestAnimationFrame so the browser has
+  // flushed all DOM mutations before getBoundingClientRect.
+  requestAnimationFrame(() => renderArrows(state.arrows || []));
 }
 
 // M05 / US2: render a compile error. Underline the span, show the message
@@ -256,43 +261,89 @@ function renderError(error) {
   setControlsEnabled(false);
 }
 
-// M05 / US2: toggle Play / Step Forward / Step Back disabled state. Rewind
-// M06: draw an SVG arrow for each active borrow. Source and target slot
-// positions are queried from the DOM via getBoundingClientRect, then a
-// quadratic Bezier path is added to the overlay. Cleared and rebuilt on
-// every render. Pass `borrows` from the StateSnapshot.
-function renderArrows(borrows) {
+// **M06 → M07**: render arrows for both borrows and ownership. Each ArrowView
+// has source_slot (always a slot id), target (Slot(id) | Heap(addr)), and
+// kind (Shared | Mut | Owning). Targets are queried via data-slot-id or
+// data-heap-addr respectively. Path is rectilinear via a left gutter.
+function renderArrows(arrows) {
   const overlay = document.getElementById("arrow-overlay");
   if (!overlay) return;
   // Clear previous arrows (everything except the <defs>).
   for (const child of [...overlay.children]) {
     if (child.tagName.toLowerCase() !== "defs") overlay.removeChild(child);
   }
-  if (!borrows || borrows.length === 0) return;
+  if (!arrows || arrows.length === 0) return;
 
   const overlayBox = overlay.getBoundingClientRect();
   const NS = "http://www.w3.org/2000/svg";
 
-  for (const b of borrows) {
-    const srcEl = document.querySelector(`[data-slot-id="${b.source_slot}"]`);
-    const tgtEl = document.querySelector(`[data-slot-id="${b.target_slot}"]`);
+  for (const a of arrows) {
+    const srcEl = document.querySelector(`[data-slot-id="${a.source_slot}"]`);
+    // M07: target can be Slot(id) or Heap(addr). The wire format is
+    // { "Slot": <id> } or { "Heap": <addr> } (serde tag-by-key).
+    let tgtEl = null;
+    if (a.target && a.target.Slot !== undefined) {
+      tgtEl = document.querySelector(`[data-slot-id="${a.target.Slot}"]`);
+    } else if (a.target && a.target.Heap !== undefined) {
+      tgtEl = document.querySelector(`[data-heap-addr="${a.target.Heap}"]`);
+    }
     if (!srcEl || !tgtEl) continue;
     const src = srcEl.getBoundingClientRect();
     const tgt = tgtEl.getBoundingClientRect();
-    // M06.1: anchor on the LEFT edge of both slots. Route as a rectilinear
-    // path (H-V-H) through a gutter to the LEFT of the cards. Avoids
-    // overlaying the slot text. Each arrow gets its own lane offset by its
-    // index, so multiple arrows pointing at the same target don't collapse.
     const x1 = src.left - overlayBox.left;
     const y1 = src.top + src.height / 2 - overlayBox.top;
     const x2 = tgt.left - overlayBox.left;
     const y2 = tgt.top + tgt.height / 2 - overlayBox.top;
-    const lane = 10 + (borrows.indexOf(b) * 6);
+    const lane = 10 + (arrows.indexOf(a) * 6);
     const gutterX = Math.min(x1, x2) - lane;
     const path = document.createElementNS(NS, "path");
     path.setAttribute("d", `M${x1},${y1} H${gutterX} V${y2} H${x2}`);
-    path.setAttribute("class", b.mutable ? "arrow-mut" : "arrow-shared");
+    const cls = a.kind === "Mut" ? "arrow-mut"
+              : a.kind === "Owning" ? "arrow-owning"
+              : "arrow-shared";
+    path.setAttribute("class", cls);
     overlay.appendChild(path);
+  }
+}
+
+// **M07**: render the heap panel. Each HeapView in state.heap becomes a
+// labeled box. Re-used across renders via a per-addr DOM-element map so
+// CSS transitions animate movement on realloc.
+const heapElements = new Map();
+function renderHeap(heap) {
+  const heapEl = document.getElementById("heap");
+  if (!heapEl) return;
+  const seenAddrs = new Set();
+  for (const h of heap) {
+    seenAddrs.add(h.addr);
+    let box = heapElements.get(h.addr);
+    if (!box) {
+      box = document.createElement("div");
+      box.className = "heap-box";
+      box.setAttribute("data-heap-addr", String(h.addr));
+      const addr = document.createElement("div");
+      addr.className = "heap-addr";
+      addr.textContent = `heap #${h.addr}`;
+      const disp = document.createElement("div");
+      disp.className = "heap-display";
+      box.appendChild(addr);
+      box.appendChild(disp);
+      heapEl.appendChild(box);
+      heapElements.set(h.addr, box);
+    }
+    // Update content + addr label every render (covers in-place updates).
+    box.setAttribute("data-heap-addr", String(h.addr));
+    box.querySelector(".heap-addr").textContent =
+      h.freed ? `heap #${h.addr} (freed)` : `heap #${h.addr}`;
+    box.querySelector(".heap-display").textContent = h.display;
+    box.classList.toggle("heap-freed", !!h.freed);
+  }
+  // Remove DOM elements for addrs that no longer exist (HeapFree).
+  for (const [addr, el] of [...heapElements.entries()]) {
+    if (!seenAddrs.has(addr)) {
+      el.remove();
+      heapElements.delete(addr);
+    }
   }
 }
 

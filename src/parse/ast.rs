@@ -74,6 +74,16 @@ pub enum Type {
         /// Span covering the `&` (or `&mut`) plus the inner type.
         span: Span,
     },
+    /// **M07**: generic type path `Vec<i32>`, `Box<i32>`. Multi-segment paths
+    /// with type arguments. `String` parses as `Type::Path { segments: ["String"] }`.
+    Generic {
+        /// Path segments (e.g. `["Vec"]` for `Vec<T>`).
+        segments: Vec<String>,
+        /// Generic type arguments (e.g. `[i32]` for `Vec<i32>`).
+        args: Vec<Type>,
+        /// Span covering `segments<args>`.
+        span: Span,
+    },
 }
 
 /// A block: zero or more statements followed by an optional tail expression.
@@ -208,6 +218,38 @@ pub enum Expr {
         /// Span from `*` through end of inner.
         span: Span,
     },
+    /// **M07**: string literal `"..."`. Used as argument to `String::from(...)`
+    /// and `String::push_str(...)`.
+    StrLit(String, Span),
+    /// **M07**: multi-segment path `Vec::new`, `Box::new`, `String::from`.
+    /// Single-segment idents stay as `Expr::Ident`.
+    Path {
+        /// Path segments (≥ 2).
+        segments: Vec<String>,
+        /// Span covering the path.
+        span: Span,
+    },
+    /// **M07**: method call `receiver.method(args)`. Dispatched in typeck
+    /// against the hardcoded `(receiver_ty, name)` table (no traits).
+    MethodCall {
+        /// Receiver expression.
+        receiver: Box<Expr>,
+        /// Method name.
+        name: String,
+        /// Method arguments.
+        args: Vec<Expr>,
+        /// Span from receiver start through `)`.
+        span: Span,
+    },
+    /// **M07**: indexing `receiver[index]`. Rvalue-only in M07.
+    Index {
+        /// Receiver expression (must be `Ty::Vec(T)`).
+        receiver: Box<Expr>,
+        /// Index expression (must be `Ty::Int(_)`).
+        index: Box<Expr>,
+        /// Span from receiver start through `]`.
+        span: Span,
+    },
 }
 
 impl Expr {
@@ -224,7 +266,11 @@ impl Expr {
             | Self::Paren { span, .. }
             | Self::If { span, .. }
             | Self::Borrow { span, .. }
-            | Self::Deref { span, .. } => *span,
+            | Self::Deref { span, .. }
+            | Self::Path { span, .. }
+            | Self::MethodCall { span, .. }
+            | Self::Index { span, .. } => *span,
+            Self::StrLit(_, s) => *s,
             Self::Block(b) => b.span,
         }
     }

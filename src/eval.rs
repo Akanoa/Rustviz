@@ -66,10 +66,53 @@ struct Evaluator<'a> {
     /// containing stmt's SlotWrite (i.e. at the same cursor step where the
     /// new binding actually has the read value) rather than before.
     pending_notes: Vec<MemEvent>,
+    /// **M07**: heap state — live allocations indexed by HeapAddr.
+    heap: HeapState,
+    /// **M07**: monotonic counter for heap addresses. One addr per logical
+    /// allocation (Box::new, Vec::new, String::from); realloc does NOT
+    /// increment — the addr is a stable identifier for the binding's heap.
+    next_heap_addr: u32,
+    /// **M07**: generation per heap addr. Bumps on real realloc (bytes
+    /// physically moved). Borrows snapshot the generation at borrow time;
+    /// dangling detection compares stored vs current generation.
+    heap_generations: std::collections::HashMap<crate::event::HeapAddr, u32>,
+    /// **M07**: per-borrow-id snapshot of the target heap's generation at
+    /// borrow time. Used by `realloc_heap`'s dangling scan.
+    borrow_generations: std::collections::HashMap<crate::event::BorrowId, u32>,
     /// Emitted events in source-execution order.
     events: Vec<MemEvent>,
     /// Set to true on runtime error to stop further evaluation.
     halted: bool,
+}
+
+/// **M07**: heap state. Each live allocation is one HeapObject indexed by
+/// its HeapAddr. Realloc replaces (old, new): the `from` addr is removed,
+/// the `to` addr is added with the new contents.
+struct HeapState {
+    objects: indexmap::IndexMap<crate::event::HeapAddr, HeapObject>,
+}
+
+impl HeapState {
+    fn new() -> Self {
+        Self { objects: indexmap::IndexMap::new() }
+    }
+}
+
+/// **M07**: per-allocation heap contents.
+enum HeapObject {
+    /// Single value boxed via `Box::new(v)`.
+    Box(Value),
+    /// Growable contiguous buffer via `Vec::new()` + `Vec::push`.
+    Vec {
+        elements: Vec<Value>,
+        capacity: usize,
+        elem_ty: Ty,
+    },
+    /// UTF-8 byte sequence via `String::from(...)` + `String::push_str`.
+    Str {
+        bytes: String,
+        capacity: usize,
+    },
 }
 
 struct Frame {
@@ -85,6 +128,12 @@ struct Scope {
     /// **M06**: BorrowIds created in this scope. On scope exit, emit
     /// `BorrowEnd` for each (in reverse order).
     borrows: Vec<crate::event::BorrowId>,
+    /// **M07**: HeapAddrs allocated in this scope. On scope exit, emit
+    /// `HeapFree` for each. NOTE: when an owning binding (Box/Vec/String)
+    /// is created via `let`, the alloc happens during init evaluation
+    /// (recorded here), THEN the LocalSlot stores the Value::Box/Vec/String.
+    /// scope.heap_allocs follows LIFO order alongside locals.
+    heap_allocs: Vec<crate::event::HeapAddr>,
 }
 
 struct LocalSlot {
@@ -131,6 +180,10 @@ impl<'a> Evaluator<'a> {
             next_frame_id: 0,
             next_borrow_id: 0,
             pending_notes: Vec::new(),
+            heap: HeapState::new(),
+            next_heap_addr: 0,
+            heap_generations: std::collections::HashMap::new(),
+            borrow_generations: std::collections::HashMap::new(),
             events: Vec::new(),
             halted: false,
         })
@@ -150,6 +203,137 @@ impl<'a> Evaluator<'a> {
         let id = crate::event::BorrowId(self.next_borrow_id);
         self.next_borrow_id += 1;
         id
+    }
+
+    /// **M07**: allocate a fresh HeapAddr.
+    fn alloc_heap_addr(&mut self) -> crate::event::HeapAddr {
+        let id = crate::event::HeapAddr(self.next_heap_addr);
+        self.next_heap_addr += 1;
+        id
+    }
+
+    /// **M07**: allocate a heap object and emit `HeapAlloc`. Returns the
+    /// new addr. Tracks the addr in the current scope for HeapFree on exit.
+    fn alloc_heap(&mut self, obj: HeapObject, ty_name: String, size: u32, span: Span) -> crate::event::HeapAddr {
+        let addr = self.alloc_heap_addr();
+        self.heap.objects.insert(addr, obj);
+        self.events.push(MemEvent::HeapAlloc {
+            addr,
+            size,
+            ty_name,
+            span,
+        });
+        // Track this alloc for HeapFree on scope exit.
+        if let Some(scope) = self
+            .frames
+            .last_mut()
+            .and_then(|f| f.scopes.last_mut())
+        {
+            scope.heap_allocs.push(addr);
+        }
+        addr
+    }
+
+    /// **M07**: real realloc — bytes physically moved to a new heap addr.
+    /// The old `from` addr is freed; a fresh `to` addr is allocated and
+    /// holds the new contents. Used when capacity is exceeded and the
+    /// existing region can't accommodate the growth in place. The pedagogy
+    /// makes the **copy** visible (old block disappears; new block at a
+    /// different addr appears with the new contents).
+    fn realloc_heap(&mut self, from: crate::event::HeapAddr, obj: HeapObject, new_size: u32, span: Span) -> crate::event::HeapAddr {
+        let new_display = heap_object_display(&obj);
+        let (old_cap, new_cap, kind_label) = match (self.heap.objects.get(&from), &obj) {
+            (Some(HeapObject::Vec { capacity: oc, .. }), HeapObject::Vec { capacity: nc, .. }) => (*oc, *nc, "Vec"),
+            (Some(HeapObject::Str { capacity: oc, .. }), HeapObject::Str { capacity: nc, .. }) => (*oc, *nc, "String"),
+            _ => (0, 0, "heap object"),
+        };
+        // Allocate a NEW addr for the copy.
+        let to = self.alloc_heap_addr();
+        self.heap.objects.shift_remove(&from);
+        self.heap.objects.insert(to, obj);
+        self.events.push(MemEvent::HeapRealloc {
+            from,
+            to,
+            new_size,
+            new_display,
+            span,
+        });
+        // Note: the explanatory Info Note is emitted by the caller (vec_push
+        // / string_push_str) BEFORE this realloc fires, so the pedagogy
+        // sequence is "announce → realloc → push" rather than
+        // "realloc → explain". `kind_label` / `old_cap` / `new_cap` left
+        // intentionally unused here so callers control the messaging.
+        let _ = (kind_label, old_cap, new_cap);
+        // Update scope tracking: `from` is gone; `to` is the new owned addr.
+        for frame in self.frames.iter_mut() {
+            for scope in frame.scopes.iter_mut() {
+                for h in scope.heap_allocs.iter_mut() {
+                    if *h == from {
+                        *h = to;
+                    }
+                }
+            }
+        }
+        // Update LocalSlot owning-values to point at the new addr; emit
+        // SlotWrite for each so the UI's owning arrow follows.
+        let mut writes_needed = Vec::new();
+        for frame in self.frames.iter_mut() {
+            for scope in frame.scopes.iter_mut() {
+                for local in scope.locals.iter_mut() {
+                    match &mut local.value {
+                        Value::Vec { addr } if *addr == from => {
+                            *addr = to;
+                            writes_needed.push((local.slot_id, local.value.clone()));
+                        }
+                        Value::String { addr } if *addr == from => {
+                            *addr = to;
+                            writes_needed.push((local.slot_id, local.value.clone()));
+                        }
+                        Value::Box { addr } if *addr == from => {
+                            *addr = to;
+                            writes_needed.push((local.slot_id, local.value.clone()));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        for (slot_id, val) in writes_needed {
+            self.events.push(MemEvent::SlotWrite { slot_id, value: val, span });
+        }
+        // Dangling-borrow detection: scan locals for Value::Ref with
+        // target = Pointee::Heap(from). After the addr change, these refs
+        // still hold the OLD addr, which is freed — they're dangling.
+        let mut dangling: Vec<Span> = Vec::new();
+        for frame in self.frames.iter() {
+            for scope in frame.scopes.iter() {
+                for local in scope.locals.iter() {
+                    if let Value::Ref { target: crate::event::Pointee::Heap(a), .. } = local.value {
+                        if a == from {
+                            dangling.push(local.decl_span);
+                        }
+                    }
+                }
+            }
+        }
+        for sp in dangling {
+            self.events.push(MemEvent::Note {
+                kind: NoteKind::RuntimeError,
+                message: format!(
+                    "dangling reference: borrow still points at heap #{from_n}, which was freed during the realloc",
+                    from_n = from.0,
+                ),
+                span: sp,
+            });
+        }
+        to
+    }
+
+    /// **M07**: free a heap object — emit HeapFree, remove from state.
+    fn free_heap(&mut self, addr: crate::event::HeapAddr, span: Span) {
+        if self.heap.objects.shift_remove(&addr).is_some() {
+            self.events.push(MemEvent::HeapFree { addr, span });
+        }
     }
 
     // ─── id allocators ─────────────────────────────────────────────────────
@@ -274,7 +458,7 @@ impl<'a> Evaluator<'a> {
         // Push the frame with an outer (param) scope.
         self.frames.push(Frame {
             frame_id,
-            scopes: vec![Scope { locals: Vec::new(), borrows: Vec::new() }],
+            scopes: vec![Scope { locals: Vec::new(), borrows: Vec::new(), heap_allocs: Vec::new() }],
         });
 
         // Emit per-param SlotAlloc + SlotWrite and push the locals.
@@ -379,21 +563,58 @@ impl<'a> Evaluator<'a> {
                 span: end_span,
             });
         }
+        // **M07**: interleave Drop semantics per local, in reverse declaration
+        // order. For each non-Copy local holding a heap-owning value
+        // (Box/Vec/String), emit a pedagogical Info Note explaining what's
+        // happening, then HeapFree, then SlotDrop. For other non-Copy locals
+        // (currently none in M07), just SlotDrop. Copy locals: nothing.
+        let _ = scope.heap_allocs; // tracked redundantly; iteration via locals is the source of truth.
         for local in scope.locals.into_iter().rev() {
-            // M03.1: Copy types have no destructor; their bytes persist on the
-            // stack until the frame is reused. Skipping the SlotDrop event for
-            // Copy-typed slots avoids visualizing physical-memory loss that
-            // doesn't actually happen. Non-Copy types (M07+: Box, Vec, String)
-            // still emit SlotDrop because their drop runs real destructor work.
             let ty = self
                 .lookup_var_ty(local.binding_id)
                 .expect("var ty after typeck");
-            if !ty.is_copy() {
-                self.events.push(MemEvent::SlotDrop {
-                    slot_id: local.slot_id,
-                    span: local.decl_span,
+            // Resolve binding name for the Note.
+            let name = self
+                .resolution
+                .bindings
+                .get(&local.binding_id)
+                .map(|d| d.name.clone())
+                .unwrap_or_else(|| format!("slot{}", local.slot_id.0));
+            // Detect heap-owning current value (the slot's current Value).
+            let heap_addr = match &local.value {
+                Value::Box { addr } | Value::Vec { addr } | Value::String { addr } => Some(*addr),
+                _ => None,
+            };
+            if let Some(addr) = heap_addr {
+                // M07: explain the Drop sequence in plain language. Fires
+                // BEFORE the HeapFree event, so the cursor step where the
+                // heap box disappears is preceded by an explanatory message.
+                let kind_name = match &local.value {
+                    Value::Box { .. } => "Box",
+                    Value::Vec { .. } => "Vec",
+                    Value::String { .. } => "String",
+                    _ => unreachable!(),
+                };
+                self.events.push(MemEvent::Note {
+                    kind: NoteKind::Info,
+                    message: format!(
+                        "`{name}` goes out of scope: Drop runs on the {kind_name}, freeing heap addr {addr_num} (the stack pointer-bytes themselves persist until the frame is reused)",
+                        addr_num = addr.0
+                    ),
+                    span: end_span,
                 });
+                self.free_heap(addr, end_span);
             }
+            // **M07**: NO SlotDrop emission at scope exit. M03.1 already
+            // established "memory persists until reused" for Copy types; the
+            // same principle applies to Box/Vec/String at the STACK level —
+            // the pointer-bytes physically remain on the stack until the
+            // frame is reused (M03.1's frame-reuse semantics). What Drop
+            // ACTUALLY does heap-side is visualized via HeapFree above; the
+            // stack slot stays visible so the learner sees the now-stale
+            // pointer alongside the freed heap. The frame eventually grays
+            // out on FrameLeave (M03.1).
+            let _ = ty;
         }
     }
 
@@ -410,7 +631,7 @@ impl<'a> Evaluator<'a> {
             .last_mut()
             .expect("frame active")
             .scopes
-            .push(Scope { locals: Vec::new(), borrows: Vec::new() });
+            .push(Scope { locals: Vec::new(), borrows: Vec::new(), heap_allocs: Vec::new() });
         for stmt in &block.stmts {
             if self.halted {
                 break;
@@ -436,7 +657,7 @@ impl<'a> Evaluator<'a> {
             .last_mut()
             .expect("frame active")
             .scopes
-            .push(Scope { locals: Vec::new(), borrows: Vec::new() });
+            .push(Scope { locals: Vec::new(), borrows: Vec::new(), heap_allocs: Vec::new() });
 
         for stmt in &block.stmts {
             if self.halted {
@@ -543,13 +764,19 @@ impl<'a> Evaluator<'a> {
                             .expect("local slot exists for assigned binding")
                     }
                     ast::Expr::Deref { inner, span: deref_span } => {
-                        // Read r's Value::Ref to find target_slot.
+                        // Read r's Value::Ref to find the target slot.
                         let ref_value = self.eval_expr(inner);
                         if self.halted {
                             return;
                         }
                         let target_slot = match ref_value {
-                            Value::Ref { target_slot, mutable: true, .. } => target_slot,
+                            // M07: target widened from SlotId to Pointee. Through-ref
+                            // assignment only valid for Slot-targeted refs in M06.1 scope.
+                            // (Heap-targeted &mut writes are out of M06.1 + M07 mutation scope.)
+                            Value::Ref { target: crate::event::Pointee::Slot(slot_id), mutable: true, .. } => slot_id,
+                            Value::Ref { target: crate::event::Pointee::Heap(_), mutable: true, .. } => {
+                                panic!("assignment through &mut heap-borrow is out of scope in M07")
+                            }
                             _ => panic!(
                                 "typeck should reject deref-assign through non-&mut value"
                             ),
@@ -677,13 +904,17 @@ impl<'a> Evaluator<'a> {
             }
             ast::Expr::Binary { op, lhs, rhs, span } => self.apply_binary(*op, lhs, rhs, *span),
             ast::Expr::Call { callee, args, span } => {
+                // **M07**: path-callee → dispatch to static-fn (Box::new, Vec::new, String::from).
+                if let ast::Expr::Path { segments, .. } = callee.as_ref() {
+                    return self.eval_path_call(segments, args, *span);
+                }
                 let callee_binding = match callee.as_ref() {
                     ast::Expr::Ident(_, sp) => *self
                         .resolution
                         .uses
                         .get(sp)
                         .expect("callee resolved"),
-                    _ => panic!("typeck should have rejected non-Ident callees"),
+                    _ => panic!("typeck should have rejected non-Ident/non-Path callees"),
                 };
                 let mut arg_values = Vec::with_capacity(args.len());
                 for arg in args {
@@ -713,34 +944,38 @@ impl<'a> Evaluator<'a> {
             }
             // M06: `&place` / `&mut place`. typeck guarantees inner is an Ident.
             ast::Expr::Borrow { inner, mutable, span } => {
-                let target_binding = match inner.as_ref() {
-                    ast::Expr::Ident(_, sp) => *self
-                        .resolution
-                        .uses
-                        .get(sp)
-                        .expect("ident resolved"),
-                    _ => panic!("typeck should have rejected non-Ident place"),
+                // M06 + M07: determine the borrow target (Slot or Heap).
+                let target = match inner.as_ref() {
+                    ast::Expr::Ident(_, sp) => {
+                        let binding_id = *self
+                            .resolution
+                            .uses
+                            .get(sp)
+                            .expect("ident resolved");
+                        let slot_id = self
+                            .lookup_local_slot(binding_id)
+                            .expect("local slot exists for borrowed binding");
+                        crate::event::Pointee::Slot(slot_id)
+                    }
+                    // **M07**: `&v[i]` — target is the Vec's heap allocation.
+                    ast::Expr::Index { receiver, .. } => {
+                        // Evaluate receiver to get its Value::Vec.
+                        let recv_v = self.eval_expr(receiver);
+                        if self.halted { return Value::Unit; }
+                        match recv_v {
+                            Value::Vec { addr } => crate::event::Pointee::Heap(addr),
+                            _ => panic!("typeck should reject &(<non-Vec>[...])"),
+                        }
+                    }
+                    _ => panic!("typeck should have rejected this place"),
                 };
-                let target_slot = self
-                    .lookup_local_slot(target_binding)
-                    .expect("local slot exists for borrowed binding");
                 let borrow_id = self.alloc_borrow_id();
-                // Emit the borrow event.
                 let event = if *mutable {
-                    MemEvent::BorrowMut {
-                        borrow_id,
-                        target: crate::event::Pointee::Slot(target_slot),
-                        span: *span,
-                    }
+                    MemEvent::BorrowMut { borrow_id, target, span: *span }
                 } else {
-                    MemEvent::BorrowShared {
-                        borrow_id,
-                        target: crate::event::Pointee::Slot(target_slot),
-                        span: *span,
-                    }
+                    MemEvent::BorrowShared { borrow_id, target, span: *span }
                 };
                 self.events.push(event);
-                // Track this borrow against the current scope for BorrowEnd.
                 self.frames
                     .last_mut()
                     .expect("frame active")
@@ -749,9 +984,16 @@ impl<'a> Evaluator<'a> {
                     .expect("scope active")
                     .borrows
                     .push(borrow_id);
+                // M07: snapshot the target heap's current generation at
+                // borrow time. realloc_heap's dangling scan compares this
+                // against the post-realloc generation.
+                if let crate::event::Pointee::Heap(addr) = target {
+                    let generation = self.heap_generations.get(&addr).copied().unwrap_or(0);
+                    self.borrow_generations.insert(borrow_id, generation);
+                }
                 Value::Ref {
                     borrow_id,
-                    target_slot,
+                    target,
                     mutable: *mutable,
                 }
             }
@@ -764,7 +1006,14 @@ impl<'a> Evaluator<'a> {
                     return Value::Unit;
                 }
                 match ref_value {
-                    Value::Ref { target_slot, .. } => {
+                    // M07: `*b` where b: Box<T> reads the boxed value.
+                    Value::Box { addr } => {
+                        if let Some(HeapObject::Box(v)) = self.heap.objects.get(&addr) {
+                            return v.clone();
+                        }
+                        panic!("Box's heap object missing")
+                    }
+                    Value::Ref { target: crate::event::Pointee::Slot(target_slot), .. } => {
                         let value = self
                             .lookup_slot_value(target_slot)
                             .expect("target slot exists during borrow's lifetime");
@@ -794,10 +1043,276 @@ impl<'a> Evaluator<'a> {
                         });
                         value
                     }
+                    Value::Ref { target: crate::event::Pointee::Heap(_), .. } => {
+                        panic!("deref-read of heap borrow is out of M07 scope")
+                    }
                     _ => panic!("typeck should reject deref of non-reference"),
                 }
             }
+            // **M07**: StrLit transient value.
+            ast::Expr::StrLit(s, _) => Value::Str(s.clone()),
+            ast::Expr::Path { .. } => panic!("Path expressions only valid as Call callees in M07"),
+            // **M07**: method call — dispatch via eval_method_call.
+            ast::Expr::MethodCall { receiver, name, args, span } => {
+                self.eval_method_call(receiver, name, args, *span)
+            }
+            // **M07**: indexing — bounds-check + copy.
+            ast::Expr::Index { receiver, index, span } => {
+                self.eval_index(receiver, index, *span)
+            }
         }
+    }
+
+    /// **M07**: evaluate a path-callee `Box::new(v)` / `Vec::new()` / `String::from("...")`.
+    fn eval_path_call(
+        &mut self,
+        segments: &[String],
+        args: &[ast::Expr],
+        span: Span,
+    ) -> Value {
+        let seg_strs: Vec<&str> = segments.iter().map(|s| s.as_str()).collect();
+        match seg_strs.as_slice() {
+            ["Box", "new"] => {
+                let v = self.eval_expr(&args[0]);
+                if self.halted { return Value::Unit; }
+                let inner_ty_name = match &v {
+                    Value::Int { kind, .. } => kind.name().to_owned(),
+                    Value::Float { kind, .. } => kind.name().to_owned(),
+                    Value::Bool(_) => "bool".to_owned(),
+                    _ => "?".to_owned(),
+                };
+                let size = 8; // M07: simplification — uniform 8 bytes for primitives.
+                // M07: embed value in the display label so the heap panel
+                // shows e.g. "Box<i32> = 5_i32" instead of just "Box<i32>".
+                let value_str = render_value_for_note(&v);
+                let display = format!("Box<{inner_ty_name}> = {value_str}");
+                let addr = self.alloc_heap(
+                    HeapObject::Box(v),
+                    display,
+                    size,
+                    span,
+                );
+                Value::Box { addr }
+            }
+            ["Vec", "new"] => {
+                // M07: initial capacity = 2 (pedagogical default; pushes fit
+                // in-place until they exceed). Matches the user-friendly
+                // mental model where the heap addr stays stable until a
+                // genuine realloc happens.
+                let elem_ty = Ty::Int(IntKind::I32);
+                let initial_cap: usize = 2;
+                let addr = self.alloc_heap(
+                    HeapObject::Vec { elements: Vec::new(), capacity: initial_cap, elem_ty },
+                    format!("Vec [] (cap={initial_cap})"),
+                    (initial_cap * 4) as u32,
+                    span,
+                );
+                Value::Vec { addr }
+            }
+            ["String", "from"] => {
+                let s = match self.eval_expr(&args[0]) {
+                    Value::Str(s) => s,
+                    _ => panic!("typeck should have rejected non-StrLit arg to String::from"),
+                };
+                let size = s.len() as u32;
+                let display = format!("String \"{s}\" (cap={})", s.len());
+                let addr = self.alloc_heap(
+                    HeapObject::Str { bytes: s.clone(), capacity: s.len() },
+                    display,
+                    size,
+                    span,
+                );
+                Value::String { addr }
+            }
+            _ => panic!("typeck should have rejected unknown path"),
+        }
+    }
+
+    /// **M07**: evaluate a method call (Vec::push, Vec::len, String::push_str).
+    fn eval_method_call(
+        &mut self,
+        receiver: &ast::Expr,
+        name: &str,
+        args: &[ast::Expr],
+        span: Span,
+    ) -> Value {
+        let recv = self.eval_expr(receiver);
+        if self.halted { return Value::Unit; }
+        match (&recv, name) {
+            (Value::Vec { addr }, "push") => {
+                let arg_v = self.eval_expr(&args[0]);
+                if self.halted { return Value::Unit; }
+                self.vec_push(*addr, arg_v, span);
+                Value::Unit
+            }
+            (Value::Vec { addr }, "len") => {
+                let obj = self.heap.objects.get(addr).expect("vec exists");
+                let len = if let HeapObject::Vec { elements, .. } = obj { elements.len() } else { 0 };
+                Value::Int { kind: IntKind::U64, bits: len as i128 }
+            }
+            (Value::String { addr }, "push_str") => {
+                let suffix = match self.eval_expr(&args[0]) {
+                    Value::Str(s) => s,
+                    _ => panic!("typeck should have rejected non-StrLit arg"),
+                };
+                self.string_push_str(*addr, &suffix, span);
+                Value::Unit
+            }
+            _ => panic!("typeck should reject this method call"),
+        }
+    }
+
+    /// **M07**: Vec::push helper. Two cases:
+    ///
+    /// - **In-place** (capacity sufficient): just update contents; emit
+    ///   one HeapRealloc {from==to} carrying the new display.
+    ///
+    /// - **Cap exceeded** (real realloc): emit a three-event sequence so
+    ///   the pedagogy is visible step by step:
+    ///   1. **Info Note** — "capacity exceeded, will copy."
+    ///   2. **HeapRealloc** with `from=old → to=new` and **old contents** at
+    ///      the new addr (capacity raised, push not done yet). This event
+    ///      represents the alloc-and-copy step alone.
+    ///   3. **HeapRealloc** with `from=new == to=new` and **new contents**
+    ///      (the actual push performed on the freshly-allocated buffer).
+    fn vec_push(&mut self, addr: crate::event::HeapAddr, value: Value, span: Span) {
+        let (cur_cap, cur_len, elem_ty, old_elements) = match self.heap.objects.get(&addr) {
+            Some(HeapObject::Vec { capacity, elements, elem_ty }) =>
+                (*capacity, elements.len(), elem_ty.clone(), elements.clone()),
+            _ => panic!("vec_push on non-Vec heap object"),
+        };
+        if cur_len + 1 > cur_cap {
+            // ── Phase 1: announce the realloc ─────────────────────────────
+            let new_cap = if cur_cap == 0 { 1 } else { cur_cap * 2 };
+            let other_blocks: Vec<u32> = self.heap.objects.keys()
+                .filter(|a| **a != addr)
+                .map(|a| a.0)
+                .collect();
+            let pre_msg = if other_blocks.is_empty() {
+                format!(
+                    "Vec capacity exceeded ({cur_cap} → {new_cap}); allocator will copy the bytes to a fresh location and free the old block"
+                )
+            } else {
+                let others_str = other_blocks.iter().map(|a| format!("#{a}")).collect::<Vec<_>>().join(", ");
+                format!(
+                    "Vec capacity exceeded ({cur_cap} → {new_cap}); cannot grow in place because heap blocks [{others_str}] occupy the adjacent region — allocator will copy the bytes to a fresh location and free the old block"
+                )
+            };
+            self.events.push(MemEvent::Note {
+                kind: NoteKind::Info,
+                message: pre_msg,
+                span,
+            });
+            // ── Phase 2: realloc (alloc new + copy old contents, free old) ──
+            // The new block holds the OLD elements at the NEW capacity. The
+            // actual push hasn't happened yet — that's phase 3.
+            let copy_obj = HeapObject::Vec {
+                elements: old_elements,
+                capacity: new_cap,
+                elem_ty: elem_ty.clone(),
+            };
+            let new_size = (new_cap * 4) as u32;
+            let new_addr = self.realloc_heap(addr, copy_obj, new_size, span);
+            // ── Phase 3: the actual push, in place on the new buffer ──────
+            if let Some(HeapObject::Vec { elements, .. }) = self.heap.objects.get_mut(&new_addr) {
+                elements.push(value);
+            }
+            let push_display = self.heap.objects.get(&new_addr)
+                .map(heap_object_display)
+                .unwrap_or_default();
+            self.events.push(MemEvent::HeapRealloc {
+                from: new_addr,
+                to: new_addr,
+                new_size,
+                new_display: push_display,
+                span,
+            });
+        } else {
+            // In-place push: just update contents and emit HeapRealloc with
+            // from==to carrying the new display.
+            if let Some(HeapObject::Vec { elements, .. }) = self.heap.objects.get_mut(&addr) {
+                elements.push(value);
+            }
+            let new_display = self.heap.objects.get(&addr)
+                .map(heap_object_display)
+                .unwrap_or_default();
+            self.events.push(MemEvent::HeapRealloc {
+                from: addr,
+                to: addr,
+                new_size: (cur_cap * 4) as u32,
+                new_display,
+                span,
+            });
+        }
+    }
+
+    /// **M07**: String::push_str helper. Doubles capacity on overflow.
+    /// Same stable-addr model as Vec::push.
+    fn string_push_str(&mut self, addr: crate::event::HeapAddr, suffix: &str, span: Span) {
+        let (cur_cap, cur_len) = match self.heap.objects.get(&addr) {
+            Some(HeapObject::Str { capacity, bytes }) => (*capacity, bytes.len()),
+            _ => panic!("string_push_str on non-Str heap object"),
+        };
+        let needed = cur_len + suffix.len();
+        if needed > cur_cap {
+            let mut new_cap = if cur_cap == 0 { 1 } else { cur_cap * 2 };
+            while new_cap < needed { new_cap *= 2; }
+            let new_bytes = match self.heap.objects.get(&addr) {
+                Some(HeapObject::Str { bytes, .. }) => {
+                    let mut b = bytes.clone();
+                    b.push_str(suffix);
+                    b
+                }
+                _ => unreachable!(),
+            };
+            let new_size = new_cap as u32;
+            let new_obj = HeapObject::Str { bytes: new_bytes, capacity: new_cap };
+            self.realloc_heap(addr, new_obj, new_size, span);
+        } else {
+            // In-place: append + emit display update via from==to HeapRealloc.
+            if let Some(HeapObject::Str { bytes, .. }) = self.heap.objects.get_mut(&addr) {
+                bytes.push_str(suffix);
+            }
+            let new_display = self.heap.objects.get(&addr)
+                .map(heap_object_display)
+                .unwrap_or_default();
+            self.events.push(MemEvent::HeapRealloc {
+                from: addr,
+                to: addr,
+                new_size: cur_cap as u32,
+                new_display,
+                span,
+            });
+        }
+    }
+
+    /// **M07**: evaluate `receiver[index]`. Receiver must be a Vec; index any Int.
+    /// Returns a copy of the element (bounds-checked).
+    fn eval_index(&mut self, receiver: &ast::Expr, index: &ast::Expr, span: Span) -> Value {
+        let recv = self.eval_expr(receiver);
+        if self.halted { return Value::Unit; }
+        let idx_v = self.eval_expr(index);
+        if self.halted { return Value::Unit; }
+        let addr = match recv {
+            Value::Vec { addr } => addr,
+            _ => panic!("typeck should reject non-Vec index"),
+        };
+        let i = match idx_v {
+            Value::Int { bits, .. } => bits,
+            _ => panic!("typeck should reject non-Int index"),
+        };
+        let obj = self.heap.objects.get(&addr).expect("vec exists");
+        let elements = if let HeapObject::Vec { elements, .. } = obj { elements } else {
+            panic!("index on non-Vec")
+        };
+        if i < 0 || (i as usize) >= elements.len() {
+            self.emit_runtime_error(
+                format!("index out of bounds: the len is {} but the index is {}", elements.len(), i),
+                span,
+            );
+            return Value::Unit;
+        }
+        elements[i as usize].clone()
     }
 
     /// **M06.1**: look up the binding name of the slot with `slot_id`.
@@ -1033,6 +1548,21 @@ impl<'a> Evaluator<'a> {
     }
 }
 
+/// **M07**: render a heap object's content for display (used in heap panel
+/// labels and realloc Info notes).
+fn heap_object_display(obj: &HeapObject) -> String {
+    match obj {
+        HeapObject::Box(v) => format!("Box = {}", render_value_for_note(v)),
+        HeapObject::Vec { elements, capacity, .. } => {
+            let elems: Vec<String> = elements.iter().map(render_value_for_note).collect();
+            format!("Vec [{}] (cap={})", elems.join(", "), capacity)
+        }
+        HeapObject::Str { bytes, capacity } => {
+            format!("String \"{bytes}\" (cap={capacity})")
+        }
+    }
+}
+
 /// **M06.1**: short value-render for use inside `Note { Info }` messages.
 /// Mirrors `ui::render_value`'s essentials but kept inline here so eval
 /// doesn't depend on ui. References render as their target's resolved
@@ -1055,6 +1585,11 @@ fn render_value_for_note(value: &Value) -> String {
         Value::Ref { mutable, .. } => {
             if *mutable { "&mut _".to_owned() } else { "&_".to_owned() }
         }
+        // M07: heap-owning values render abstractly in notes.
+        Value::Box { .. } => "Box".to_owned(),
+        Value::Vec { .. } => "Vec".to_owned(),
+        Value::String { .. } => "String".to_owned(),
+        Value::Str(s) => format!("\"{s}\""),
     }
 }
 

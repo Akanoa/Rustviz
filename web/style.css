@@ -104,6 +104,65 @@ main > section {
   marker-end: url(#arrow-head-shared);
 }
 
+/* M07: owning arrows (Box/Vec/String -> heap). Black, thicker. */
+#arrow-overlay .arrow-owning {
+  stroke: #000;
+  fill: none;
+  stroke-width: 2;
+  marker-end: url(#arrow-head-owning);
+}
+
+/* M07: heap panel. Each HeapAlloc creates a labeled box. Flex-wrap layout;
+   CSS transition on transform handles realloc moves. */
+#heap {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  padding: 1rem;
+  align-content: flex-start;
+}
+
+.heap-box {
+  display: inline-flex;
+  flex-direction: column;
+  border: 1px solid var(--frame-border);
+  border-radius: 4px;
+  padding: 0.4rem 0.6rem;
+  background: var(--frame-bg);
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-size: 0.85rem;
+  min-width: 80px;
+  transition: transform 300ms ease-out, opacity 200ms;
+}
+
+.heap-box .heap-addr {
+  font-size: 0.7rem;
+  color: var(--muted);
+}
+
+.heap-box .heap-display {
+  font-weight: 500;
+}
+
+/* M07: freed heap blocks stay visible (allocator "free list" pedagogy)
+   but render grayed-out to convey they're available for reuse. */
+.heap-box.heap-freed {
+  opacity: 0.45;
+  border-style: dashed;
+  background: repeating-linear-gradient(
+    45deg,
+    var(--frame-bg),
+    var(--frame-bg) 4px,
+    rgba(0, 0, 0, 0.04) 4px,
+    rgba(0, 0, 0, 0.04) 8px
+  );
+}
+
+.heap-box.heap-freed .heap-display {
+  text-decoration: line-through;
+  color: var(--muted);
+}
+
 #arrow-overlay .arrow-mut {
   stroke: #c62828;
   fill: none;

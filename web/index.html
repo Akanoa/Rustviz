@@ -57,17 +57,20 @@
         <option value="m06_1_assign_basic">Direct assignment (M06.1)</option>
         <option value="m06_1_deref_read">Deref read (M06.1)</option>
         <option value="m06_1_deref_write">Deref write (M06.1)</option>
+        <option value="m07_box">Box (M07)</option>
+        <option value="m07_vec_realloc">Vec realloc (M07)</option>
+        <option value="m07_vec_realloc_blocked">Vec realloc, blocked by Box (M07)</option>
+        <option value="m07_string">String (M07)</option>
       </select>
     </header>
 
     <main>
       <section id="editor" aria-label="source code"></section>
       <section id="stacks" aria-label="stacks panel"></section>
-      <section id="heap" aria-label="heap panel">
-        <p class="placeholder">Heap (Level 3+)</p>
-      </section>
+      <section id="heap" aria-label="heap panel"></section>
       <!-- M06: SVG arrow overlay drawn above all panels. pointer-events:none
-           so clicks pass through to the underlying panels. -->
+           so clicks pass through to the underlying panels. M07 adds a black
+           marker for owning arrows (Box/Vec/String -> heap). -->
       <svg id="arrow-overlay" aria-hidden="true">
         <defs>
           <marker id="arrow-head-shared" viewBox="0 0 10 10" refX="9" refY="5"
@@ -77,6 +80,10 @@
           <marker id="arrow-head-mut" viewBox="0 0 10 10" refX="9" refY="5"
                   markerWidth="6" markerHeight="6" orient="auto-start-reverse">
             <path d="M0,0 L10,5 L0,10 z" fill="#c62828" />
+          </marker>
+          <marker id="arrow-head-owning" viewBox="0 0 10 10" refX="9" refY="5"
+                  markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="#000" />
           </marker>
         </defs>
       </svg>

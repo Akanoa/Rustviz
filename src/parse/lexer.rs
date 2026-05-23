@@ -143,6 +143,64 @@ pub fn lex(file: FileId, source_map: &SourceMap) -> Result<Vec<Token>, ParseErro
             continue;
         }
 
+        // **M07**: string literal `"..."` with escapes `\n`, `\t`, `\\`, `\"`.
+        // No raw strings, no multi-line, ASCII-only contents per L3 scope.
+        if b == b'"' {
+            pos += 1; // consume opening `"`
+            let mut bytes = Vec::new();
+            loop {
+                if pos >= len {
+                    return Err(ParseError {
+                        message: "unterminated string literal".into(),
+                        span: Span::new(start, pos, file),
+                    });
+                }
+                let c = src[pos as usize];
+                if c == b'"' {
+                    pos += 1; // consume closing `"`
+                    break;
+                }
+                if c == b'\\' {
+                    if pos + 1 >= len {
+                        return Err(ParseError {
+                            message: "unterminated string literal".into(),
+                            span: Span::new(start, pos + 1, file),
+                        });
+                    }
+                    let esc = src[(pos + 1) as usize];
+                    let resolved = match esc {
+                        b'n' => b'\n',
+                        b't' => b'\t',
+                        b'\\' => b'\\',
+                        b'"' => b'"',
+                        other => {
+                            return Err(ParseError {
+                                message: format!(
+                                    "invalid escape sequence `\\{}`",
+                                    other as char
+                                ),
+                                span: Span::new(pos, pos + 2, file),
+                            });
+                        }
+                    };
+                    bytes.push(resolved);
+                    pos += 2;
+                    continue;
+                }
+                bytes.push(c);
+                pos += 1;
+            }
+            let s = String::from_utf8(bytes).map_err(|_| ParseError {
+                message: "string literal contains invalid UTF-8".into(),
+                span: Span::new(start, pos, file),
+            })?;
+            tokens.push(Token {
+                kind: TokenKind::Str(s),
+                span: Span::new(start, pos, file),
+            });
+            continue;
+        }
+
         // Identifier or keyword: `[A-Za-z_][A-Za-z0-9_]*`.
         if b.is_ascii_alphabetic() || b == b'_' {
             while pos < len {
@@ -221,7 +279,15 @@ pub fn lex(file: FileId, source_map: &SourceMap) -> Result<Vec<Token>, ParseErro
             (b'}', _) => (TokenKind::RBrace, 1),
             (b',', _) => (TokenKind::Comma, 1),
             (b';', _) => (TokenKind::Semi, 1),
+            // **M07**: `::` as a single token (path separator).
+            (b':', Some(b':')) => (TokenKind::ColonColon, 2),
             (b':', _) => (TokenKind::Colon, 1),
+            // **M07**: `.`, `[`, `]` as single-char tokens. The numeric-literal
+            // lexer arm consumes `.digit` greedily for floats; bare `.` reaches
+            // here only as the postfix method-call separator.
+            (b'.', _) => (TokenKind::Dot, 1),
+            (b'[', _) => (TokenKind::LBracket, 1),
+            (b']', _) => (TokenKind::RBracket, 1),
             _ => {
                 // Unknown character. Compute next UTF-8 boundary so the span is
                 // valid for multi-byte characters that landed here erroneously.

@@ -464,6 +464,113 @@ mod tests {
         assert_eq!(err.stage, CompileStage::Typeck);
     }
 
+    // M07 / US1: Box owning arrow + HeapAlloc/Free.
+
+    #[test]
+    fn run_pipeline_box_basic() {
+        let source = "fn main() { let b = Box::new(5); }";
+        let events = run_pipeline(source).expect("box compiles");
+        let alloc_count = events.iter().filter(|e| matches!(e, crate::MemEvent::HeapAlloc { .. })).count();
+        let free_count = events.iter().filter(|e| matches!(e, crate::MemEvent::HeapFree { .. })).count();
+        assert_eq!(alloc_count, 1, "expected exactly 1 HeapAlloc");
+        assert_eq!(free_count, 1, "expected exactly 1 HeapFree");
+    }
+
+    #[test]
+    fn run_pipeline_box_deref_read() {
+        let source = "fn main() { let b = Box::new(42); let y = *b; }";
+        let events = run_pipeline(source).expect("box deref compiles");
+        let has_42 = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite { value: crate::Value::Int { bits: 42, .. }, .. }
+        ));
+        assert!(has_42, "expected y to be written with value 42 (via *b)");
+    }
+
+    // M07 / US2: Vec realloc + dangling.
+
+    #[test]
+    fn run_pipeline_vec_push_grows() {
+        let source = "fn main() {
+            let mut v: Vec<i32> = Vec::new();
+            v.push(1);
+            v.push(2);
+            v.push(3);
+        }";
+        let events = run_pipeline(source).expect("vec push compiles");
+        // Vec::new emits 1 HeapAlloc (cap 0). Pushes 1,2,3 each cross a
+        // capacity boundary (0→1, 1→2, 2→4) = 3 HeapReallocs.
+        let realloc_count = events.iter().filter(|e| matches!(e, crate::MemEvent::HeapRealloc { .. })).count();
+        assert!(realloc_count >= 2, "expected ≥ 2 HeapReallocs for capacity-growing pushes, got {realloc_count}");
+    }
+
+    #[test]
+    fn run_pipeline_vec_index_basic() {
+        let source = "fn main() {
+            let mut v: Vec<i32> = Vec::new();
+            v.push(5);
+            let x = v[0];
+        }";
+        let events = run_pipeline(source).expect("vec index compiles");
+        let has_5 = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite { value: crate::Value::Int { bits: 5, .. }, .. }
+        ));
+        assert!(has_5, "expected x = v[0] = 5");
+    }
+
+    #[test]
+    fn run_pipeline_vec_index_oob() {
+        let source = "fn main() {
+            let v: Vec<i32> = Vec::new();
+            let x = v[0];
+        }";
+        let events = run_pipeline(source).expect("vec OOB compiles; halts at runtime");
+        let has_oob = events.iter().any(|e| matches!(e,
+            crate::MemEvent::Note { kind: crate::NoteKind::RuntimeError, message, .. }
+                if message.contains("index out of bounds")
+        ));
+        assert!(has_oob, "expected runtime error for OOB index");
+    }
+
+    #[test]
+    fn run_pipeline_vec_dangling_borrow() {
+        // The headline demo: &v[0] becomes dangling after v.push triggers
+        // a realloc.
+        let source = "fn main() {
+            let mut v: Vec<i32> = Vec::new();
+            v.push(1);
+            v.push(2);
+            let r = &v[0];
+            v.push(3);
+        }";
+        let events = run_pipeline(source).expect("vec dangling compiles");
+        let has_dangling = events.iter().any(|e| matches!(e,
+            crate::MemEvent::Note { kind: crate::NoteKind::RuntimeError, message, .. }
+                if message.contains("dangling reference")
+        ));
+        assert!(has_dangling, "expected dangling-reference RuntimeError at realloc");
+    }
+
+    // M07 / US3: String.
+
+    #[test]
+    fn run_pipeline_string_from() {
+        let source = "fn main() { let s = String::from(\"hi\"); }";
+        let events = run_pipeline(source).expect("String compiles");
+        let alloc_count = events.iter().filter(|e| matches!(e, crate::MemEvent::HeapAlloc { .. })).count();
+        assert_eq!(alloc_count, 1);
+    }
+
+    #[test]
+    fn run_pipeline_string_push_str_realloc() {
+        let source = "fn main() {
+            let mut s = String::from(\"hi\");
+            s.push_str(\"world\");
+        }";
+        let events = run_pipeline(source).expect("String push_str compiles");
+        let realloc_count = events.iter().filter(|e| matches!(e, crate::MemEvent::HeapRealloc { .. })).count();
+        assert!(realloc_count >= 1, "expected ≥ 1 HeapRealloc when push_str grows capacity");
+    }
+
     #[test]
     fn compile_error_serde_roundtrip() {
         let err = run_pipeline("fn main() { let x = ; }").expect_err("parse error");
