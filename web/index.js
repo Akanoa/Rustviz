@@ -229,12 +229,21 @@ function render(state) {
 
   // **M07**: render the heap panel BEFORE arrows so the heap-box DOM
   // elements exist when renderArrows queries `data-heap-addr` positions.
+  // **M07.2**: render the static-memory region too, for the same reason —
+  // slice arrows targeting `&'static str` literals query `data-static-addr`.
+  renderStaticRegion(state.static_region || []);
   renderHeap(state.heap || []);
 
   // M06.1 → M07: render arrows LAST, after the status bar AND heap have
   // taken their final layout. Use requestAnimationFrame so the browser has
   // flushed all DOM mutations before getBoundingClientRect.
-  requestAnimationFrame(() => renderArrows(state.arrows || []));
+  // **M07.2**: transient copy arrow rendered alongside the regular arrows
+  // — only present on the BytesCopy cursor step (otherwise pending_copy
+  // is null and renderCopyArrow is a no-op).
+  requestAnimationFrame(() => {
+    renderArrows(state.arrows || []);
+    renderCopyArrow(state.pending_copy || null);
+  });
 }
 
 // M05 / US2: render a compile error. Underline the span, show the message
@@ -283,6 +292,7 @@ function renderArrows(arrows) {
   const targetKey = (a) =>
     a.target && a.target.Slot !== undefined ? `s${a.target.Slot}`
     : a.target && a.target.Heap !== undefined ? `h${a.target.Heap}`
+    : a.target && a.target.Static !== undefined ? `t${a.target.Static}`
     : "?";
   const sourceKey = (a) => `s${a.source_slot}`;
   const byTarget = new Map();
@@ -314,6 +324,12 @@ function renderArrows(arrows) {
     } else if (a.target && a.target.Heap !== undefined) {
       tgtEl = document.querySelector(`[data-heap-addr="${a.target.Heap}"]`);
       targetIsHeap = true;
+    } else if (a.target && a.target.Static !== undefined) {
+      // **M07.2**: slice arrow targeting a static-memory block. Static
+      // blocks live in their own region between stacks and heap; route
+      // arrows to them the same way as heap targets (enter from above).
+      tgtEl = document.querySelector(`[data-static-addr="${a.target.Static}"]`);
+      targetIsHeap = true; // reuse the "enter from above" routing
     }
     if (!srcEl || !tgtEl) continue;
     const src = srcEl.getBoundingClientRect();
@@ -369,27 +385,96 @@ function renderArrows(arrows) {
               : a.kind === "Owning" ? "arrow-owning"
               : "arrow-shared";
     path.setAttribute("class", cls);
+    // **M07.2**: add an invisible wider "hit-target" path with the same
+    // geometry, appended BEFORE the visible path so the visible line
+    // stays on top visually. SVG `pointer-events: stroke` uses the actual
+    // stroke width for hit-testing, so a wider transparent stroke is the
+    // only standard way to expand the hover-detection zone without
+    // thickening the visible line. CSS targets `.arrow-hit-target`
+    // (stroke-width 5px: ~1.5px visible + ~3.5px detection padding).
+    const hitTarget = document.createElementNS(NS, "path");
+    hitTarget.setAttribute("d", d);
+    hitTarget.setAttribute("class", "arrow-hit-target");
+    // Use :has() in CSS to apply the visual hover style (color, drop-
+    // shadow, stroke-width) to the visible sibling path when the
+    // hit-target is hovered. The visible path itself has
+    // pointer-events:none so all hover dispatching goes through the
+    // hit-target — letting the hit-target be the source of mouseenter/
+    // mouseleave events for the slice-highlight handler too.
+    overlay.appendChild(hitTarget);
     overlay.appendChild(path);
+
+    // **M07.1**: slice arrows carry a length annotation. When `len` is
+    // present, render a small `[len: N]` label near the arrowhead.
+    // **M07.2 fix**: the label is hidden by default and only revealed on
+    // hover of the corresponding arrow — keeps the visualization clean
+    // when many slices coexist (multiple labels overlapping with each
+    // other or with adjacent block headers was confusing). Created
+    // upfront so the hover handler below can toggle its visibility.
+    let lenLabel = null;
+    if (a.len !== undefined && a.len !== null) {
+      lenLabel = document.createElementNS(NS, "text");
+      let labelX, labelY;
+      if (targetIsHeap) {
+        const tList = byTarget.get(targetKey(a));
+        const tIdx = tList.indexOf(a);
+        labelX = tgt.left + tgt.width - overlayBox.left + 6;
+        labelY = tgt.top - overlayBox.top + 10 + tIdx * 14;
+      } else {
+        const tList = byTarget.get(targetKey(a));
+        const tIdx = tList.indexOf(a);
+        const yOffsetTgt = distOffset(tgt.height, tIdx, tList.length);
+        const globalNudge = (arrIdx - (arrows.length - 1) / 2) * 4;
+        const x2 = tgt.left - overlayBox.left;
+        const y2 = tgt.top + tgt.height / 2 + yOffsetTgt + globalNudge - overlayBox.top;
+        labelX = x2 - 36;
+        labelY = y2 - 4;
+      }
+      lenLabel.setAttribute("x", String(labelX));
+      lenLabel.setAttribute("y", String(labelY));
+      lenLabel.setAttribute("class", "arrow-len-label");
+      lenLabel.textContent = `[len: ${a.len}]`;
+      overlay.appendChild(lenLabel);
+    }
 
     // **M07.1**: slice arrows highlight their covered region in the target
     // heap block on hover — both the byte-cells (byte_offset + byte_len)
     // AND the element-span labels (elem_start + len). For `&v[1..3]` of
     // Vec<i32>: bytes [4, 12) light up alongside elements `2_i32, 3_i32`
-    // in the display string.
+    // in the display string. **M07.2**: also toggles the `[len: N]`
+    // label's visibility (hidden by default, shown on hover).
     if (
       targetIsHeap
       && a.byte_offset !== undefined && a.byte_offset !== null
       && a.byte_len !== undefined && a.byte_len !== null
     ) {
-      const heapBox = document.querySelector(`[data-heap-addr="${a.target.Heap}"]`);
-      const cellsEl = heapBox ? heapBox.querySelector(".heap-cells") : null;
-      const dispEl = heapBox ? heapBox.querySelector(".heap-display") : null;
+      // **M07.2**: target may be a heap block OR a static-memory block.
+      // - Heap blocks: byte-cells in `.heap-cells`; element labels in
+      //   `.heap-display` indexed by `elem_start` + `len` (Vec elements).
+      // - Static blocks: byte-cells in `.static-cells`; byte spans in
+      //   `.static-display` indexed by `byte_offset` + `byte_len` (1 byte
+      //   = 1 char for our ASCII model — so hovering `&s[..2]` lights up
+      //   bytes 0-1 of `"hello"`, i.e. `he`).
+      const isStatic = a.target.Static !== undefined;
+      const targetBox = isStatic
+        ? document.querySelector(`[data-static-addr="${a.target.Static}"]`)
+        : document.querySelector(`[data-heap-addr="${a.target.Heap}"]`);
+      const cellsEl = targetBox
+        ? targetBox.querySelector(isStatic ? ".static-cells" : ".heap-cells")
+        : null;
+      const dispEl = targetBox
+        ? targetBox.querySelector(isStatic ? ".static-display" : ".heap-display")
+        : null;
       const byteStart = Number(a.byte_offset);
       const byteEnd = byteStart + Number(a.byte_len);
-      const elemStart = a.elem_start !== undefined && a.elem_start !== null
-        ? Number(a.elem_start) : null;
-      const elemEnd = elemStart !== null && a.len !== undefined && a.len !== null
-        ? elemStart + Number(a.len) : null;
+      // For Vec slices, element-span highlight uses elem_start + len.
+      // For static slices, it uses byte_offset + byte_len (1:1 byte/char).
+      const [elemStart, elemEnd] = isStatic
+        ? [byteStart, byteEnd]
+        : (a.elem_start !== undefined && a.elem_start !== null
+            && a.len !== undefined && a.len !== null
+            ? [Number(a.elem_start), Number(a.elem_start) + Number(a.len)]
+            : [null, null]);
       const setHighlight = (on) => {
         if (cellsEl) {
           for (let i = byteStart; i < byteEnd && i < cellsEl.children.length; i++) {
@@ -402,49 +487,106 @@ function renderArrows(arrows) {
             if (span) span.classList.toggle("elem-slice-highlighted", on);
           }
         }
+        // M07.2: reveal the [len: N] label on hover; hide on leave.
+        if (lenLabel) lenLabel.classList.toggle("label-visible", on);
       };
-      path.addEventListener("mouseenter", () => setHighlight(true));
-      path.addEventListener("mouseleave", () => setHighlight(false));
+      // M07.2: events fire on the wider hit-target, not the visible path.
+      hitTarget.addEventListener("mouseenter", () => setHighlight(true));
+      hitTarget.addEventListener("mouseleave", () => setHighlight(false));
+    } else if (lenLabel) {
+      // Slice arrow without byte-range (shouldn't happen post-M07.1, but
+      // be defensive): still wire label visibility to hover.
+      hitTarget.addEventListener("mouseenter", () => lenLabel.classList.add("label-visible"));
+      hitTarget.addEventListener("mouseleave", () => lenLabel.classList.remove("label-visible"));
     }
+  }
+}
 
-    // **M07.1**: slice arrows carry a length annotation. When `len` is
-    // present, render a small `[len: N]` label near the arrowhead so the
-    // learner sees the fat-pointer's length alongside the data-pointer arrow.
-    if (a.len !== undefined && a.len !== null) {
-      const label = document.createElementNS(NS, "text");
-      // Position: just above the arrowhead's V-segment start for heap targets
-      // (the laneY/targetX point), or above the H-bend for slot targets.
-      // For both routings we have the final approach segment; mid-X near the
-      // arrowhead with a small Y offset reads well without crowding the
-      // arrowhead marker.
-      let labelX, labelY;
-      if (targetIsHeap) {
-        // Recompute the per-arrow X distribution so the label sits next to
-        // THIS arrow's actual landing column (not the block's midpoint).
-        const tList = byTarget.get(targetKey(a));
-        const tIdx = tList.indexOf(a);
-        const xOffsetTgt = distOffset(tgt.width, tIdx, tList.length);
-        const targetX = tgt.left + tgt.width / 2 + xOffsetTgt - overlayBox.left;
-        const laneY = tgt.top - 20 - arrIdx * 6 - overlayBox.top;
-        // Place mid-way between laneY and target top, slightly to the right
-        // of the descending V segment so it doesn't sit on the arrow line.
-        labelX = targetX + 6;
-        labelY = laneY + 10;
-      } else {
-        const tList = byTarget.get(targetKey(a));
-        const tIdx = tList.indexOf(a);
-        const yOffsetTgt = distOffset(tgt.height, tIdx, tList.length);
-        const globalNudge = (arrIdx - (arrows.length - 1) / 2) * 4;
-        const x2 = tgt.left - overlayBox.left;
-        const y2 = tgt.top + tgt.height / 2 + yOffsetTgt + globalNudge - overlayBox.top;
-        labelX = x2 - 36;
-        labelY = y2 - 4;
+// **M07.2**: render the transient "bytes copied" arrow. Fires only on the
+// cursor step where a `BytesCopy` event is current — `pending_copy` is
+// null at all other steps. The arrow is orange + dashed + auto-fades in,
+// visually distinct from blue/red/black ownership/borrow arrows so the
+// learner reads it as "data flow", not "permanent pointer". A small
+// "copy N bytes" label sits alongside. Also highlights the source
+// byte-cells AND char spans covered by the copy so the learner sees
+// exactly which bytes flowed.
+function renderCopyArrow(pendingCopy) {
+  // Always clear any stale copy-source highlights from the previous step.
+  for (const el of document.querySelectorAll(".byte-copy-source-highlighted")) {
+    el.classList.remove("byte-copy-source-highlighted");
+  }
+  for (const el of document.querySelectorAll(".elem-copy-source-highlighted")) {
+    el.classList.remove("elem-copy-source-highlighted");
+  }
+  if (!pendingCopy) return;
+  const overlay = document.getElementById("arrow-overlay");
+  if (!overlay) return;
+  const NS = "http://www.w3.org/2000/svg";
+
+  // Resolve source DOM element.
+  let srcEl = null;
+  let srcIsStatic = false;
+  if (pendingCopy.from.Slot !== undefined) {
+    srcEl = document.querySelector(`[data-slot-id="${pendingCopy.from.Slot}"]`);
+  } else if (pendingCopy.from.Heap !== undefined) {
+    srcEl = document.querySelector(`[data-heap-addr="${pendingCopy.from.Heap}"]`);
+  } else if (pendingCopy.from.Static !== undefined) {
+    srcEl = document.querySelector(`[data-static-addr="${pendingCopy.from.Static}"]`);
+    srcIsStatic = true;
+  }
+  const tgtEl = document.querySelector(`[data-heap-addr="${pendingCopy.to}"]`);
+  if (!srcEl || !tgtEl) return;
+
+  const overlayBox = overlay.getBoundingClientRect();
+  const src = srcEl.getBoundingClientRect();
+  const tgt = tgtEl.getBoundingClientRect();
+
+  // Route: a direct angled line from the source's right edge to the
+  // target's left edge. Curved (quadratic bezier) for a "flowing" feel.
+  const x1 = src.right - overlayBox.left;
+  const y1 = src.top + src.height / 2 - overlayBox.top;
+  const x2 = tgt.left - overlayBox.left;
+  const y2 = tgt.top + tgt.height / 2 - overlayBox.top;
+  // Control point: midpoint, bowed downward slightly so the curve doesn't
+  // overlap straight horizontal arrows above.
+  const mx = (x1 + x2) / 2;
+  const my = (y1 + y2) / 2 + 20;
+  const d = `M${x1},${y1} Q${mx},${my} ${x2},${y2}`;
+
+  const path = document.createElementNS(NS, "path");
+  path.setAttribute("d", d);
+  path.setAttribute("class", "arrow-copy");
+  overlay.appendChild(path);
+
+  // "copy N bytes" label near the curve's apex.
+  const label = document.createElementNS(NS, "text");
+  label.setAttribute("x", String(mx));
+  label.setAttribute("y", String(my + 14));
+  label.setAttribute("class", "arrow-copy-label");
+  label.setAttribute("text-anchor", "middle");
+  label.textContent = `copy ${pendingCopy.n_bytes} byte${pendingCopy.n_bytes === 1 ? "" : "s"}`;
+  overlay.appendChild(label);
+
+  // Highlight the source bytes/chars covered by this copy. The byte-cells
+  // are inside `.heap-cells` (heap source) or `.static-cells` (static
+  // source). For static sources, also highlight the char spans inside
+  // `.static-display` since static blocks segment their display per byte.
+  const cellsSelector = srcIsStatic ? ".static-cells" : ".heap-cells";
+  const cellsEl = srcEl.querySelector(cellsSelector);
+  const byteStart = Number(pendingCopy.from_byte_offset);
+  const byteEnd = byteStart + Number(pendingCopy.n_bytes);
+  if (cellsEl) {
+    for (let i = byteStart; i < byteEnd && i < cellsEl.children.length; i++) {
+      cellsEl.children[i].classList.add("byte-copy-source-highlighted");
+    }
+  }
+  if (srcIsStatic) {
+    const dispEl = srcEl.querySelector(".static-display");
+    if (dispEl) {
+      for (let i = byteStart; i < byteEnd; i++) {
+        const span = dispEl.querySelector(`[data-elem-idx="${i}"]`);
+        if (span) span.classList.add("elem-copy-source-highlighted");
       }
-      label.setAttribute("x", String(labelX));
-      label.setAttribute("y", String(labelY));
-      label.setAttribute("class", "arrow-len-label");
-      label.textContent = `[len: ${a.len}]`;
-      overlay.appendChild(label);
     }
   }
 }
@@ -489,6 +631,107 @@ function renderHeapDisplay(dispEl, display) {
     dispEl.appendChild(span);
   });
   dispEl.appendChild(document.createTextNode("]" + (suffix || "")));
+}
+
+// **M07.2**: render a static block's display, segmenting each byte into
+// `<span class="elem-cell" data-elem-idx="i">` so the slice-hover handler
+// can highlight individual bytes. Surrounding quotes are plain text so
+// they don't get highlighted (only the inner bytes do).
+function renderStaticDisplay(dispEl, bytes) {
+  dispEl.textContent = ""; // clear prior contents
+  dispEl.appendChild(document.createTextNode("\""));
+  for (let i = 0; i < bytes.length; i++) {
+    const span = document.createElement("span");
+    span.className = "elem-cell";
+    span.setAttribute("data-elem-idx", String(i));
+    // Render visible escape sequences for the common pedagogically-relevant
+    // bytes (newline, tab, backslash, quote) so they show as `\n` rather
+    // than collapsing into whitespace in the UI.
+    const c = bytes[i];
+    if (c === "\n") span.textContent = "\\n";
+    else if (c === "\t") span.textContent = "\\t";
+    else if (c === "\\") span.textContent = "\\\\";
+    else if (c === "\"") span.textContent = "\\\"";
+    else span.textContent = c;
+    dispEl.appendChild(span);
+  }
+  dispEl.appendChild(document.createTextNode("\""));
+}
+
+// **M07.2**: render the static-memory region. Each StaticView is one
+// read-only block holding a string literal's bytes. Persists for the
+// trace's lifetime — once a block is rendered, it stays. Re-used across
+// renders via `staticElements: Map<addr, HTMLElement>` so slice arrows
+// targeting `data-static-addr` can resolve consistently.
+const staticElements = new Map();
+function renderStaticRegion(staticRegion) {
+  const region = document.getElementById("static");
+  if (!region) return;
+  // Find or create the inner container (header sibling).
+  let container = region.querySelector(".static-blocks");
+  if (!container) {
+    container = document.createElement("div");
+    container.className = "static-blocks";
+    region.appendChild(container);
+  }
+  const seenAddrs = new Set();
+  for (const s of staticRegion) {
+    seenAddrs.add(s.addr);
+    let block = staticElements.get(s.addr);
+    if (!block) {
+      block = document.createElement("div");
+      block.className = "static-block";
+      block.setAttribute("data-static-addr", String(s.addr));
+      const addr = document.createElement("div");
+      addr.className = "static-addr";
+      addr.textContent = `static #${s.addr} (${s.size}B)`;
+      const disp = document.createElement("div");
+      disp.className = "static-display";
+      const cells = document.createElement("div");
+      cells.className = "static-cells";
+      block.appendChild(addr);
+      block.appendChild(disp);
+      block.appendChild(cells);
+      container.appendChild(block);
+      staticElements.set(s.addr, block);
+    }
+    // **M07.2**: segment each byte of the string into its own
+    // `<span data-elem-idx="i">` so the slice-hover handler can light up
+    // the bytes covered by the slice (e.g. hovering `&s[..2]` highlights
+    // `he` in `"hello"`). The surrounding quotes are rendered as plain
+    // text. For ASCII (the only case M07.2 handles), 1 byte = 1 displayed
+    // char, so byte index = element index directly.
+    renderStaticDisplay(block.querySelector(".static-display"), s.bytes);
+    // Byte-cells: one per byte, all filled (static blocks have no
+    // "capacity vs used" distinction — every byte is real content).
+    const cellsEl = block.querySelector(".static-cells");
+    while (cellsEl.children.length < s.size) {
+      const c = document.createElement("span");
+      c.className = "byte-cell";
+      cellsEl.appendChild(c);
+    }
+    while (cellsEl.children.length > s.size) {
+      cellsEl.removeChild(cellsEl.lastChild);
+    }
+  }
+  // Static blocks NEVER disappear — once interned, they persist.
+  // No cleanup phase needed (in contrast to renderHeap which removes
+  // freed blocks). If `staticRegion` shrinks across re-renders (e.g.
+  // due to cursor rewind), elements stay in DOM but won't be in the
+  // current snapshot. This matches the "static memory is forever"
+  // pedagogy AND avoids fighting the player cursor on rewind — when
+  // the cursor moves backward past a StaticAlloc event, the static
+  // block stays visible because it'll appear again on forward step.
+  //
+  // Actually we DO need rewind support: on rewind, the snapshot won't
+  // include that block; remove stale DOM elements so the visualization
+  // matches the trace state.
+  for (const [addr, el] of [...staticElements.entries()]) {
+    if (!seenAddrs.has(addr)) {
+      el.remove();
+      staticElements.delete(addr);
+    }
+  }
 }
 
 // **M07**: render the heap panel. Each HeapView in state.heap becomes a

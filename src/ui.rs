@@ -56,10 +56,58 @@ pub struct StateSnapshot {
     /// **M07**: live heap allocations at this cursor position. JS renders
     /// these as boxes in the heap panel.
     pub heap: Vec<HeapView>,
+    /// **M07.2**: static-memory blocks (read-only data segment). One per
+    /// unique string-literal content, content-deduplicated. Never shrinks
+    /// — static blocks persist for the trace's lifetime. JS renders these
+    /// as blocks in a separate "static memory (RO)" region between the
+    /// stacks and heap panels.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub static_region: Vec<StaticView>,
+    /// **M07.2**: present when the most recent event is `BytesCopy` (fired
+    /// by `String::from` / `push_str`). The UI renders a transient orange
+    /// dashed arrow from the source region to the destination heap block
+    /// at this cursor step only — making the copy that would otherwise
+    /// be invisible (bytes "magically" appearing in the heap) explicit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_copy: Option<CopyView>,
     /// Cursor position (mirrors `Cursor::position`).
     pub position: usize,
     /// Total events in the trace.
     pub total: usize,
+}
+
+/// **M07.2**: transient "bytes copied" indication. Set on `StateSnapshot`
+/// when the most recent event is `MemEvent::BytesCopy`; cleared on the
+/// next step. Drives a one-shot orange arrow render in the JS layer
+/// PLUS highlights the source byte-cells and char spans covered by the
+/// copy — making "these specific bytes flowed into this block" tangible.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CopyView {
+    /// Source region (Slot / Heap / Static).
+    pub from: ArrowTarget,
+    /// Byte offset within the source block where the copied range starts.
+    /// Pairs with `n_bytes` to identify the highlighted byte-cell range.
+    pub from_byte_offset: u32,
+    /// Destination heap block.
+    pub to: u32,
+    /// Bytes copied.
+    pub n_bytes: u32,
+}
+
+/// **M07.2**: one static-memory block. Holds raw bytes for a unique string
+/// literal. Persists for the trace's lifetime — there is no equivalent of
+/// `HeapFree` for static blocks.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StaticView {
+    /// Identifier (matches the `StaticAddr.0` in events).
+    pub addr: u32,
+    /// Raw bytes (already-processed string after lexer escape resolution).
+    pub bytes: String,
+    /// Size in bytes (= `bytes.len()`).
+    pub size: u32,
+    /// Pre-rendered display label (e.g. `"\"hi\""` with surrounding quotes
+    /// for visual clarity in the UI).
+    pub display: String,
 }
 
 /// **M06 (restructured in M07)**: one active arrow as seen by the renderer.
@@ -96,13 +144,16 @@ pub struct ArrowView {
     pub elem_start: Option<u64>,
 }
 
-/// **M07**: arrow target — slot (for borrows-of-locals) or heap (for borrows-of-heap and ownership).
+/// **M07**: arrow target — slot (for borrows-of-locals), heap (for borrows-of-heap
+/// and ownership), or static memory (for `&'static str` literals — M07.2).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum ArrowTarget {
     /// Stack slot (M06's case, kept).
     Slot(u32),
     /// Heap allocation (M07's case).
     Heap(u32),
+    /// **M07.2**: static-memory block (StaticAddr.0). Read-only; never freed.
+    Static(u32),
 }
 
 /// **M07**: arrow visual kind.
@@ -236,6 +287,9 @@ impl Cursor {
         let editor_highlight = last.map(event_span);
         let status = last.and_then(note_to_status);
         let pending_return = last.and_then(return_to_pending);
+        // M07.2: transient copy arrow indicator. Set only on the BytesCopy
+        // cursor step; cleared on next step.
+        let pending_copy = last.and_then(copy_to_pending);
         // M03.1: the currently-executing frame is the topmost active frame in
         // the stack. All other active frames are paused callers waiting for
         // their callee to return; grayed frames have already returned.
@@ -265,6 +319,8 @@ impl Cursor {
                     target: match b.target {
                         BorrowTarget::Slot(id) => ArrowTarget::Slot(id),
                         BorrowTarget::Heap(addr) => ArrowTarget::Heap(addr),
+                        // M07.2: &'static str borrows target the static region.
+                        BorrowTarget::Static(addr) => ArrowTarget::Static(addr),
                     },
                     kind: if b.mutable { ArrowKind::Mut } else { ArrowKind::Shared },
                     // M07.1: slice borrows carry length + byte-range + element
@@ -298,6 +354,9 @@ impl Cursor {
             used: h.used,
             freed: h.freed,
         }).collect::<Vec<HeapView>>();
+        // M07.2: clone the static region for the snapshot. Static blocks
+        // persist; this is just a read-only view.
+        let static_region = world.static_region.clone();
         StateSnapshot {
             frames: world
                 .frames
@@ -310,6 +369,8 @@ impl Cursor {
             pending_return,
             arrows,
             heap,
+            static_region,
+            pending_copy,
             position: self.position,
             total: self.trace.len(),
         }
@@ -331,6 +392,10 @@ struct World {
     /// Value::Box/Vec/String. Removed when the heap addr is freed OR when
     /// the slot is overwritten with a different value.
     owning: Vec<OwningState>,
+    /// **M07.2**: static-memory blocks (one per unique string-literal content,
+    /// deduplicated). Push on StaticAlloc; never remove (static memory
+    /// persists for the trace's lifetime).
+    static_region: Vec<StaticView>,
 }
 
 struct ActiveBorrowState {
@@ -359,6 +424,8 @@ struct ActiveBorrowState {
 enum BorrowTarget {
     Slot(u32),
     Heap(u32),
+    /// **M07.2**: borrow into the static-memory region (StaticAddr.0).
+    Static(u32),
 }
 
 struct HeapAllocState {
@@ -548,6 +615,7 @@ fn apply_event(world: &mut World, event: &MemEvent) {
             let t = match target {
                 crate::event::Pointee::Slot(id) => BorrowTarget::Slot(id.0),
                 crate::event::Pointee::Heap(addr) => BorrowTarget::Heap(addr.0),
+                crate::event::Pointee::Static(addr) => BorrowTarget::Static(addr.0),
             };
             world.borrows.push(ActiveBorrowState {
                 borrow_id: borrow_id.0,
@@ -564,6 +632,7 @@ fn apply_event(world: &mut World, event: &MemEvent) {
             let t = match target {
                 crate::event::Pointee::Slot(id) => BorrowTarget::Slot(id.0),
                 crate::event::Pointee::Heap(addr) => BorrowTarget::Heap(addr.0),
+                crate::event::Pointee::Static(addr) => BorrowTarget::Static(addr.0),
             };
             world.borrows.push(ActiveBorrowState {
                 borrow_id: borrow_id.0,
@@ -648,8 +717,20 @@ fn apply_event(world: &mut World, event: &MemEvent) {
             }
             world.owning.retain(|o| o.target_heap != addr.0);
         }
+        // **M07.2**: static-memory block allocation (fires once per unique
+        // literal content). Push to the static region; never remove.
+        MemEvent::StaticAlloc { addr, bytes, .. } => {
+            let size = bytes.len() as u32;
+            world.static_region.push(StaticView {
+                addr: addr.0,
+                bytes: bytes.clone(),
+                size,
+                display: format!("\"{bytes}\""),
+            });
+        }
         // The remaining variants don't modify world state. `Note` surfaces via
-        // `note_to_status` on the most-recent-event side path.
+        // `note_to_status`; `BytesCopy` surfaces via `pending_copy` on the
+        // most-recent-event side path.
         MemEvent::SlotMove { .. }
         | MemEvent::LockAcquire { .. }
         | MemEvent::LockRelease { .. }
@@ -658,7 +739,8 @@ fn apply_event(world: &mut World, event: &MemEvent) {
         | MemEvent::ThreadSpawn { .. }
         | MemEvent::ThreadJoin { .. }
         | MemEvent::ThreadPark { .. }
-        | MemEvent::Note { .. } => {
+        | MemEvent::Note { .. }
+        | MemEvent::BytesCopy { .. } => {
             // No world-state change.
         }
     }
@@ -710,6 +792,25 @@ fn return_to_pending(event: &MemEvent) -> Option<PendingReturnView> {
     }
 }
 
+/// **M07.2**: extract the transient `pending_copy` view from a
+/// `MemEvent::BytesCopy`; `None` for any other variant. Drives the
+/// one-shot orange arrow render in the JS layer.
+fn copy_to_pending(event: &MemEvent) -> Option<CopyView> {
+    match event {
+        MemEvent::BytesCopy { from, from_byte_offset, to, n_bytes, .. } => Some(CopyView {
+            from: match from {
+                crate::event::Pointee::Slot(id) => ArrowTarget::Slot(id.0),
+                crate::event::Pointee::Heap(addr) => ArrowTarget::Heap(addr.0),
+                crate::event::Pointee::Static(addr) => ArrowTarget::Static(addr.0),
+            },
+            from_byte_offset: *from_byte_offset,
+            to: to.0,
+            n_bytes: *n_bytes,
+        }),
+        _ => None,
+    }
+}
+
 /// **M06.1**: look up the binding name of the slot with `slot_id` anywhere
 /// in the call stack's live frames. Used by SlotWrite's render path so
 /// `Value::Ref { target_slot: 0 }` renders as `&x` (the binding name) rather
@@ -755,6 +856,9 @@ fn render_value(value: &Value) -> String {
             let target_str = match target {
                 crate::event::Pointee::Slot(id) => format!("slot{}", id.0),
                 crate::event::Pointee::Heap(addr) => format!("heap[{}]", addr.0),
+                // M07.2: unreachable in practice (only Value::Slice targets
+                // static memory; Value::Ref never does), but exhaustive.
+                crate::event::Pointee::Static(addr) => format!("static[{}]", addr.0),
             };
             if *mutable {
                 format!("&mut {target_str}")
@@ -767,12 +871,15 @@ fn render_value(value: &Value) -> String {
         Value::Box { addr } => format!("Box→heap[{}]", addr.0),
         Value::Vec { addr } => format!("Vec→heap[{}]", addr.0),
         Value::String { addr } => format!("String→heap[{}]", addr.0),
-        Value::Str(s) => format!("\"{s}\""),
         // M07.1: slice fallback render. Normal path (SlotWrite) uses empty
         // text because the arrow + length-annotation conveys everything.
         Value::Slice { target, len, .. } => match target {
             crate::event::Pointee::Heap(addr) => format!("&heap[{}; {len}]", addr.0),
             crate::event::Pointee::Slot(id) => format!("&slot{}; {len}]", id.0),
+            // M07.2: `&str` literals render with their content if available;
+            // fallback path doesn't have the static-region lookup, so just
+            // show the addr + len.
+            crate::event::Pointee::Static(addr) => format!("&static[{}; {len}]", addr.0),
         },
     }
 }
@@ -796,6 +903,8 @@ fn event_span(event: &MemEvent) -> Span {
         | MemEvent::HeapAlloc { span, .. }
         | MemEvent::HeapRealloc { span, .. }
         | MemEvent::HeapFree { span, .. }
+        | MemEvent::StaticAlloc { span, .. }
+        | MemEvent::BytesCopy { span, .. }
         | MemEvent::BorrowShared { span, .. }
         | MemEvent::BorrowMut { span, .. }
         | MemEvent::BorrowEnd { span, .. }

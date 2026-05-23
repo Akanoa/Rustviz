@@ -190,6 +190,12 @@ pub enum Ty {
     /// the `&[T]` type, matching Rust's "[T] only appears behind a
     /// reference" rule. Carries the element type.
     Slice(Box<Ty>),
+    /// **M07.2**: `&str` — semantically equivalent to
+    /// `Ty::Slice(Box::new(Ty::Int(IntKind::U8)))`. Kept as a distinct
+    /// sugar variant so the rendered type reads `"&str"` (not `"&[u8]"`),
+    /// matching what Rust developers see. Method dispatch + borrow
+    /// tracking treat `Ty::Str` interchangeably with the slice form.
+    Str,
 }
 
 impl Ty {
@@ -214,6 +220,8 @@ impl Ty {
             Self::String => "String".to_owned(),
             // M07.1: slice. Leading `&` is part of the type name; always shared in M07.1.
             Self::Slice(inner) => format!("&[{}]", inner.name()),
+            // M07.2: &str sugar — rendered as `"&str"` not `"&[u8]"`.
+            Self::Str => "&str".to_owned(),
         }
     }
 
@@ -229,7 +237,8 @@ impl Ty {
             Self::Box(_) | Self::Vec(_) | Self::String => false,
             // M07.1: slices are non-Copy (they carry a borrow_id; cloning would
             // duplicate the borrow registration).
-            Self::Slice(_) => false,
+            // M07.2: &str follows the same rule (it's a Slice<u8> in disguise).
+            Self::Slice(_) | Self::Str => false,
         }
     }
 }
@@ -818,9 +827,11 @@ impl<'a> Typechecker<'a> {
                     }),
                 }
             }
-            // **M07**: string literal — transient `&str-like` type. Modeled as
-            // Ty::String for typeck simplicity; only consumed by String methods.
-            ast::Expr::StrLit(_, _) => Ok(Ty::String),
+            // **M07 → M07.2**: string literal. M07 modeled this as `Ty::String`
+            // (heap-owned) for typeck simplicity — wrong by Rust's semantics
+            // since `"hi"` is `&'static str`, a borrow into the RO data
+            // segment. M07.2 fixes it: literals are now `Ty::Str`.
+            ast::Expr::StrLit(_, _) => Ok(Ty::Str),
             // **M07**: path expression (Vec::new, Box::new, String::from). These
             // ARE callable identifiers; when invoked via Expr::Call the call
             // arm consults the path-fn dispatch table. Bare path (no Call) is
@@ -894,14 +905,30 @@ impl<'a> Typechecker<'a> {
                 span: borrow_span,
             });
         }
-        // Receiver must be a Vec.
+        // Receiver: Vec<T> (M07.1), &[T] (M07.2 — slice-of-slice), or &str
+        // (M07.2 — sub-slicing a string literal). The result type preserves
+        // the receiver's "shape": slicing a Vec or a &[T] yields &[T];
+        // slicing a &str yields &str (the sugar is preserved).
         let receiver_ty = self.typecheck_expr(receiver)?;
-        let elem_ty = match receiver_ty {
-            Ty::Vec(inner) => *inner,
+        let (elem_ty, result_ty) = match receiver_ty {
+            Ty::Vec(inner) => {
+                let inner = *inner;
+                let result = Ty::Slice(Box::new(inner.clone()));
+                (inner, result)
+            }
+            // M07.2: slice-of-slice (forward-compat for any &[T] receiver).
+            Ty::Slice(inner) => {
+                let inner = *inner;
+                let result = Ty::Slice(Box::new(inner.clone()));
+                (inner, result)
+            }
+            // M07.2: sub-slicing a `&str` produces another `&str` (sugar
+            // preserved). Underneath it's a slice of bytes.
+            Ty::Str => (Ty::Int(IntKind::U8), Ty::Str),
             other => {
                 return Err(ParseError {
                     message: format!(
-                        "cannot slice value of type `{}`; expected Vec",
+                        "cannot slice value of type `{}`; expected Vec, &[T], or &str",
                         other.name()
                     ),
                     span: receiver.span(),
@@ -927,9 +954,11 @@ impl<'a> Typechecker<'a> {
         }
         // Record the slice type on the inner Index span so eval can confirm
         // the slice-borrow shape; also on the Borrow span (caller does this).
-        let slice_ty = Ty::Slice(Box::new(elem_ty));
-        self.types.expr_types.insert(idx_span, slice_ty.clone());
-        Ok(slice_ty)
+        // M07.2: `result_ty` preserves the receiver's shape — Vec/&[T] → &[T],
+        // &str → &str. `elem_ty` only feeds future bounds/dispatch checks.
+        let _ = elem_ty;
+        self.types.expr_types.insert(idx_span, result_ty.clone());
+        Ok(result_ty)
     }
 
     /// **M07**: dispatch a path-fn call against the hardcoded static-fn table.
@@ -982,13 +1011,21 @@ impl<'a> Typechecker<'a> {
                         span: call_span,
                     });
                 }
-                if !matches!(&args[0], ast::Expr::StrLit(_, _)) {
+                // M07.2: accept any `&str` arg (literal OR an existing
+                // `&str` binding OR a sub-slice). Eval extracts bytes from
+                // the slice's static region using its byte_offset/byte_len.
+                let arg_ty = self.typecheck_expr(&args[0])?;
+                if !matches!(arg_ty, Ty::Str)
+                    && !matches!(&arg_ty, Ty::Slice(inner) if matches!(**inner, Ty::Int(IntKind::U8)))
+                {
                     return Err(ParseError {
-                        message: "String::from: expected a string literal argument".into(),
+                        message: format!(
+                            "String::from: expected `&str`, found `{}`",
+                            arg_ty.name()
+                        ),
                         span: args[0].span(),
                     });
                 }
-                let _ = self.typecheck_expr(&args[0])?;
                 Ok(Ty::String)
             }
             _ => Err(ParseError {
@@ -1044,10 +1081,11 @@ impl<'a> Typechecker<'a> {
                 Ok(Ty::Int(IntKind::U64))
             }
             // M07.1: `Slice::len() -> u64`. Same signature as Vec::len.
-            (Ty::Slice(_), "len") => {
+            // M07.2: `&str` is a sugar for `&[u8]`, so the same `len()` works.
+            (Ty::Slice(_), "len") | (Ty::Str, "len") => {
                 if !args.is_empty() {
                     return Err(ParseError {
-                        message: "Slice::len takes no args".into(),
+                        message: "len takes no args".into(),
                         span,
                     });
                 }
@@ -1060,14 +1098,19 @@ impl<'a> Typechecker<'a> {
                         span,
                     });
                 }
-                // arg must be a string literal (no `&str` first-class type).
-                if !matches!(&args[0], ast::Expr::StrLit(_, _)) {
+                // M07.2: accept any `&str` arg (literal, binding, or sub-slice).
+                let arg_ty = self.typecheck_expr(&args[0])?;
+                if !matches!(arg_ty, Ty::Str)
+                    && !matches!(&arg_ty, Ty::Slice(inner) if matches!(**inner, Ty::Int(IntKind::U8)))
+                {
                     return Err(ParseError {
-                        message: "String::push_str: expected a string literal argument".into(),
+                        message: format!(
+                            "String::push_str: expected `&str`, found `{}`",
+                            arg_ty.name()
+                        ),
                         span: args[0].span(),
                     });
                 }
-                let _arg_ty = self.typecheck_expr(&args[0])?;
                 Ok(Ty::Unit)
             }
             _ => Err(ParseError {

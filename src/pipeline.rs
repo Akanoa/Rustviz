@@ -553,14 +553,18 @@ mod tests {
         assert!(has_dangling, "expected dangling-reference RuntimeError at realloc");
     }
 
-    // M07 / US3: String.
+    // M07 / US3: String. M07.2 re-baseline: count HeapAlloc + StaticAlloc
+    // separately so the test verifies both the heap allocation for the
+    // String's buffer AND the static-region interning of the literal.
 
     #[test]
     fn run_pipeline_string_from() {
         let source = "fn main() { let s = String::from(\"hi\"); }";
         let events = run_pipeline(source).expect("String compiles");
-        let alloc_count = events.iter().filter(|e| matches!(e, crate::MemEvent::HeapAlloc { .. })).count();
-        assert_eq!(alloc_count, 1);
+        let heap_count = events.iter().filter(|e| matches!(e, crate::MemEvent::HeapAlloc { .. })).count();
+        let static_count = events.iter().filter(|e| matches!(e, crate::MemEvent::StaticAlloc { .. })).count();
+        assert_eq!(heap_count, 1, "expected one heap allocation for the String buffer");
+        assert_eq!(static_count, 1, "expected one static block for the \"hi\" literal");
     }
 
     #[test]
@@ -571,7 +575,10 @@ mod tests {
         }";
         let events = run_pipeline(source).expect("String push_str compiles");
         let realloc_count = events.iter().filter(|e| matches!(e, crate::MemEvent::HeapRealloc { .. })).count();
+        let static_count = events.iter().filter(|e| matches!(e, crate::MemEvent::StaticAlloc { .. })).count();
         assert!(realloc_count >= 1, "expected ≥ 1 HeapRealloc when push_str grows capacity");
+        // M07.2: both literals interned in static (one for "hi", one for "world").
+        assert_eq!(static_count, 2, "expected two static blocks for \"hi\" and \"world\"");
     }
 
     // ─── M07.1: typeck rejections (mutable slice, standalone range) ───────
@@ -636,6 +643,198 @@ mod tests {
         let json = serde_json::to_string(&err).expect("serialize");
         let back: CompileError = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(err, back);
+    }
+
+    // ─── M07.2 / US1: string literal as `&str` (slice into static memory) ──
+
+    /// A string literal `let s = "toto";` typechecks as `&str`, evaluates
+    /// to a `Value::Slice` targeting the static region, emits exactly one
+    /// `StaticAlloc` event and one `BorrowShared` with `Pointee::Static`,
+    /// and emits **zero** `HeapAlloc` events.
+    #[test]
+    fn run_pipeline_str_literal() {
+        let source = "fn main() { let s = \"toto\"; }";
+        let events = run_pipeline(source).expect("str literal compiles");
+        // Exactly one StaticAlloc with the literal's bytes.
+        let static_allocs: Vec<&str> = events.iter().filter_map(|e| match e {
+            crate::MemEvent::StaticAlloc { bytes, .. } => Some(bytes.as_str()),
+            _ => None,
+        }).collect();
+        assert_eq!(static_allocs, vec!["toto"], "expected exactly one StaticAlloc with bytes 'toto'");
+        // Zero HeapAlloc — string literals don't allocate at runtime.
+        let heap_count = events.iter().filter(|e| matches!(e, crate::MemEvent::HeapAlloc { .. })).count();
+        assert_eq!(heap_count, 0, "expected zero HeapAlloc events for a bare literal");
+        // BorrowShared with Pointee::Static target.
+        let shared_static = events.iter().any(|e| matches!(e,
+            crate::MemEvent::BorrowShared { target: crate::event::Pointee::Static(_), .. }
+        ));
+        assert!(shared_static, "expected BorrowShared with Pointee::Static target");
+        // s's SlotWrite carries Value::Slice with len 4.
+        let slice_write = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite { value: crate::Value::Slice { len: 4, target: crate::event::Pointee::Static(_), .. }, .. }
+        ));
+        assert!(slice_write, "expected SlotWrite of Value::Slice {{ len: 4, target: Pointee::Static(_), .. }}");
+    }
+
+    /// `String::from(s)` where `s` is an existing `&str` binding (not a
+     /// literal) is accepted by typeck and produces the same trace shape as
+     /// the literal form: 1 StaticAlloc (for `s`'s literal) + 1 HeapAlloc
+     /// (for the String's buffer) + 1 BytesCopy (data flow).
+    #[test]
+    fn run_pipeline_string_from_str_binding() {
+        let source = "fn main() {
+            let s = \"hi\";
+            let t = String::from(s);
+        }";
+        let events = run_pipeline(source).expect("String::from(&str binding) compiles");
+        let static_count = events.iter().filter(|e| matches!(e, crate::MemEvent::StaticAlloc { .. })).count();
+        let heap_count = events.iter().filter(|e| matches!(e, crate::MemEvent::HeapAlloc { .. })).count();
+        let copy_count = events.iter().filter(|e| matches!(e, crate::MemEvent::BytesCopy { .. })).count();
+        assert_eq!(static_count, 1, "expected one static block for \"hi\"");
+        assert_eq!(heap_count, 1, "expected one heap allocation for String t");
+        assert_eq!(copy_count, 1, "expected one BytesCopy event from static to heap");
+    }
+
+    /// `String::from(&s[1..3])` — a sub-slice of an existing `&str` — copies
+    /// just the sub-slice's bytes (3 bytes "ell" from "hello"), not the
+    /// whole source.
+    #[test]
+    fn run_pipeline_string_from_subslice() {
+        let source = "fn main() {
+            let s = \"hello\";
+            let t = String::from(&s[1..4]);
+        }";
+        let events = run_pipeline(source).expect("compiles");
+        let copy = events.iter().find_map(|e| match e {
+            crate::MemEvent::BytesCopy { n_bytes, .. } => Some(*n_bytes),
+            _ => None,
+        });
+        assert_eq!(copy, Some(3), "expected BytesCopy of exactly 3 bytes (sub-slice [1..4] of \"hello\")");
+    }
+
+    // ─── M07.2 / US2: `String::from` copies static bytes to heap ──────────
+
+    /// `String::from("hi")` produces a trace where both the static `"hi"`
+    /// block AND a fresh heap `String` block coexist. Verifies BOTH the
+    /// alloc events fire AND no spurious extra events are emitted.
+    #[test]
+    fn run_pipeline_string_from_static_visible() {
+        let source = "fn main() { let s = String::from(\"hi\"); }";
+        let events = run_pipeline(source).expect("String::from compiles");
+        // Exactly one StaticAlloc for the "hi" literal.
+        let static_allocs: Vec<&str> = events.iter().filter_map(|e| match e {
+            crate::MemEvent::StaticAlloc { bytes, .. } => Some(bytes.as_str()),
+            _ => None,
+        }).collect();
+        assert_eq!(static_allocs, vec!["hi"], "expected one StaticAlloc with bytes 'hi'");
+        // Exactly one HeapAlloc for the String's buffer.
+        let heap_count = events.iter().filter(|e| matches!(e, crate::MemEvent::HeapAlloc { .. })).count();
+        assert_eq!(heap_count, 1, "expected one heap allocation");
+        // The trace ends with the heap String being freed (scope exit).
+        let free_count = events.iter().filter(|e| matches!(e, crate::MemEvent::HeapFree { .. })).count();
+        assert_eq!(free_count, 1, "expected the heap String to be freed at scope exit");
+        // The static block is NEVER freed — no StaticFree event variant exists.
+    }
+
+    // ─── M07.2 / US3: `push_str` + `s.len()` on `&str` ────────────────────
+
+    /// `push_str("!")` — the literal arg interns in static; bytes flow from
+    /// the static block into the heap String's buffer. No separate heap
+    /// allocation for the argument.
+    #[test]
+    fn run_pipeline_push_str_static() {
+        let source = "fn main() {
+            let mut s = String::from(\"hi\");
+            s.push_str(\"!\");
+        }";
+        let events = run_pipeline(source).expect("push_str compiles");
+        let static_count = events.iter().filter(|e| matches!(e, crate::MemEvent::StaticAlloc { .. })).count();
+        let heap_count = events.iter().filter(|e| matches!(e, crate::MemEvent::HeapAlloc { .. })).count();
+        assert_eq!(static_count, 2, "expected two static blocks (one for \"hi\", one for \"!\")");
+        assert_eq!(heap_count, 1, "expected one heap allocation (the String's buffer)");
+    }
+
+    /// Sub-slicing a `&str` produces another `&str` pointing into the same
+    /// static block, with offsets adjusted. `let s = "hello"; let s2 = &s[..2];`
+    /// gives `s2` viewing bytes 0..2 ("he") of the static "hello".
+    #[test]
+    fn run_pipeline_str_subslice() {
+        let source = "fn main() {
+            let s = \"hello\";
+            let s2 = &s[..2];
+        }";
+        let events = run_pipeline(source).expect("&str sub-slice compiles");
+        // One StaticAlloc for "hello"; no separate alloc for the sub-slice
+        // (it shares the same static block).
+        let static_count = events.iter().filter(|e| matches!(e, crate::MemEvent::StaticAlloc { .. })).count();
+        assert_eq!(static_count, 1, "sub-slice should reuse the parent's static block");
+        // Two BorrowShared events targeting the same Pointee::Static — one
+        // for the literal `s`, one for the sub-slice `s2`.
+        let shared_static_count = events.iter().filter(|e| matches!(e,
+            crate::MemEvent::BorrowShared { target: crate::event::Pointee::Static(_), .. }
+        )).count();
+        assert_eq!(shared_static_count, 2, "expected two static-targeted borrows (literal + sub-slice)");
+        // s2's SlotWrite has Value::Slice with len 2 + byte_offset 0 + byte_len 2.
+        let s2_write = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite {
+                value: crate::Value::Slice {
+                    target: crate::event::Pointee::Static(_),
+                    start: 0, len: 2, byte_offset: 0, byte_len: 2, ..
+                },
+                ..
+            }
+        ));
+        assert!(s2_write, "expected s2 = &s[..2] to produce Value::Slice {{ len: 2, byte_offset: 0, .. }}");
+    }
+
+    /// Sub-slicing with a non-zero start preserves byte_offset accumulation:
+    /// `&s[1..]` should pick up at byte 1 of the static block.
+    #[test]
+    fn run_pipeline_str_subslice_with_start() {
+        let source = "fn main() {
+            let s = \"hello\";
+            let s2 = &s[1..4];
+        }";
+        let events = run_pipeline(source).expect("compiles");
+        let s2_write = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite {
+                value: crate::Value::Slice {
+                    target: crate::event::Pointee::Static(_),
+                    start: 1, len: 3, byte_offset: 1, byte_len: 3, ..
+                },
+                ..
+            }
+        ));
+        assert!(s2_write, "expected s2 = &s[1..4] → Value::Slice {{ start: 1, len: 3, byte_offset: 1, byte_len: 3 }}");
+    }
+
+    /// `s.len()` on `&str` returns the byte length as `u64`.
+    #[test]
+    fn run_pipeline_str_len() {
+        let source = "fn main() { let s = \"toto\"; let n = s.len(); }";
+        let events = run_pipeline(source).expect("str len compiles");
+        let n_is_4 = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite {
+                value: crate::Value::Int { kind: crate::typeck::IntKind::U64, bits: 4 },
+                ..
+            }
+        ));
+        assert!(n_is_4, "expected n = s.len() to be Int {{ U64, 4 }}");
+    }
+
+    /// Two identical literals share one StaticAlloc (content-deduplicated
+    /// to match Rust linker behavior). Each occurrence still gets its own
+    /// `BorrowShared`.
+    #[test]
+    fn run_pipeline_literal_dedup() {
+        let source = "fn main() { let a = \"hi\"; let b = \"hi\"; }";
+        let events = run_pipeline(source).expect("literal dedup compiles");
+        let static_count = events.iter().filter(|e| matches!(e, crate::MemEvent::StaticAlloc { .. })).count();
+        assert_eq!(static_count, 1, "two identical literals should share one StaticAlloc");
+        let shared_count = events.iter().filter(|e| matches!(e,
+            crate::MemEvent::BorrowShared { target: crate::event::Pointee::Static(_), .. }
+        )).count();
+        assert_eq!(shared_count, 2, "each literal occurrence should fire its own BorrowShared");
     }
 
     // ─── M07.1 / US1: partial-range slice ────────────────────────────────

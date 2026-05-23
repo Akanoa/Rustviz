@@ -79,6 +79,9 @@ struct Evaluator<'a> {
     /// **M07**: per-borrow-id snapshot of the target heap's generation at
     /// borrow time. Used by `realloc_heap`'s dangling scan.
     borrow_generations: std::collections::HashMap<crate::event::BorrowId, u32>,
+    /// **M07.2**: static-memory region — read-only blocks for unique string
+    /// literals (content-deduplicated to match Rust linker behavior).
+    static_region: StaticState,
     /// Emitted events in source-execution order.
     events: Vec<MemEvent>,
     /// Set to true on runtime error to stop further evaluation.
@@ -101,6 +104,30 @@ impl HeapState {
         Self {
             objects: indexmap::IndexMap::new(),
             free_list: Vec::new(),
+        }
+    }
+}
+
+/// **M07.2**: static-memory region. Holds one block per unique string-literal
+/// content; the `by_content` map dedupes (matches Rust linker's `.rodata`
+/// merging). Static blocks persist for the trace's lifetime — there's no
+/// equivalent of `HeapFree` for them.
+struct StaticState {
+    next_addr: u32,
+    blocks: indexmap::IndexMap<crate::event::StaticAddr, StaticBlock>,
+    by_content: std::collections::HashMap<String, crate::event::StaticAddr>,
+}
+
+struct StaticBlock {
+    bytes: String,
+}
+
+impl StaticState {
+    fn new() -> Self {
+        Self {
+            next_addr: 0,
+            blocks: indexmap::IndexMap::new(),
+            by_content: std::collections::HashMap::new(),
         }
     }
 }
@@ -143,7 +170,8 @@ fn ty_size_bytes(ty: &Ty) -> u32 {
         Ty::Unit => 0,
         Ty::Ref { .. } | Ty::Box(_) | Ty::String | Ty::Vec(_) => 8,
         // M07.1: slice is a fat pointer (data ptr + length) — 16 bytes on 64-bit.
-        Ty::Slice(_) => 16,
+        // M07.2: `&str` is a slice-shaped fat pointer too.
+        Ty::Slice(_) | Ty::Str => 16,
     }
 }
 
@@ -165,8 +193,8 @@ fn value_size_bytes(v: &Value) -> u32 {
         Value::Bool(_) => 1,
         Value::Unit => 0,
         Value::Ref { .. } | Value::Box { .. } | Value::String { .. } | Value::Vec { .. } => 8,
-        Value::Str(_) => 0,
         // M07.1: slice fat pointer = 16 bytes on 64-bit.
+        // M07.2: `&str` literals also flow through Value::Slice now.
         Value::Slice { .. } => 16,
     }
 }
@@ -257,6 +285,7 @@ impl<'a> Evaluator<'a> {
             next_heap_addr: 0,
             heap_generations: std::collections::HashMap::new(),
             borrow_generations: std::collections::HashMap::new(),
+            static_region: StaticState::new(),
             events: Vec::new(),
             halted: false,
         })
@@ -305,6 +334,33 @@ impl<'a> Evaluator<'a> {
             return (addr, None);
         }
         (self.alloc_heap_addr(), None)
+    }
+
+    /// **M07.2**: intern a string-literal's bytes into the static region.
+    /// Content-deduplicated: identical bytes share one block (matches Rust
+    /// linker's `.rodata` merging). Emits `StaticAlloc` only on first
+    /// occurrence. Returns the addr (newly allocated or reused).
+    fn intern_static(&mut self, bytes: String, span: Span) -> crate::event::StaticAddr {
+        if let Some(addr) = self.static_region.by_content.get(&bytes) {
+            return *addr;
+        }
+        let addr = crate::event::StaticAddr(self.static_region.next_addr);
+        self.static_region.next_addr += 1;
+        self.static_region.by_content.insert(bytes.clone(), addr);
+        self.static_region.blocks.insert(addr, StaticBlock { bytes: bytes.clone() });
+        self.events.push(MemEvent::StaticAlloc { addr, bytes, span });
+        addr
+    }
+
+    /// **M07.2**: look up a static block's bytes by addr. Used by
+    /// `String::from` / `push_str` to copy the literal's content into the
+    /// heap allocation.
+    fn get_static_bytes(&self, addr: crate::event::StaticAddr) -> &str {
+        self.static_region
+            .blocks
+            .get(&addr)
+            .map(|b| b.bytes.as_str())
+            .expect("static block must exist for any Pointee::Static value")
     }
 
     /// **M07**: allocate a heap object and emit `HeapAlloc`. Returns the
@@ -1189,8 +1245,42 @@ impl<'a> Evaluator<'a> {
                     _ => panic!("typeck should reject deref of non-reference"),
                 }
             }
-            // **M07**: StrLit transient value.
-            ast::Expr::StrLit(s, _) => Value::Str(s.clone()),
+            // **M07 → M07.2**: string literal. M07 used a transient
+            // `Value::Str(String)`; M07.2 promotes literals to fat-pointer
+            // slices into the static memory region (matching Rust's
+            // `&'static str` semantics). The bytes are interned in the
+            // static region (content-deduplicated), a fresh borrow_id is
+            // allocated, BorrowShared fires with `Pointee::Static(addr)`,
+            // and the returned Value::Slice covers the full literal length.
+            ast::Expr::StrLit(s, span) => {
+                let bytes_len = s.len() as u64;
+                let addr = self.intern_static(s.clone(), *span);
+                let target = crate::event::Pointee::Static(addr);
+                let borrow_id = self.alloc_borrow_id();
+                self.events.push(MemEvent::BorrowShared {
+                    borrow_id,
+                    target,
+                    span: *span,
+                });
+                // Register the borrow in the current scope so BorrowEnd
+                // fires at scope exit (same path as M07.1 slice borrows).
+                if let Some(scope) = self
+                    .frames
+                    .last_mut()
+                    .and_then(|f| f.scopes.last_mut())
+                {
+                    scope.borrows.push(borrow_id);
+                }
+                Value::Slice {
+                    borrow_id,
+                    target,
+                    start: 0,
+                    len: bytes_len,
+                    mutable: false,
+                    byte_offset: 0,
+                    byte_len: bytes_len,
+                }
+            }
             ast::Expr::Path { .. } => panic!("Path expressions only valid as Call callees in M07"),
             // **M07**: method call — dispatch via eval_method_call.
             ast::Expr::MethodCall { receiver, name, args, span } => {
@@ -1252,9 +1342,30 @@ impl<'a> Evaluator<'a> {
                 Value::Vec { addr }
             }
             ["String", "from"] => {
-                let s = match self.eval_expr(&args[0]) {
-                    Value::Str(s) => s,
-                    _ => panic!("typeck should have rejected non-StrLit arg to String::from"),
+                // **M07 → M07.2**: arg evaluation now produces `Value::Slice`
+                // targeting the static region. Extract the slice's bytes
+                // (respecting its byte_offset/byte_len so sub-slices like
+                // `String::from(&"hello"[..2])` copy just the visible window
+                // "he", not the whole "hello"). The slice's borrow lives
+                // in the active scope and fires its own BorrowEnd at scope
+                // exit.
+                let (source, source_offset, s) = match self.eval_expr(&args[0]) {
+                    Value::Slice {
+                        target: crate::event::Pointee::Static(saddr),
+                        byte_offset,
+                        byte_len,
+                        ..
+                    } => {
+                        let full = self.get_static_bytes(saddr);
+                        let start = byte_offset as usize;
+                        let end = start + byte_len as usize;
+                        (
+                            crate::event::Pointee::Static(saddr),
+                            byte_offset as u32,
+                            full[start..end].to_owned(),
+                        )
+                    }
+                    _ => panic!("typeck should have rejected non-&str arg to String::from"),
                 };
                 let size = s.len() as u32;
                 let display = format!("String \"{s}\" (cap={})", s.len());
@@ -1264,6 +1375,31 @@ impl<'a> Evaluator<'a> {
                     size,
                     span,
                 );
+                // **M07.2**: pedagogical Note + BytesCopy event making the
+                // data flow visible. Note surfaces in the status bar; the
+                // BytesCopy event drives the transient copy arrow in the
+                // UI (source → fresh heap String).
+                let n_bytes = s.len() as u32;
+                let source_label = match source {
+                    crate::event::Pointee::Static(a) => format!("static #{}", a.0),
+                    crate::event::Pointee::Heap(a) => format!("heap #{}", a.0),
+                    crate::event::Pointee::Slot(_) => "stack slot".to_owned(),
+                };
+                self.events.push(MemEvent::Note {
+                    kind: NoteKind::Info,
+                    message: format!(
+                        "String::from copies {n_bytes} byte{} from {source_label} into a fresh heap allocation owned by the new String — the source bytes stay where they are; the String owns its own independent copy",
+                        if n_bytes == 1 { "" } else { "s" },
+                    ),
+                    span,
+                });
+                self.events.push(MemEvent::BytesCopy {
+                    from: source,
+                    from_byte_offset: source_offset,
+                    to: addr,
+                    n_bytes,
+                    span,
+                });
                 Value::String { addr }
             }
             _ => panic!("typeck should have rejected unknown path"),
@@ -1293,11 +1429,55 @@ impl<'a> Evaluator<'a> {
                 Value::Int { kind: IntKind::U64, bits: len as i128 }
             }
             (Value::String { addr }, "push_str") => {
-                let suffix = match self.eval_expr(&args[0]) {
-                    Value::Str(s) => s,
-                    _ => panic!("typeck should have rejected non-StrLit arg"),
+                // **M07 → M07.2**: arg evaluation produces `Value::Slice`
+                // targeting the static region. Look up bytes via the slice's
+                // byte_offset/byte_len so sub-slices push just their window.
+                let (source, source_offset, suffix) = match self.eval_expr(&args[0]) {
+                    Value::Slice {
+                        target: crate::event::Pointee::Static(saddr),
+                        byte_offset,
+                        byte_len,
+                        ..
+                    } => {
+                        let full = self.get_static_bytes(saddr);
+                        let start = byte_offset as usize;
+                        let end = start + byte_len as usize;
+                        (
+                            crate::event::Pointee::Static(saddr),
+                            byte_offset as u32,
+                            full[start..end].to_owned(),
+                        )
+                    }
+                    _ => panic!("typeck should have rejected non-&str arg"),
                 };
-                self.string_push_str(*addr, &suffix, span);
+                let dest_addr = *addr;
+                let n_bytes = suffix.len() as u32;
+                // Emit pedagogical Note + BytesCopy BEFORE the actual push.
+                // The push itself may trigger HeapRealloc; ordering the
+                // copy explanation first matches the user's mental model
+                // ("the bytes are about to flow into this allocation").
+                let source_label = match source {
+                    crate::event::Pointee::Static(a) => format!("static #{}", a.0),
+                    crate::event::Pointee::Heap(a) => format!("heap #{}", a.0),
+                    crate::event::Pointee::Slot(_) => "stack slot".to_owned(),
+                };
+                self.events.push(MemEvent::Note {
+                    kind: NoteKind::Info,
+                    message: format!(
+                        "push_str copies {n_bytes} byte{} from {source_label} into heap #{} — appended to the String's existing buffer",
+                        if n_bytes == 1 { "" } else { "s" },
+                        dest_addr.0,
+                    ),
+                    span,
+                });
+                self.events.push(MemEvent::BytesCopy {
+                    from: source,
+                    from_byte_offset: source_offset,
+                    to: dest_addr,
+                    n_bytes,
+                    span,
+                });
+                self.string_push_str(dest_addr, &suffix, span);
                 Value::Unit
             }
             // M07.1: `Slice::len()` returns the slice's stored length as u64.
@@ -1545,24 +1725,38 @@ impl<'a> Evaluator<'a> {
         _range_span: Span,
         borrow_span: Span,
     ) -> Value {
-        // Evaluate receiver — must be Value::Vec.
+        // **M07.2**: receiver may be a Vec (M07.1's case) OR an existing
+        // slice/&str (sub-slicing). For sub-slicing, the result inherits the
+        // receiver's `target` (Static for &str, Heap for &[T]) and offsets
+        // are computed relative to the receiver's existing window.
         let recv = self.eval_expr(receiver);
         if self.halted { return Value::Unit; }
-        let addr = match recv {
-            Value::Vec { addr } => addr,
-            _ => panic!("typeck should reject slice of non-Vec"),
+        // Get the receiver's element size from typeck (covers the
+        // len=0-but-non-byte-element corner case where deriving via
+        // byte_len/len would fail).
+        let elem_size: u64 = match self.types.expr_types.get(&receiver.span()) {
+            Some(Ty::Vec(inner)) | Some(Ty::Slice(inner)) => ty_size_bytes(inner) as u64,
+            Some(Ty::Str) => 1,
+            _ => panic!("typeck should have recorded a sliceable receiver type"),
         };
-        // Look up the Vec's current length + element size (for byte-range
-        // computation used by the UI hover highlight).
-        let (vec_len, elem_size): (i128, u64) = {
-            let obj = self.heap.objects.get(&addr).expect("vec exists");
-            if let HeapObject::Vec { elements, elem_ty, .. } = obj {
-                (elements.len() as i128, ty_size_bytes(elem_ty) as u64)
-            } else {
-                panic!("slice of non-Vec heap object")
+        let (target, base_byte_offset, base_len): (crate::event::Pointee, u64, i128) = match recv {
+            Value::Vec { addr } => {
+                let obj = self.heap.objects.get(&addr).expect("vec exists");
+                if let HeapObject::Vec { elements, .. } = obj {
+                    (crate::event::Pointee::Heap(addr), 0, elements.len() as i128)
+                } else {
+                    panic!("slice of non-Vec heap object")
+                }
             }
+            Value::Slice { target, byte_offset, len, .. } => {
+                // Sub-slice: result inherits the receiver's `target` and
+                // its existing byte_offset; the new range is interpreted
+                // relative to the receiver's window (length = len).
+                (target, byte_offset, len as i128)
+            }
+            _ => panic!("typeck should reject slice of non-sliceable value"),
         };
-        // Evaluate bounds. Defaults: start=0, end=vec_len.
+        // Evaluate bounds. Defaults: start=0, end=base_len.
         let start_i: i128 = if let Some(e) = start {
             let v = self.eval_expr(e);
             if self.halted { return Value::Unit; }
@@ -1578,21 +1772,24 @@ impl<'a> Evaluator<'a> {
                 Value::Int { bits, .. } => bits,
                 _ => panic!("typeck should reject non-Int range bound"),
             }
-        } else { vec_len };
-        // Bounds-check.
-        if start_i < 0 || start_i > vec_len {
+        } else { base_len };
+        // Bounds-check. "vec len" wording kept for the Vec case; "slice len"
+        // for the sub-slice case.
+        let bound_name = if matches!(target, crate::event::Pointee::Heap(_))
+            && base_byte_offset == 0 { "vec len" } else { "slice len" };
+        if start_i < 0 || start_i > base_len {
             self.emit_runtime_error(
                 format!(
-                    "slice start out of bounds: start is {start_i}, vec len is {vec_len}"
+                    "slice start out of bounds: start is {start_i}, {bound_name} is {base_len}"
                 ),
                 idx_span,
             );
             return Value::Unit;
         }
-        if end_i < 0 || end_i > vec_len {
+        if end_i < 0 || end_i > base_len {
             self.emit_runtime_error(
                 format!(
-                    "slice end out of bounds: end is {end_i}, vec len is {vec_len}"
+                    "slice end out of bounds: end is {end_i}, {bound_name} is {base_len}"
                 ),
                 idx_span,
             );
@@ -1607,10 +1804,10 @@ impl<'a> Evaluator<'a> {
             );
             return Value::Unit;
         }
-        // Allocate a borrow_id, emit BorrowShared targeting the Vec's heap.
+        // Allocate a borrow_id, emit BorrowShared targeting the receiver's
+        // memory region (Heap or Static — Slot reserved for M07.3 arrays).
         // mutable=false enforced (typeck rejects mutable slices in M07.1).
         let _ = mutable; // forward-compat marker
-        let target = crate::event::Pointee::Heap(addr);
         let borrow_id = self.alloc_borrow_id();
         self.events.push(MemEvent::BorrowShared {
             borrow_id,
@@ -1625,9 +1822,12 @@ impl<'a> Evaluator<'a> {
             .expect("scope active")
             .borrows
             .push(borrow_id);
-        // Snapshot heap generation for the dangling-borrow detection scan.
-        let generation = self.heap_generations.get(&addr).copied().unwrap_or(0);
-        self.borrow_generations.insert(borrow_id, generation);
+        // Snapshot heap generation for the dangling-borrow detection scan
+        // (only meaningful for Heap targets; Static never goes dangling).
+        if let crate::event::Pointee::Heap(addr) = target {
+            let generation = self.heap_generations.get(&addr).copied().unwrap_or(0);
+            self.borrow_generations.insert(borrow_id, generation);
+        }
         let len = (end_i - start_i) as u64;
         let start = start_i as u64;
         Value::Slice {
@@ -1636,7 +1836,9 @@ impl<'a> Evaluator<'a> {
             start,
             len,
             mutable: false,
-            byte_offset: start * elem_size,
+            // Byte offset accumulates: sub-slicing adds to the receiver's
+            // existing byte_offset (e.g. &"hello"[1..][..2] picks bytes 1-3).
+            byte_offset: base_byte_offset + start * elem_size,
             byte_len: len * elem_size,
         }
     }
@@ -1955,8 +2157,8 @@ fn render_value_for_note(value: &Value) -> String {
         Value::Box { .. } => "Box".to_owned(),
         Value::Vec { .. } => "Vec".to_owned(),
         Value::String { .. } => "String".to_owned(),
-        Value::Str(s) => format!("\"{s}\""),
         // M07.1: slice. Abstract render with length for notes.
+        // M07.2: `&str` literals flow through Value::Slice with Pointee::Static.
         Value::Slice { len, .. } => format!("&[_; {len}]"),
     }
 }

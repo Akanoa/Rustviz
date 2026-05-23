@@ -106,7 +106,34 @@ main > section {
   transition: stroke-width 120ms ease-out, filter 120ms ease-out;
 }
 
-#arrow-overlay path:hover {
+/* **M07.2**: invisible wider hit-detection overlay. Each visible arrow
+   has a sibling `.arrow-hit-target` path with the same geometry but a
+   wider transparent stroke. SVG `pointer-events: stroke` uses the actual
+   stroke width for hit-testing, so this wider stroke expands the
+   detection zone (~5px total vs ~1.5px for the visible line) without
+   thickening the rendered arrow. Hover events fire on the hit-target;
+   the `:has()` selector below applies the visual hover style to the
+   sibling visible path. */
+#arrow-overlay .arrow-hit-target {
+  stroke: transparent;
+  stroke-width: 5;
+  fill: none;
+  pointer-events: stroke;
+}
+
+/* Visible arrows opt OUT of pointer-events — the hit-target catches
+   everything for them so the wider detection zone applies uniformly. */
+#arrow-overlay .arrow-shared,
+#arrow-overlay .arrow-mut,
+#arrow-overlay .arrow-owning {
+  pointer-events: none;
+}
+
+/* Hover effect: when the hit-target is hovered, style the visible
+   sibling path (which comes immediately after the hit-target in DOM
+   order — see renderArrows). Uses CSS `:has()` for sibling selection. */
+#arrow-overlay path:hover,
+#arrow-overlay .arrow-hit-target:hover + path {
   stroke: #5eb1ff;       /* light blue highlight */
   stroke-width: 3.5;
   filter: drop-shadow(0 0 3px rgba(0, 0, 0, 0.45));
@@ -125,6 +152,55 @@ main > section {
   fill: none;
   stroke-width: 2;
   marker-end: url(#arrow-head-owning);
+}
+
+/* **M07.2**: transient "bytes copied" arrow. Orange dashed line + soft
+   glow makes the data-flow direction obvious without competing with
+   the permanent ownership/borrow arrows. Fades in via opacity (set by
+   JS on render). Only present on the BytesCopy cursor step. */
+#arrow-overlay .arrow-copy {
+  stroke: #e07a00;
+  fill: none;
+  stroke-width: 2;
+  stroke-dasharray: 5 3;
+  marker-end: url(#arrow-head-copy);
+  filter: drop-shadow(0 0 2px rgba(224, 122, 0, 0.55));
+  pointer-events: none;
+  animation: arrow-copy-fade-in 220ms ease-out;
+}
+
+@keyframes arrow-copy-fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+#arrow-overlay .arrow-copy-label {
+  font-size: 11px;
+  fill: #b35f00;
+  font-weight: 600;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  user-select: none;
+  pointer-events: none;
+  animation: arrow-copy-fade-in 220ms ease-out;
+}
+
+/* **M07.2**: source-side highlight for bytes/chars covered by a transient
+   copy arrow. Orange-tinted to visually pair with the arrow itself; uses
+   a distinct class from the yellow `.byte-slice-highlighted` so a hover-
+   driven slice highlight and a copy-driven highlight don't conflict
+   (different colors, both readable). Applied/cleared by renderCopyArrow. */
+.byte-cell.byte-copy-source-highlighted {
+  outline: 2px solid #e07a00;
+  outline-offset: -1px;
+  box-shadow: 0 0 4px rgba(224, 122, 0, 0.7);
+  z-index: 1;
+}
+
+.elem-cell.elem-copy-source-highlighted {
+  background: rgba(224, 122, 0, 0.3);
+  outline: 1px solid #e07a00;
+  border-radius: 2px;
+  padding: 0 1px;
 }
 
 /* M07: heap panel. Each HeapAlloc creates a labeled box. Flex-wrap layout;
@@ -204,12 +280,16 @@ main > section {
    per element so the slice-arrow hover handler can highlight the labels
    covered by `[elem_start, elem_start + len)`. The base style is invisible
    (no decoration) so the display reads as before; the highlight class is
-   what makes the covered elements pop. */
-.heap-box .heap-display .elem-cell {
+   what makes the covered elements pop.
+   **M07.2**: same mechanism applies to per-byte spans inside a static
+   block's display (`"hello"` → segmented as `h`, `e`, `l`, `l`, `o`).
+   Selector is broadened to match `.elem-cell` regardless of parent so
+   both Vec-element labels and static-byte labels light up uniformly. */
+.elem-cell {
   /* no baseline decoration — invisible until highlighted */
 }
 
-.heap-box .heap-display .elem-cell.elem-slice-highlighted {
+.elem-cell.elem-slice-highlighted {
   background: rgba(245, 184, 0, 0.35);
   outline: 1px solid #f5b800;
   border-radius: 2px;
@@ -253,13 +333,22 @@ main > section {
 
 /* **M07.1**: slice arrows show a `[len: N]` annotation near the arrowhead.
    Small monospace, blue to match the shared-borrow color, unselectable so
-   it doesn't interfere with text selection in adjacent panels. */
+   it doesn't interfere with text selection in adjacent panels.
+   **M07.2**: hidden by default; revealed only when the corresponding
+   arrow is hovered. Keeps the visualization clean when many slices
+   coexist (labels would otherwise stack and crowd adjacent UI). */
 #arrow-overlay .arrow-len-label {
   font-size: 10px;
   fill: #4d8fcd;
   font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
   user-select: none;
   pointer-events: none;
+  opacity: 0;
+  transition: opacity 100ms ease-out;
+}
+
+#arrow-overlay .arrow-len-label.label-visible {
+  opacity: 1;
 }
 
 main > section:last-child {
@@ -303,6 +392,68 @@ main > section:last-child {
   display: flex;
   flex-direction: column-reverse; /* innermost frame visually on top */
   gap: 0.5rem;
+}
+
+/* **M07.2**: static-memory region (read-only data segment). Holds blocks
+   for string literals; persists for the whole trace. Visually distinct
+   from heap — gray gradient background + muted gray byte-cells. */
+#static {
+  padding: 0.5rem 1rem;
+  background: linear-gradient(to bottom, #f1f1f0, #e7e7e6);
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  min-height: 60px;
+  flex: 0.6; /* narrower than stacks/heap — literals are typically small */
+}
+
+#static .static-label {
+  font-style: italic;
+  font-size: 11px;
+  color: var(--muted);
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+
+#static .static-blocks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-content: flex-start;
+}
+
+.static-block {
+  display: inline-flex;
+  flex-direction: column;
+  border: 1px solid #b5b5b3;
+  border-radius: 4px;
+  padding: 0.3rem 0.5rem;
+  background: #fafafa;
+  font-size: 12px;
+}
+
+.static-block .static-addr {
+  font-size: 10px;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, monospace;
+}
+
+.static-block .static-display {
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  margin: 2px 0;
+}
+
+.static-block .static-cells {
+  display: flex;
+  gap: 1px;
+}
+
+.static-block .byte-cell {
+  width: 8px;
+  height: 8px;
+  border: 1px solid #999;
+  background: #c8c8c6;
+  box-sizing: border-box;
 }
 
 #heap {

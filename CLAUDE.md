@@ -121,6 +121,8 @@ src/
 - in-memory; no new files. M03 snapshot tests should stay byte-identical (existing samples don't construct `Value::Ref` or `Ty::Ref`). M02 may re-baseline if any TypeMap snapshot Debug output shifts (unlikely — additive enum variants don't change existing variant formats). (009-m06-borrows)
 - Rust 2024 edition (same toolchain as M01–M07). No new toolchain requirements. + existing `indexmap`, `serde`, `serde_json`, `wasm-bindgen`, `js-sys`, `console_error_panic_hook`. **No new Rust deps**. **No JS deps changes**. (012-m07-1-slices)
 - in-memory; no new files. M01/M02/M03 snapshot tests should stay byte-identical (existing samples don't construct `Value::Slice`, and `Ty::Slice` / `Value::Slice` are additive variants). (012-m07-1-slices)
+- Rust 2024 edition (same toolchain as M01–M07.1). No new toolchain requirements. + existing `indexmap`, `serde`, `serde_json`, `wasm-bindgen`, `js-sys`, `console_error_panic_hook`. **No new Rust deps**. **No JS deps changes**. (013-m07-2-str-static)
+- in-memory; no new files. M01/M02/M03 snapshot tests stay byte-identical (existing L1 samples don't construct string literals). M07's `m07_string` test re-baselines: alloc-count for `String::from("hi")` now stays 1 (heap) but the trace gains a `StaticAlloc` event for the `"hi"` literal that occurs BEFORE the `String::from` heap alloc. (013-m07-2-str-static)
 
 ## Recent Changes
 - 001-milestone-roadmap: Added N/A — deliverable is markdown documentation + `CLAUDE.md` (authoritative scope source); `specs/001-milestone-roadmap/spec.md` (this feature's spec)

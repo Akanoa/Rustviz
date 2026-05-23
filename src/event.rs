@@ -28,16 +28,28 @@ pub struct HeapAddr(pub u32);
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct BorrowId(pub u32);
 
-/// Where a pointer points — into the stack or onto the heap.
+/// Where a pointer points — into the stack, onto the heap, or into static memory.
 ///
 /// Per CLAUDE.md › Event model: "Pointee is an enum `Slot(SlotId) | Heap(HeapAddr)`".
+/// **M07.2** extends with `Static(StaticAddr)` for `&'static str` and similar
+/// borrows into the binary's read-only data segment.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Pointee {
     /// Points at a stack slot.
     Slot(SlotId),
     /// Points at a heap allocation (M07+).
     Heap(HeapAddr),
+    /// **M07.2**: points into the static-memory region (read-only data
+    /// segment). Used by string-literal slices (`&'static str`). Static
+    /// blocks never go dangling — they persist for the trace's lifetime.
+    Static(StaticAddr),
 }
+
+/// **M07.2**: identifier for a block in the static-memory region. Distinct
+/// from `HeapAddr` because static blocks have different lifetime semantics
+/// (never freed). Monotonic; never reused.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct StaticAddr(pub u32);
 
 /// A runtime value held in a stack slot.
 ///
@@ -98,9 +110,6 @@ pub enum Value {
         /// Heap address of the String's underlying buffer.
         addr: HeapAddr,
     },
-    /// **M07**: transient string value for string-literal arguments to
-    /// `String::from(...)` / `String::push_str(...)`. NOT stored in slots.
-    Str(String),
     /// **M07.1**: slice value — a fat pointer (target + length) into a heap
     /// allocation. Sibling of `Value::Ref` (not an extension); slices carry
     /// extra `len` metadata and live in the same active-borrow registry, so
@@ -150,8 +159,8 @@ impl Value {
             Self::Box { .. } => "Box",
             Self::Vec { .. } => "Vec",
             Self::String { .. } => "String",
-            Self::Str(_) => "&str",
             // M07.1: slice. Short tag — full `&[T]` rendering comes from the Ty layer.
+            // M07.2: includes `&str` literals (Value::Slice with Pointee::Static target).
             Self::Slice { .. } => "&[]",
         }
     }
@@ -327,6 +336,40 @@ pub enum MemEvent {
         /// Allocation being freed.
         addr: HeapAddr,
         /// Source location where the owning value goes out of scope.
+        span: Span,
+    },
+    /// **M07.2**: a static-memory block was allocated. Fires ONCE per unique
+    /// string-literal content (content-deduplicated to match Rust linker
+    /// behavior — duplicate literals in `.rodata` share one block). Static
+    /// blocks never fire a corresponding free event; they persist for the
+    /// trace's lifetime.
+    StaticAlloc {
+        /// Identifier of the static block.
+        addr: StaticAddr,
+        /// The block's byte content (already-processed string after escape
+        /// resolution in the lexer).
+        bytes: String,
+        /// Source location of the literal that first interned this content.
+        span: Span,
+    },
+    /// **M07.2**: N bytes were copied from a source memory region into a
+    /// heap allocation. Emitted by `String::from(s)` (copies from `s`'s
+    /// region into a fresh heap String buffer) and `push_str(s)` (copies
+    /// from `s`'s region into the receiver's existing heap buffer). Makes
+    /// the data-flow visible — without this, the copy looked magical
+    /// (bytes appeared in the heap with no link to the source).
+    BytesCopy {
+        /// Source region (typically `Pointee::Static(_)` for `&str` args).
+        from: Pointee,
+        /// Byte offset within the source block where the copied range
+        /// starts. Pairs with `n_bytes` to identify the exact sub-range —
+        /// e.g. `String::from(&"hello"[1..4])` copies from offset 1.
+        from_byte_offset: u32,
+        /// Destination heap allocation.
+        to: HeapAddr,
+        /// Number of bytes copied.
+        n_bytes: u32,
+        /// Source location of the call site.
         span: Span,
     },
 

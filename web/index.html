@@ -65,12 +65,23 @@
         <option value="m07_1_slice_basic">Slice basic (M07.1)</option>
         <option value="m07_1_slice_range">Slice range (M07.1)</option>
         <option value="m07_1_slice_dangling">Slice dangling (M07.1)</option>
+        <option value="m07_2_str_literal">Str literal (M07.2)</option>
+        <option value="m07_2_str_subslice">&amp;str sub-slice (M07.2)</option>
+        <option value="m07_2_string_from">String::from + static (M07.2)</option>
+        <option value="m07_2_string_from_binding">String::from(&amp;str binding) + copy arrow (M07.2)</option>
+        <option value="m07_2_push_str">push_str + static (M07.2)</option>
       </select>
     </header>
 
     <main>
       <section id="editor" aria-label="source code"></section>
       <section id="stacks" aria-label="stacks panel"></section>
+      <!-- M07.2: static memory region (read-only data segment). Holds
+           one block per unique string-literal content; persists for the
+           trace's lifetime. -->
+      <section id="static" aria-label="static memory">
+        <header class="static-label">static memory (RO)</header>
+      </section>
       <section id="heap" aria-label="heap panel"></section>
       <!-- M06: SVG arrow overlay drawn above all panels. pointer-events:none
            so clicks pass through to the underlying panels. M07 adds a black
@@ -93,6 +104,13 @@
             <path d="M0,0 L10,5 L0,10 z" fill="context-stroke" />
           </marker>
           <marker id="arrow-head-owning" viewBox="0 0 10 10" refX="9" refY="5"
+                  markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse"
+                  orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="context-stroke" />
+          </marker>
+          <!-- M07.2: orange arrowhead for the transient "bytes copied"
+               arrow (String::from / push_str data-flow indicator). -->
+          <marker id="arrow-head-copy" viewBox="0 0 10 10" refX="9" refY="5"
                   markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse"
                   orient="auto-start-reverse">
             <path d="M0,0 L10,5 L0,10 z" fill="context-stroke" />
