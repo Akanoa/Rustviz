@@ -96,7 +96,22 @@ main > section {
   z-index: 10;
 }
 
-/* M06: borrow arrows. Blue for shared (`&`), red for mutable (`&mut`). */
+/* M06: borrow arrows. Blue for shared (`&`), red for mutable (`&mut`).
+   M07: hover highlight — thicker stroke + drop-shadow to bring the arrow
+   to the foreground. `pointer-events: stroke` on each path lets the
+   stroke catch hover events while the overlay's bounding box stays
+   click-through (the overlay itself stays `pointer-events: none`). */
+#arrow-overlay path {
+  pointer-events: stroke;
+  transition: stroke-width 120ms ease-out, filter 120ms ease-out;
+}
+
+#arrow-overlay path:hover {
+  stroke: #5eb1ff;       /* light blue highlight */
+  stroke-width: 3.5;
+  filter: drop-shadow(0 0 3px rgba(0, 0, 0, 0.45));
+}
+
 #arrow-overlay .arrow-shared {
   stroke: #2a6fa5;
   fill: none;
