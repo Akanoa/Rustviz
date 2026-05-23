@@ -393,6 +393,77 @@ mod tests {
         assert_eq!(err.stage, CompileStage::Typeck);
     }
 
+    // M06.1 / US1: direct assignment to `let mut` bindings.
+
+    #[test]
+    fn run_pipeline_assign_basic() {
+        let source = "fn main() { let mut x = 0; x = 7; }";
+        let events = run_pipeline(source).expect("direct assign compiles");
+        let writes = events
+            .iter()
+            .filter(|e| matches!(e, crate::MemEvent::SlotWrite { .. }))
+            .count();
+        assert!(writes >= 2, "expected ≥ 2 SlotWrite events (init + reassign)");
+    }
+
+    #[test]
+    fn run_pipeline_assign_immutable_rejected() {
+        let err = run_pipeline("fn main() { let x = 0; x = 7; }")
+            .expect_err("immutable binding rejects reassignment");
+        assert_eq!(err.stage, CompileStage::Typeck);
+    }
+
+    // M06.1 / US2: deref-read.
+
+    #[test]
+    fn run_pipeline_deref_read_shared() {
+        let source = "fn main() { let x = 42; let r = &x; let y = *r; }";
+        let events = run_pipeline(source).expect("deref-read through &T compiles");
+        let has_42 = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite {
+                value: crate::Value::Int { bits: 42, .. },
+                ..
+            }
+        ));
+        assert!(has_42, "expected a SlotWrite with value 42 (y bound through *r)");
+    }
+
+    #[test]
+    fn run_pipeline_deref_on_non_reference_rejected() {
+        let err = run_pipeline("fn main() { let x = 5; let y = *x; }")
+            .expect_err("deref of non-reference is invalid");
+        assert_eq!(err.stage, CompileStage::Typeck);
+    }
+
+    // M06.1 / US3: deref-write.
+
+    #[test]
+    fn run_pipeline_deref_write_basic() {
+        let source = "fn main() { let mut x = 5; let r = &mut x; *r = 10; }";
+        let events = run_pipeline(source).expect("through-ref write compiles");
+        let has_10 = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite {
+                value: crate::Value::Int { bits: 10, .. },
+                ..
+            }
+        ));
+        assert!(has_10, "expected a SlotWrite with value 10 (through *r)");
+    }
+
+    #[test]
+    fn run_pipeline_deref_write_through_shared_rejected() {
+        let err = run_pipeline("fn main() { let x = 5; let r = &x; *r = 10; }")
+            .expect_err("cannot assign through &T");
+        assert_eq!(err.stage, CompileStage::Typeck);
+    }
+
+    #[test]
+    fn run_pipeline_assign_to_borrowed_rejected() {
+        let err = run_pipeline("fn main() { let mut x = 5; let r = &x; x = 7; }")
+            .expect_err("cannot assign to a borrowed binding");
+        assert_eq!(err.stage, CompileStage::Typeck);
+    }
+
     #[test]
     fn compile_error_serde_roundtrip() {
         let err = run_pipeline("fn main() { let x = ; }").expect_err("parse error");

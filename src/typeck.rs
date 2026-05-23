@@ -365,6 +365,12 @@ mod borrow_tracker {
                 stack.retain(|a| a.scope_depth < leaving_depth);
             }
         }
+
+        /// **M06.1**: whether `b` has any active borrows. Used by typeck to
+        /// reject direct assignment to a currently-borrowed binding.
+        pub fn is_borrowed(&self, b: BindingId) -> bool {
+            self.active.get(&b).map(|v| !v.is_empty()).unwrap_or(false)
+        }
     }
 }
 
@@ -506,7 +512,121 @@ impl<'a> Typechecker<'a> {
             ast::Stmt::Expr(expr) => {
                 self.typecheck_expr(expr)?;
             }
+            // **M06.1**: assignment statement `lhs = rhs;`. Handles both
+            // direct assignment (US1: `Expr::Ident(x)` lhs) and through-ref
+            // assignment (US3: `Expr::Deref(Expr::Ident(r))` lhs).
+            ast::Stmt::Assign { lhs, rhs, span } => {
+                self.typecheck_assign(lhs, rhs, *span)?;
+            }
         }
+        Ok(())
+    }
+
+    /// **M06.1**: typecheck an assignment statement. The lhs must be a place
+    /// expression (`Expr::Ident(x)` with `x: let mut`, OR
+    /// `Expr::Deref(Expr::Ident(r))` with `r: &mut T`). The rhs must
+    /// typecheck to the same type (with M03.2 literal coercion).
+    fn typecheck_assign(
+        &mut self,
+        lhs: &ast::Expr,
+        rhs: &ast::Expr,
+        span: Span,
+    ) -> Result<(), ParseError> {
+        // Determine the lhs's expected type and the binding being mutated.
+        let lhs_ty = match lhs {
+            ast::Expr::Ident(name, ident_span) => {
+                // Direct assignment to a `let mut` binding.
+                let binding_id = *self
+                    .resolution
+                    .uses
+                    .get(ident_span)
+                    .expect("ident resolved");
+                let decl = &self.resolution.bindings[&binding_id];
+                let is_mut_let = matches!(decl.kind, BindingKind::Let { mutable: true, .. });
+                if !is_mut_let {
+                    return Err(ParseError {
+                        message: format!("cannot assign to immutable variable `{name}`"),
+                        span: *ident_span,
+                    });
+                }
+                // M06: cannot assign to a borrowed binding.
+                if self.borrow_tracker.is_borrowed(binding_id) {
+                    return Err(ParseError {
+                        message: format!(
+                            "cannot assign to `{name}` because it is borrowed"
+                        ),
+                        span: *ident_span,
+                    });
+                }
+                // Look up x's current type.
+                match self.types.binding_types.get(&binding_id) {
+                    Some(BindingType::Var(t)) => t.clone(),
+                    _ => panic!("typeck saw an unbound or non-var ident at assign lhs"),
+                }
+            }
+            ast::Expr::Deref { inner, span: deref_span } => {
+                // Through-ref assignment: inner must be Ident, its type must
+                // be `&mut T`. No borrow-tracker check (R-008): the `&mut`
+                // itself is what permits the write.
+                let inner_ident = match inner.as_ref() {
+                    ast::Expr::Ident(_, _) => inner.as_ref(),
+                    _ => {
+                        return Err(ParseError {
+                            message: "left side of assignment must be a place expression".into(),
+                            span: lhs.span(),
+                        });
+                    }
+                };
+                let inner_ty = self.typecheck_expr(inner_ident)?;
+                match inner_ty {
+                    Ty::Ref { inner: target, mutable: true } => {
+                        // Also record the deref's own type in expr_types so
+                        // future consumers don't panic.
+                        self.types.expr_types.insert(*deref_span, (*target).clone());
+                        *target
+                    }
+                    Ty::Ref { mutable: false, .. } => {
+                        return Err(ParseError {
+                            message: "cannot assign through `&T`; need `&mut T`".into(),
+                            span: *deref_span,
+                        });
+                    }
+                    other => {
+                        return Err(ParseError {
+                            message: format!(
+                                "cannot dereference value of type `{}`; expected a reference",
+                                other.name()
+                            ),
+                            span: inner.span(),
+                        });
+                    }
+                }
+            }
+            _ => {
+                return Err(ParseError {
+                    message: "left side of assignment must be a place expression".into(),
+                    span: lhs.span(),
+                });
+            }
+        };
+        // Typecheck rhs and coerce to lhs's type if it's a literal.
+        let rhs_ty = self.typecheck_expr(rhs)?;
+        let rhs_ty = self
+            .try_coerce_to(rhs, rhs_ty.clone(), lhs_ty.clone())
+            .unwrap_or(rhs_ty);
+        if rhs_ty != lhs_ty {
+            return Err(ParseError {
+                message: format!(
+                    "expected `{}`, found `{}`",
+                    lhs_ty.name(),
+                    rhs_ty.name()
+                ),
+                span: rhs.span(),
+            });
+        }
+        // Record the statement's "expression type" implicitly as Unit; not
+        // strictly necessary since Stmt doesn't expose a type to callers.
+        let _ = span;
         Ok(())
     }
 
@@ -644,6 +764,21 @@ impl<'a> Typechecker<'a> {
             // **M06**: borrow expressions `&place` and `&mut place`.
             ast::Expr::Borrow { inner, mutable, span } => {
                 self.typecheck_borrow(inner, *mutable, *span)
+            }
+            // **M06.1**: deref expression `*r`. Inner must be a reference;
+            // the deref's type is the referenced type (regardless of mut).
+            ast::Expr::Deref { inner, .. } => {
+                let inner_ty = self.typecheck_expr(inner)?;
+                match inner_ty {
+                    Ty::Ref { inner: target, .. } => Ok(*target),
+                    other => Err(ParseError {
+                        message: format!(
+                            "cannot dereference value of type `{}`; expected a reference",
+                            other.name()
+                        ),
+                        span: inner.span(),
+                    }),
+                }
             }
         }
     }

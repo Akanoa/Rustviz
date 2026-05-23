@@ -478,7 +478,83 @@ impl<'a> Evaluator<'a> {
             ast::Stmt::Expr(expr) => {
                 let _ = self.eval_expr(expr);
             }
+            // **M06.1**: assignment statement. Two cases:
+            //   - lhs is `Expr::Ident(x)`: direct assignment to x's slot.
+            //   - lhs is `Expr::Deref(Expr::Ident(r))`: write through r to
+            //     the target slot.
+            // Both cases: emit `SlotWrite { slot_id, value, span }` and
+            // update the in-memory LocalSlot value via `update_slot_value`.
+            ast::Stmt::Assign { lhs, rhs, span } => {
+                let value = self.eval_expr(rhs);
+                if self.halted {
+                    return;
+                }
+                let target_slot = match lhs {
+                    ast::Expr::Ident(_, ident_span) => {
+                        let binding_id = *self
+                            .resolution
+                            .uses
+                            .get(ident_span)
+                            .expect("ident resolved");
+                        self.lookup_local_slot(binding_id)
+                            .expect("local slot exists for assigned binding")
+                    }
+                    ast::Expr::Deref { inner, .. } => {
+                        // Read r's Value::Ref to find target_slot.
+                        let ref_value = self.eval_expr(inner);
+                        if self.halted {
+                            return;
+                        }
+                        match ref_value {
+                            Value::Ref { target_slot, mutable: true, .. } => target_slot,
+                            _ => panic!(
+                                "typeck should reject deref-assign through non-&mut value"
+                            ),
+                        }
+                    }
+                    _ => panic!("typeck should reject non-place assignment lhs"),
+                };
+                self.events.push(MemEvent::SlotWrite {
+                    slot_id: target_slot,
+                    value: value.clone(),
+                    span: *span,
+                });
+                self.update_slot_value(target_slot, value);
+            }
         }
+    }
+
+    /// **M06.1**: write `value` to the LocalSlot with `slot_id`, anywhere in
+    /// the call stack. Panics if not found (typeck guarantees the slot's
+    /// existence during the assignment's lifetime).
+    fn update_slot_value(&mut self, slot_id: SlotId, value: Value) {
+        for frame in self.frames.iter_mut().rev() {
+            for scope in frame.scopes.iter_mut().rev() {
+                for local in scope.locals.iter_mut().rev() {
+                    if local.slot_id == slot_id {
+                        local.value = value;
+                        return;
+                    }
+                }
+            }
+        }
+        panic!("update_slot_value: slot {slot_id:?} not found in any active frame");
+    }
+
+    /// **M06.1**: read the current value at `slot_id`, anywhere in the call
+    /// stack. Used by `Expr::Deref` rvalue evaluation. Returns `None` if not
+    /// found.
+    fn lookup_slot_value(&self, slot_id: SlotId) -> Option<Value> {
+        for frame in self.frames.iter().rev() {
+            for scope in frame.scopes.iter().rev() {
+                for local in scope.locals.iter().rev() {
+                    if local.slot_id == slot_id {
+                        return Some(local.value.clone());
+                    }
+                }
+            }
+        }
+        None
     }
 
     fn eval_expr(&mut self, expr: &ast::Expr) -> Value {
@@ -610,6 +686,21 @@ impl<'a> Evaluator<'a> {
                     borrow_id,
                     target_slot,
                     mutable: *mutable,
+                }
+            }
+            // **M06.1**: `*r` — read through a reference. Inner evaluates to
+            // a `Value::Ref { target_slot, .. }`; we look up that slot's
+            // current value and return it.
+            ast::Expr::Deref { inner, .. } => {
+                let ref_value = self.eval_expr(inner);
+                if self.halted {
+                    return Value::Unit;
+                }
+                match ref_value {
+                    Value::Ref { target_slot, .. } => self
+                        .lookup_slot_value(target_slot)
+                        .expect("target slot exists during borrow's lifetime"),
+                    _ => panic!("typeck should reject deref of non-reference"),
                 }
             }
         }

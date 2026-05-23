@@ -205,6 +205,11 @@ impl Resolver {
             ast::Stmt::Expr(expr) => {
                 self.resolve_expr(expr)?;
             }
+            // **M06.1**: resolve both sides of an assignment. No new binding.
+            ast::Stmt::Assign { lhs, rhs, .. } => {
+                self.resolve_expr(lhs)?;
+                self.resolve_expr(rhs)?;
+            }
         }
         Ok(())
     }
@@ -227,6 +232,7 @@ impl Resolver {
             },
             ast::Expr::Unary { expr, .. } => self.resolve_expr(expr)?,
             ast::Expr::Borrow { inner, .. } => self.resolve_expr(inner)?,
+            ast::Expr::Deref { inner, .. } => self.resolve_expr(inner)?,
             ast::Expr::Binary { lhs, rhs, .. } => {
                 self.resolve_expr(lhs)?;
                 self.resolve_expr(rhs)?;

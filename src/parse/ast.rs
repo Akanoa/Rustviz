@@ -95,6 +95,19 @@ pub enum Stmt {
     Let(LetStmt),
     /// An expression followed by `;` (its value is discarded).
     Expr(Expr),
+    /// **M06.1**: assignment statement `lhs = rhs;`. The `lhs` must be a
+    /// place expression — typeck restricts it to `Expr::Ident(_, _)` (direct
+    /// assignment to a `mut` binding) or `Expr::Deref(Expr::Ident(_, _))`
+    /// (write through a `&mut` reference). Emits a `MemEvent::SlotWrite`
+    /// event at the resolved target slot.
+    Assign {
+        /// Place expression on the left side.
+        lhs: Expr,
+        /// Value expression on the right side.
+        rhs: Expr,
+        /// Span from start of `lhs` through `;`.
+        span: Span,
+    },
 }
 
 /// A `let` binding.
@@ -186,6 +199,15 @@ pub enum Expr {
         /// Span from `&` (or `&mut`) through end of `inner`.
         span: Span,
     },
+    /// **M06.1**: `*expr` — read through a reference (rvalue), or write
+    /// through a reference when used as the lhs of `Stmt::Assign` (lvalue).
+    /// Typeck requires `inner`'s type to be `Ty::Ref { .. }`.
+    Deref {
+        /// The expression being dereferenced.
+        inner: Box<Expr>,
+        /// Span from `*` through end of inner.
+        span: Span,
+    },
 }
 
 impl Expr {
@@ -201,7 +223,8 @@ impl Expr {
             | Self::Call { span, .. }
             | Self::Paren { span, .. }
             | Self::If { span, .. }
-            | Self::Borrow { span, .. } => *span,
+            | Self::Borrow { span, .. }
+            | Self::Deref { span, .. } => *span,
             Self::Block(b) => b.span,
         }
     }

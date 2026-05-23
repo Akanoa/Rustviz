@@ -158,6 +158,9 @@ main > section:last-child {
   border: 1px solid var(--frame-border);
   border-radius: 4px;
   padding: 0.4rem 0.6rem;
+  /* M06.1: extra left padding gives borrow-arrow gutters room without
+     overlapping the slot text. */
+  padding-left: 2.5rem;
 }
 
 .frame-card .frame-header {

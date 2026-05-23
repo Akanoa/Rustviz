@@ -177,13 +177,21 @@ impl Parser {
                 continue;
             }
             let expr = self.parse_expr(0)?;
-            if self.bump_if(&TokenKind::Semi).is_some() {
+            // M06.1: if the parsed expression is followed by `=`, treat the
+            // whole thing as an assignment statement. lhs validity is checked
+            // at typeck (place-expression rule).
+            if self.bump_if(&TokenKind::Eq).is_some() {
+                let rhs = self.parse_expr(0)?;
+                let semi = self.expect(&TokenKind::Semi, "`;`")?;
+                let span = expr.span().merge(semi.span);
+                stmts.push(Stmt::Assign { lhs: expr, rhs, span });
+            } else if self.bump_if(&TokenKind::Semi).is_some() {
                 stmts.push(Stmt::Expr(expr));
             } else if self.at(&TokenKind::RBrace) {
                 tail = Some(Box::new(expr));
                 break;
             } else {
-                return Err(self.error_expected("`;` or `}`"));
+                return Err(self.error_expected("`;`, `=`, or `}`"));
             }
         }
         let rbrace = self.expect(&TokenKind::RBrace, "`}`")?;
@@ -324,6 +332,7 @@ impl Parser {
             TokenKind::Minus => self.parse_unary(UnOp::Neg),
             TokenKind::Bang => self.parse_unary(UnOp::Not),
             TokenKind::Amp | TokenKind::AmpMut => self.parse_borrow_expr(),
+            TokenKind::Star => self.parse_deref_expr(),
             _ => Err(self.error_expected("expression")),
         }
     }
@@ -351,6 +360,19 @@ impl Parser {
         Ok(Expr::Borrow {
             inner: Box::new(inner),
             mutable,
+            span,
+        })
+    }
+
+    /// **M06.1**: `*expr` — prefix deref. Same precedence as other unaries
+    /// (bp 70). Disambiguation from binary `*` is by parser position: this
+    /// path runs at expression-start; the binary path runs after an operand.
+    fn parse_deref_expr(&mut self) -> Result<Expr, ParseError> {
+        let star = self.bump();
+        let inner = self.parse_expr(70)?;
+        let span = star.span.merge(inner.span());
+        Ok(Expr::Deref {
+            inner: Box::new(inner),
             span,
         })
     }

@@ -275,17 +275,18 @@ function renderArrows(borrows) {
     if (!srcEl || !tgtEl) continue;
     const src = srcEl.getBoundingClientRect();
     const tgt = tgtEl.getBoundingClientRect();
-    // Anchor from the right edge of source to the right edge of target,
-    // both vertically centered. Curve outward to the right for visibility.
-    const x1 = src.right - overlayBox.left;
+    // M06.1: anchor on the LEFT edge of both slots. Route as a rectilinear
+    // path (H-V-H) through a gutter to the LEFT of the cards. Avoids
+    // overlaying the slot text. Each arrow gets its own lane offset by its
+    // index, so multiple arrows pointing at the same target don't collapse.
+    const x1 = src.left - overlayBox.left;
     const y1 = src.top + src.height / 2 - overlayBox.top;
-    const x2 = tgt.right - overlayBox.left;
+    const x2 = tgt.left - overlayBox.left;
     const y2 = tgt.top + tgt.height / 2 - overlayBox.top;
-    // Control point offset to the right of both endpoints for a clean curve.
-    const cx = Math.max(x1, x2) + 40;
-    const cy = (y1 + y2) / 2;
+    const lane = 10 + (borrows.indexOf(b) * 6);
+    const gutterX = Math.min(x1, x2) - lane;
     const path = document.createElementNS(NS, "path");
-    path.setAttribute("d", `M${x1},${y1} Q${cx},${cy} ${x2},${y2}`);
+    path.setAttribute("d", `M${x1},${y1} H${gutterX} V${y2} H${x2}`);
     path.setAttribute("class", b.mutable ? "arrow-mut" : "arrow-shared");
     overlay.appendChild(path);
   }

@@ -319,9 +319,25 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                     borrow.source_slot = Some(slot_id.0);
                 }
             }
+            // M06.1: render Value::Ref using the *binding name* of the target
+            // slot (`&x`, `&mut x`) instead of `&slot0` / `&mut slot0`. The
+            // SlotId is implementation jargon; learners think in binding names.
+            // Fall back to `slot{N}` only if the target slot isn't found.
+            let rendered = match value {
+                Value::Ref { target_slot, mutable, .. } => {
+                    let name = lookup_slot_name(&world.frames, target_slot.0)
+                        .unwrap_or_else(|| format!("slot{}", target_slot.0));
+                    if *mutable {
+                        format!("&mut {name}")
+                    } else {
+                        format!("&{name}")
+                    }
+                }
+                _ => render_value(value),
+            };
             for frame in &mut world.frames {
                 if let Some(slot) = frame.slots.iter_mut().find(|s| s.slot_id == slot_id.0) {
-                    slot.value = Some(render_value(value));
+                    slot.value = Some(rendered);
                     return;
                 }
             }
@@ -436,6 +452,21 @@ fn return_to_pending(event: &MemEvent) -> Option<PendingReturnView> {
     }
 }
 
+/// **M06.1**: look up the binding name of the slot with `slot_id` anywhere
+/// in the call stack's live frames. Used by SlotWrite's render path so
+/// `Value::Ref { target_slot: 0 }` renders as `&x` (the binding name) rather
+/// than `&slot0` (the internal id).
+fn lookup_slot_name(frames: &[FrameInProgress], slot_id: u32) -> Option<String> {
+    for frame in frames {
+        for slot in &frame.slots {
+            if slot.slot_id == slot_id {
+                return Some(slot.name.clone());
+            }
+        }
+    }
+    None
+}
+
 fn render_value(value: &Value) -> String {
     match value {
         // M03.2: type-tag suffix on numeric values (`5_i32`, `2.5_f64`, `NaN_f64`, ...).
@@ -457,7 +488,11 @@ fn render_value(value: &Value) -> String {
         }
         Value::Bool(b) => b.to_string(),
         Value::Unit => "()".to_owned(),
-        // M06: reference value renders as `&slot{N}` or `&mut slot{N}`.
+        // M06: reference value. Renders as `&slot{N}` here as a fallback only.
+        // The SlotWrite path special-cases Value::Ref to use the BINDING name
+        // (`&x`, `&mut x`) via `lookup_slot_name`. This fallback is reached
+        // only if the value is rendered outside the SlotWrite path (e.g.
+        // future ReturnValue of a ref — not constructible in M06.1).
         Value::Ref { target_slot, mutable, .. } => {
             if *mutable {
                 format!("&mut slot{}", target_slot.0)
