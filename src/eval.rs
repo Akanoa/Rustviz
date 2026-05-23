@@ -363,6 +363,39 @@ impl<'a> Evaluator<'a> {
             .expect("static block must exist for any Pointee::Static value")
     }
 
+    /// **M07.2**: snapshot the current scope's borrow count. Paired with
+    /// `end_transient_borrows_since` to end any borrows that came into
+    /// existence during a transient sub-evaluation (e.g. evaluating a
+    /// function-call arg). Without this, transient literal borrows (like
+    /// the `"hi"` in `String::from("hi")`) sit in the scope tracker until
+    /// the function returns, producing silent no-op cursor steps at
+    /// scope-exit BorrowEnd time — the borrows were never bound to any
+    /// visible slot, so their end is invisible.
+    fn scope_borrows_snapshot(&self) -> usize {
+        self.frames
+            .last()
+            .and_then(|f| f.scopes.last())
+            .map(|s| s.borrows.len())
+            .unwrap_or(0)
+    }
+
+    /// **M07.2**: end any borrows added to the current scope since the
+    /// given snapshot was taken. Fires BorrowEnd inline for each and
+    /// removes the ids from the scope tracker so scope-exit doesn't
+    /// double-emit. Used by `String::from` / `push_str` to release
+    /// literal/sub-slice args' transient borrows at the call's end.
+    fn end_transient_borrows_since(&mut self, snapshot: usize, span: Span) {
+        let to_end: Vec<crate::event::BorrowId> = self
+            .frames
+            .last_mut()
+            .and_then(|f| f.scopes.last_mut())
+            .map(|s| s.borrows.split_off(snapshot))
+            .unwrap_or_default();
+        for borrow_id in to_end.into_iter().rev() {
+            self.events.push(MemEvent::BorrowEnd { borrow_id, span });
+        }
+    }
+
     /// **M07**: allocate a heap object and emit `HeapAlloc`. Returns the
     /// new addr. Tracks the addr in the current scope for HeapFree on exit.
     fn alloc_heap(&mut self, obj: HeapObject, ty_name: String, size: u32, span: Span) -> crate::event::HeapAddr {
@@ -1346,9 +1379,12 @@ impl<'a> Evaluator<'a> {
                 // targeting the static region. Extract the slice's bytes
                 // (respecting its byte_offset/byte_len so sub-slices like
                 // `String::from(&"hello"[..2])` copy just the visible window
-                // "he", not the whole "hello"). The slice's borrow lives
-                // in the active scope and fires its own BorrowEnd at scope
-                // exit.
+                // "he", not the whole "hello"). Snapshot the scope's borrow
+                // count BEFORE arg eval so any transient borrows created
+                // for the arg (literal `"hi"`, sub-slice `&s[..2]`, ...)
+                // can be released inline after the call instead of lingering
+                // to scope-exit and producing silent no-op cursor steps.
+                let borrows_before = self.scope_borrows_snapshot();
                 let (source, source_offset, s) = match self.eval_expr(&args[0]) {
                     Value::Slice {
                         target: crate::event::Pointee::Static(saddr),
@@ -1400,6 +1436,9 @@ impl<'a> Evaluator<'a> {
                     n_bytes,
                     span,
                 });
+                // M07.2: release the arg's transient borrow inline (literal
+                // `"hi"`, sub-slice `&s[..2]`, etc.) — already consumed.
+                self.end_transient_borrows_since(borrows_before, span);
                 Value::String { addr }
             }
             _ => panic!("typeck should have rejected unknown path"),
@@ -1432,6 +1471,8 @@ impl<'a> Evaluator<'a> {
                 // **M07 → M07.2**: arg evaluation produces `Value::Slice`
                 // targeting the static region. Look up bytes via the slice's
                 // byte_offset/byte_len so sub-slices push just their window.
+                // Same transient-borrow snapshot pattern as `String::from`.
+                let borrows_before = self.scope_borrows_snapshot();
                 let (source, source_offset, suffix) = match self.eval_expr(&args[0]) {
                     Value::Slice {
                         target: crate::event::Pointee::Static(saddr),
@@ -1478,6 +1519,8 @@ impl<'a> Evaluator<'a> {
                     span,
                 });
                 self.string_push_str(dest_addr, &suffix, span);
+                // M07.2: release the arg's transient borrow inline.
+                self.end_transient_borrows_since(borrows_before, span);
                 Value::Unit
             }
             // M07.1: `Slice::len()` returns the slice's stored length as u64.
