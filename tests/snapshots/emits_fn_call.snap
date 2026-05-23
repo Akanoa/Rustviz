@@ -10,8 +10,8 @@ Ok(
             ),
             fn_name: "main",
             span: Span {
-                start: 45,
-                end: 81,
+                start: 48,
+                end: 52,
                 file: FileId(
                     1,
                 ),

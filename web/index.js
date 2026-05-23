@@ -189,9 +189,6 @@ function render(state) {
     stacksEl.appendChild(card);
   }
 
-  // M06: draw borrow arrows after slot rows exist in the DOM.
-  renderArrows(state.borrows || []);
-
   // Editor span highlight (yellow, most-recent event).
   if (state.editor_highlight) {
     const { start, end } = state.editor_highlight;
@@ -226,6 +223,13 @@ function render(state) {
   // M05 / US2: success path — clear any error underline + re-enable controls.
   editorView.dispatch({ effects: setError.of(null) });
   setControlsEnabled(true);
+
+  // M06.1: render borrow arrows LAST, after the status bar has taken its
+  // final size. Otherwise the arrows are positioned against the pre-status
+  // layout and visibly drift when a Note appears/disappears between steps.
+  // Use requestAnimationFrame so the browser has flushed all DOM mutations
+  // into a settled layout before getBoundingClientRect runs.
+  requestAnimationFrame(() => renderArrows(state.borrows || []));
 }
 
 // M05 / US2: render a compile error. Underline the span, show the message

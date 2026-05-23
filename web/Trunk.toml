@@ -10,7 +10,13 @@ port = 8080
 # live in-browser via Player::set_source. The `gen_traces` binary still
 # exists for CLI offline pipeline verification (`cargo run --bin gen_traces`).
 #
-# The watcher still ignores `traces/` (now-unused, gitignored) and `dist/`
-# (trunk's output dir) so trunk doesn't loop on its own writes.
+# M06.1: extend the watch list to the crate source so Rust edits trigger an
+# automatic rebuild without needing to also touch a file under `web/`.
+# Trunk's default watch is just the build target's parent folder (`web/`);
+# we explicitly add `../src` and `../Cargo.toml` so the WASM rebuilds when
+# the agent edits Rust code. `traces/` (unused, gitignored) and `dist/`
+# (trunk's own output dir) stay ignored so trunk doesn't loop on its own
+# writes.
 [watch]
 ignore = ["traces", "dist"]
+watch = [".", "../src", "../Cargo.toml"]

@@ -33,7 +33,18 @@ pub fn evaluate(
     });
     if let Some(id) = main_id {
         let decl = eval.fn_decls[&id];
-        let _ = eval.call_fn(id, Vec::new(), decl.span);
+        // **M06.1**: synthesize a tight span pointing at `main`'s name token
+        // (3-char `fn ` prefix offset, then the identifier) rather than the
+        // whole `fn main() { ... }` decl. The latter highlights the entire
+        // function body at step 1 (FrameEnter), which is visually disruptive.
+        let name_len = decl.name.len() as u32;
+        let name_start = decl.span.start + 3; // skip `fn `
+        let entry_span = crate::parse::span::Span::new(
+            name_start,
+            name_start + name_len,
+            decl.span.file,
+        );
+        let _ = eval.call_fn(id, Vec::new(), entry_span);
     }
 
     Ok(eval.events)
@@ -50,6 +61,11 @@ struct Evaluator<'a> {
     next_frame_id: u32,
     /// **M06**: monotonic counter for borrow ids.
     next_borrow_id: u32,
+    /// **M06.1**: Info notes deferred until the end of the current statement.
+    /// Used by deref-read so the explanatory Note appears AFTER the
+    /// containing stmt's SlotWrite (i.e. at the same cursor step where the
+    /// new binding actually has the read value) rather than before.
+    pending_notes: Vec<MemEvent>,
     /// Emitted events in source-execution order.
     events: Vec<MemEvent>,
     /// Set to true on runtime error to stop further evaluation.
@@ -114,9 +130,19 @@ impl<'a> Evaluator<'a> {
             next_slot_id: 0,
             next_frame_id: 0,
             next_borrow_id: 0,
+            pending_notes: Vec::new(),
             events: Vec::new(),
             halted: false,
         })
+    }
+
+    /// **M06.1**: flush any deferred Notes (emitted during rhs evaluation,
+    /// held back so they appear AFTER the statement's main SlotWrite).
+    fn flush_pending_notes(&mut self) {
+        if !self.pending_notes.is_empty() {
+            let drained: Vec<_> = self.pending_notes.drain(..).collect();
+            self.events.extend(drained);
+        }
     }
 
     /// **M06**: allocate a fresh borrow id.
@@ -436,6 +462,18 @@ impl<'a> Evaluator<'a> {
     }
 
     fn eval_stmt(&mut self, stmt: &ast::Stmt) {
+        let result = self.eval_stmt_inner(stmt);
+        // **M06.1**: flush any deferred Notes (e.g. from deref-read) AFTER
+        // the statement's main effects, so the explanatory message and the
+        // result (e.g. SlotWrite of the new binding) land at adjacent cursor
+        // steps with the result first.
+        if !self.halted {
+            self.flush_pending_notes();
+        }
+        let _ = result;
+    }
+
+    fn eval_stmt_inner(&mut self, stmt: &ast::Stmt) {
         if self.halted {
             return;
         }
@@ -489,6 +527,11 @@ impl<'a> Evaluator<'a> {
                 if self.halted {
                     return;
                 }
+                // For deref-write we also queue an explanatory Note (same
+                // deferred-Note pattern as deref-read, so the message lands
+                // at the cursor step right after the SlotWrite that the
+                // learner just saw).
+                let mut deref_note: Option<MemEvent> = None;
                 let target_slot = match lhs {
                     ast::Expr::Ident(_, ident_span) => {
                         let binding_id = *self
@@ -499,18 +542,39 @@ impl<'a> Evaluator<'a> {
                         self.lookup_local_slot(binding_id)
                             .expect("local slot exists for assigned binding")
                     }
-                    ast::Expr::Deref { inner, .. } => {
+                    ast::Expr::Deref { inner, span: deref_span } => {
                         // Read r's Value::Ref to find target_slot.
                         let ref_value = self.eval_expr(inner);
                         if self.halted {
                             return;
                         }
-                        match ref_value {
+                        let target_slot = match ref_value {
                             Value::Ref { target_slot, mutable: true, .. } => target_slot,
                             _ => panic!(
                                 "typeck should reject deref-assign through non-&mut value"
                             ),
-                        }
+                        };
+                        // **M06.1**: pop the deref-READ note that
+                        // `eval_expr(inner)` would have queued — but
+                        // actually inner is the Ident (`r`), not the Deref,
+                        // so no read-note was queued. We just add the
+                        // write-note here.
+                        let ref_name = match inner.as_ref() {
+                            ast::Expr::Ident(name, _) => name.clone(),
+                            _ => "reference".to_owned(),
+                        };
+                        let target_name = self
+                            .lookup_slot_name(target_slot)
+                            .unwrap_or_else(|| format!("slot{}", target_slot.0));
+                        deref_note = Some(MemEvent::Note {
+                            kind: NoteKind::Info,
+                            message: format!(
+                                "*{ref_name} writes {} to {target_name} (through `&mut {ref_name}` — `{ref_name}` itself is unchanged)",
+                                render_value_for_note(&value)
+                            ),
+                            span: *deref_span,
+                        });
+                        target_slot
                     }
                     _ => panic!("typeck should reject non-place assignment lhs"),
                 };
@@ -520,6 +584,9 @@ impl<'a> Evaluator<'a> {
                     span: *span,
                 });
                 self.update_slot_value(target_slot, value);
+                if let Some(note) = deref_note {
+                    self.pending_notes.push(note);
+                }
             }
         }
     }
@@ -691,19 +758,60 @@ impl<'a> Evaluator<'a> {
             // **M06.1**: `*r` — read through a reference. Inner evaluates to
             // a `Value::Ref { target_slot, .. }`; we look up that slot's
             // current value and return it.
-            ast::Expr::Deref { inner, .. } => {
+            ast::Expr::Deref { inner, span } => {
                 let ref_value = self.eval_expr(inner);
                 if self.halted {
                     return Value::Unit;
                 }
                 match ref_value {
-                    Value::Ref { target_slot, .. } => self
-                        .lookup_slot_value(target_slot)
-                        .expect("target slot exists during borrow's lifetime"),
+                    Value::Ref { target_slot, .. } => {
+                        let value = self
+                            .lookup_slot_value(target_slot)
+                            .expect("target slot exists during borrow's lifetime");
+                        // **M06.1**: emit a pedagogical Info note explaining the
+                        // deref-read. Makes the value-copy explicit (not the
+                        // reference being moved). Status bar renders this so
+                        // the learner sees "*r reads <v> from <x>" next to the
+                        // editor's highlight of `*r`.
+                        let ref_name = match inner.as_ref() {
+                            ast::Expr::Ident(name, _) => name.clone(),
+                            _ => "reference".to_owned(),
+                        };
+                        let target_name = self
+                            .lookup_slot_name(target_slot)
+                            .unwrap_or_else(|| format!("slot{}", target_slot.0));
+                        // Defer the Note: see `pending_notes` field doc. The
+                        // consuming statement's eval flushes it after its
+                        // own SlotWrite so message and result land at the
+                        // same cursor step.
+                        self.pending_notes.push(MemEvent::Note {
+                            kind: NoteKind::Info,
+                            message: format!(
+                                "*{ref_name} reads {} from {target_name} (copied — `{ref_name}` itself is unchanged)",
+                                render_value_for_note(&value)
+                            ),
+                            span: *span,
+                        });
+                        value
+                    }
                     _ => panic!("typeck should reject deref of non-reference"),
                 }
             }
         }
+    }
+
+    /// **M06.1**: look up the binding name of the slot with `slot_id`.
+    fn lookup_slot_name(&self, slot_id: SlotId) -> Option<String> {
+        for frame in self.frames.iter().rev() {
+            for scope in frame.scopes.iter().rev() {
+                for local in &scope.locals {
+                    if local.slot_id == slot_id {
+                        return self.resolution.bindings.get(&local.binding_id).map(|d| d.name.clone());
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// **M06**: look up the SlotId of the local holding `binding_id`.
@@ -922,6 +1030,31 @@ impl<'a> Evaluator<'a> {
             });
         }
         Value::Float { kind, value: result }
+    }
+}
+
+/// **M06.1**: short value-render for use inside `Note { Info }` messages.
+/// Mirrors `ui::render_value`'s essentials but kept inline here so eval
+/// doesn't depend on ui. References render as their target's resolved
+/// description in the calling site, not via this helper.
+fn render_value_for_note(value: &Value) -> String {
+    match value {
+        Value::Int { kind, bits } => format!("{bits}_{}", kind.name()),
+        Value::Float { kind, value } => {
+            let body = if value.is_nan() {
+                "NaN".to_owned()
+            } else if value.is_infinite() {
+                if *value > 0.0 { "+Inf".to_owned() } else { "-Inf".to_owned() }
+            } else {
+                value.to_string()
+            };
+            format!("{body}_{}", kind.name())
+        }
+        Value::Bool(b) => b.to_string(),
+        Value::Unit => "()".to_owned(),
+        Value::Ref { mutable, .. } => {
+            if *mutable { "&mut _".to_owned() } else { "&_".to_owned() }
+        }
     }
 }
 

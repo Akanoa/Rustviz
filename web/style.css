@@ -30,6 +30,13 @@ html, body {
   background: #fff;
 }
 
+/* M06.1: body as a vertical flex container so main absorbs remaining space
+   and status appearing/disappearing doesn't push the toolbar off-screen. */
+body {
+  display: flex;
+  flex-direction: column;
+}
+
 header {
   display: flex;
   align-items: center;
@@ -61,7 +68,11 @@ header select {
 
 main {
   display: flex;
-  height: calc(100vh - 96px); /* header ~48px + status (auto) + toolbar ~48px */
+  /* M06.1: main flexes to fill remaining vertical space. When #status
+     appears (or disappears) the body flex layout absorbs the height change
+     here instead of pushing the toolbar past the viewport. */
+  flex: 1;
+  min-height: 0;
   border-bottom: 1px solid var(--border);
   position: relative; /* anchor for the absolute-positioned SVG overlay */
 }
