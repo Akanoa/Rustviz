@@ -189,6 +189,33 @@ main > section {
   border-color: #2a6fa5;
 }
 
+/* **M07.1**: byte-cells covered by a slice get a bright yellow outline + a
+   soft glow when the user hovers the slice's arrow. Makes the slice's
+   "view of these specific bytes" tangible — `&v[1..3]` lights up the
+   second and third elements when you hover the slice arrow. */
+.heap-box .byte-cell.byte-slice-highlighted {
+  outline: 2px solid #f5b800;
+  outline-offset: -1px;
+  box-shadow: 0 0 4px rgba(245, 184, 0, 0.7);
+  z-index: 1;
+}
+
+/* **M07.1**: element-span labels inside a Vec's display text — segmented
+   per element so the slice-arrow hover handler can highlight the labels
+   covered by `[elem_start, elem_start + len)`. The base style is invisible
+   (no decoration) so the display reads as before; the highlight class is
+   what makes the covered elements pop. */
+.heap-box .heap-display .elem-cell {
+  /* no baseline decoration — invisible until highlighted */
+}
+
+.heap-box .heap-display .elem-cell.elem-slice-highlighted {
+  background: rgba(245, 184, 0, 0.35);
+  outline: 1px solid #f5b800;
+  border-radius: 2px;
+  padding: 0 1px;
+}
+
 .heap-box.heap-freed .byte-cell {
   border-style: dashed;
   background: repeating-linear-gradient(
@@ -222,6 +249,17 @@ main > section {
   fill: none;
   stroke-width: 1.5;
   marker-end: url(#arrow-head-mut);
+}
+
+/* **M07.1**: slice arrows show a `[len: N]` annotation near the arrowhead.
+   Small monospace, blue to match the shared-borrow color, unselectable so
+   it doesn't interfere with text selection in adjacent panels. */
+#arrow-overlay .arrow-len-label {
+  font-size: 10px;
+  fill: #4d8fcd;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  user-select: none;
+  pointer-events: none;
 }
 
 main > section:last-child {

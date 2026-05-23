@@ -245,6 +245,14 @@ impl Resolver {
                 self.resolve_expr(receiver)?;
                 self.resolve_expr(index)?;
             }
+            ast::Expr::Range { start, end, .. } => {
+                if let Some(s) = start {
+                    self.resolve_expr(s)?;
+                }
+                if let Some(e) = end {
+                    self.resolve_expr(e)?;
+                }
+            }
             ast::Expr::Binary { lhs, rhs, .. } => {
                 self.resolve_expr(lhs)?;
                 self.resolve_expr(rhs)?;

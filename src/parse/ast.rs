@@ -84,6 +84,17 @@ pub enum Type {
         /// Span covering `segments<args>`.
         span: Span,
     },
+    /// **M07.1**: slice type `&[T]` or `&mut [T]`. The leading `&` is
+    /// absorbed into the slice type (matches Rust's "[T] only appears
+    /// behind a reference"). M07.1 typeck rejects `mutable: true`.
+    Slice {
+        /// Element type.
+        inner: Box<Type>,
+        /// `true` for `&mut [T]`, `false` for `&[T]`.
+        mutable: bool,
+        /// Span from `&` (or `&mut`) through `]`.
+        span: Span,
+    },
 }
 
 /// A block: zero or more statements followed by an optional tail expression.
@@ -250,6 +261,16 @@ pub enum Expr {
         /// Span from receiver start through `]`.
         span: Span,
     },
+    /// **M07.1**: range expression `a..b`, `..b`, `a..`, `..`. M07.1 parses
+    /// this only inside `Expr::Index.index`; typeck rejects standalone uses.
+    Range {
+        /// Start bound (inclusive). `None` defaults to 0 at eval time.
+        start: Option<Box<Expr>>,
+        /// End bound (exclusive). `None` defaults to receiver length at eval time.
+        end: Option<Box<Expr>>,
+        /// Span covering the whole range expression, including any bounds.
+        span: Span,
+    },
 }
 
 impl Expr {
@@ -269,7 +290,8 @@ impl Expr {
             | Self::Deref { span, .. }
             | Self::Path { span, .. }
             | Self::MethodCall { span, .. }
-            | Self::Index { span, .. } => *span,
+            | Self::Index { span, .. }
+            | Self::Range { span, .. } => *span,
             Self::StrLit(_, s) => *s,
             Self::Block(b) => b.span,
         }

@@ -101,6 +101,37 @@ pub enum Value {
     /// **M07**: transient string value for string-literal arguments to
     /// `String::from(...)` / `String::push_str(...)`. NOT stored in slots.
     Str(String),
+    /// **M07.1**: slice value — a fat pointer (target + length) into a heap
+    /// allocation. Sibling of `Value::Ref` (not an extension); slices carry
+    /// extra `len` metadata and live in the same active-borrow registry, so
+    /// the dangling-detection scan catches them on later realloc.
+    Slice {
+        /// Identifier of the active borrow.
+        borrow_id: BorrowId,
+        /// What's being sliced. In M07.1 always `Pointee::Heap(addr)` of the
+        /// underlying Vec's allocation; `Pointee::Slot(_)` is unreachable
+        /// (no array-on-stack in M07.1).
+        target: Pointee,
+        /// **M07.1**: element index within the target Vec where this slice
+        /// starts (the range's `start` bound; 0 for the `..` / `..end` forms).
+        /// Drives the element-span highlight on slice-arrow hover.
+        start: u64,
+        /// Number of elements visible through this slice (end - start).
+        len: u64,
+        /// `true` for `&mut [T]`, `false` for `&[T]`. Always `false` in M07.1
+        /// (typeck rejects mutable-slice construction).
+        mutable: bool,
+        /// **M07.1**: byte offset within the target block where the slice's
+        /// data pointer starts. Computed at construction from
+        /// `start * elem_size`. Used by the UI to highlight the covered
+        /// byte-cells on slice-arrow hover, making "this slice views these
+        /// specific bytes" tangible.
+        byte_offset: u64,
+        /// **M07.1**: length in bytes of the slice's view
+        /// (`len * elem_size`). Together with `byte_offset` fully specifies
+        /// the byte range highlighted on hover.
+        byte_len: u64,
+    },
 }
 
 impl Value {
@@ -120,6 +151,8 @@ impl Value {
             Self::Vec { .. } => "Vec",
             Self::String { .. } => "String",
             Self::Str(_) => "&str",
+            // M07.1: slice. Short tag — full `&[T]` rendering comes from the Ty layer.
+            Self::Slice { .. } => "&[]",
         }
     }
 }

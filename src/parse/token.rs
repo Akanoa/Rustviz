@@ -83,6 +83,8 @@ pub enum TokenKind {
     ColonColon,
     /// **M07**: `.` — method-call dot (e.g. `v.push(x)`).
     Dot,
+    /// **M07.1**: `..` — range operator. Only legal inside `[ ]` brackets in M07.1.
+    DotDot,
     /// **M07**: `[`
     LBracket,
     /// **M07**: `]`
@@ -120,6 +122,7 @@ impl TokenKind {
             Self::AmpMut => "`&mut`",
             Self::ColonColon => "`::`",
             Self::Dot => "`.`",
+            Self::DotDot => "`..`",
             Self::LBracket => "`[`",
             Self::RBracket => "`]`",
             Self::Str(_) => "string literal",

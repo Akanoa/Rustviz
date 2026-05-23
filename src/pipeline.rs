@@ -533,13 +533,16 @@ mod tests {
 
     #[test]
     fn run_pipeline_vec_dangling_borrow() {
-        // The headline demo: &v[0] becomes dangling after v.push triggers
-        // a realloc.
+        // The headline dangling demo: &v[0] becomes dangling after v.push
+        // triggers a *copy*-realloc. M07.1 update: the allocator now grows
+        // in place when there's room, so the demo needs a Box blocker
+        // physically occupying the adjacent region to force the copy.
         let source = "fn main() {
             let mut v: Vec<i32> = Vec::new();
             v.push(1);
             v.push(2);
             let r = &v[0];
+            let b = Box::new(99);
             v.push(3);
         }";
         let events = run_pipeline(source).expect("vec dangling compiles");
@@ -571,11 +574,180 @@ mod tests {
         assert!(realloc_count >= 1, "expected ≥ 1 HeapRealloc when push_str grows capacity");
     }
 
+    // ─── M07.1: typeck rejections (mutable slice, standalone range) ───────
+
+    #[test]
+    fn run_pipeline_mut_slice_rejected() {
+        let source = "fn main() {
+            let mut v: Vec<i32> = Vec::new();
+            v.push(1);
+            let s = &mut v[..];
+        }";
+        let err = run_pipeline(source).expect_err("mutable slice must be rejected");
+        assert_eq!(err.stage, CompileStage::Typeck);
+        assert!(
+            err.message.contains("mutable slices are out of scope"),
+            "expected mutable-slice rejection message, got: {}",
+            err.message
+        );
+    }
+
+    /// Standalone range outside `[ ]` is rejected by the parser (M07.1 only
+    /// accepts `..` inside index brackets — see research R-003). The error
+    /// surfaces as a parse-stage failure pointing at the unexpected `..`.
+    #[test]
+    fn run_pipeline_standalone_range_rejected() {
+        let source = "fn main() { let r = 1..3; }";
+        let err = run_pipeline(source).expect_err("standalone range must be rejected");
+        assert_eq!(err.stage, CompileStage::Parse);
+    }
+
+    // ─── M07.1 / US3: slice dangles after Vec realloc ─────────────────────
+
+    /// A slice taken before a Vec realloc produces a `Note { RuntimeError }`
+    /// at the realloc step — same pedagogy as M07's `&v[0]` case but at
+    /// slice granularity.
+    #[test]
+    fn run_pipeline_slice_dangling() {
+        // M07.1: the allocator does in-place growth when nothing physically
+        // blocks it — so a slice + naive push wouldn't dangle (the Vec just
+        // grows where it is). The dangling demo needs a Box::new blocker
+        // sitting in the adjacent region to force a copy-realloc, which IS
+        // what invalidates the slice.
+        let source = "fn main() {
+            let mut v: Vec<i32> = Vec::new();
+            v.push(1);
+            v.push(2);
+            let s = &v[..];
+            let b = Box::new(99);
+            v.push(3);
+        }";
+        let events = run_pipeline(source).expect("slice dangling compiles");
+        let has_dangling = events.iter().any(|e| matches!(e,
+            crate::MemEvent::Note { kind: crate::NoteKind::RuntimeError, message, .. }
+                if message.contains("dangling reference")
+        ));
+        assert!(has_dangling, "expected dangling-reference RuntimeError on Vec realloc with active slice");
+    }
+
     #[test]
     fn compile_error_serde_roundtrip() {
         let err = run_pipeline("fn main() { let x = ; }").expect_err("parse error");
         let json = serde_json::to_string(&err).expect("serialize");
         let back: CompileError = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(err, back);
+    }
+
+    // ─── M07.1 / US1: partial-range slice ────────────────────────────────
+
+    /// A slice `&v[1..3]` typechecks, emits a `BorrowShared` event whose
+    /// target is the Vec's heap allocation, and the binding's SlotWrite
+    /// carries a `Value::Slice { len: 2, .. }`.
+    #[test]
+    fn run_pipeline_slice_range() {
+        let source = "fn main() {
+            let mut v: Vec<i32> = Vec::new();
+            v.push(10);
+            v.push(20);
+            v.push(30);
+            v.push(40);
+            let s = &v[1..3];
+        }";
+        let events = run_pipeline(source).expect("slice range compiles");
+        // BorrowShared with Pointee::Heap target.
+        let shared_heap = events.iter().any(|e| matches!(e,
+            crate::MemEvent::BorrowShared { target: crate::event::Pointee::Heap(_), .. }
+        ));
+        assert!(shared_heap, "expected BorrowShared with Heap target for slice borrow");
+        // SlotWrite of Value::Slice with len 2.
+        let slice_write = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite { value: crate::Value::Slice { len: 2, .. }, .. }
+        ));
+        assert!(slice_write, "expected SlotWrite of Value::Slice {{ len: 2, .. }}");
+    }
+
+    #[test]
+    fn run_pipeline_slice_oob_end() {
+        let source = "fn main() {
+            let mut v: Vec<i32> = Vec::new();
+            v.push(1);
+            let s = &v[0..5];
+        }";
+        let events = run_pipeline(source).expect("slice OOB compiles; halts at runtime");
+        let has_oob = events.iter().any(|e| matches!(e,
+            crate::MemEvent::Note { kind: crate::NoteKind::RuntimeError, message, .. }
+                if message.contains("slice end out of bounds")
+        ));
+        assert!(has_oob, "expected runtime error for OOB slice end");
+    }
+
+    // ─── M07.1 / US2: full-vec slice + `s.len()` ─────────────────────────
+
+    #[test]
+    fn run_pipeline_slice_basic() {
+        let source = "fn main() {
+            let mut v: Vec<i32> = Vec::new();
+            v.push(1);
+            v.push(2);
+            v.push(3);
+            let s = &v[..];
+            let n = s.len();
+        }";
+        let events = run_pipeline(source).expect("slice basic compiles");
+        // `s` is a slice with len 3.
+        let slice_len_3 = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite { value: crate::Value::Slice { len: 3, .. }, .. }
+        ));
+        assert!(slice_len_3, "expected Value::Slice {{ len: 3, .. }} for &v[..]");
+        // `n = s.len()` produces a U64 3.
+        let n_eq_3 = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite {
+                value: crate::Value::Int { kind: crate::typeck::IntKind::U64, bits: 3 },
+                ..
+            }
+        ));
+        assert!(n_eq_3, "expected n = s.len() to be Int {{ U64, 3 }}");
+    }
+
+    /// All four range forms parse + typecheck on the same Vec, each producing
+    /// a slice with the expected length.
+    #[test]
+    fn run_pipeline_slice_all_forms() {
+        let source = "fn main() {
+            let mut v: Vec<i32> = Vec::new();
+            v.push(1);
+            v.push(2);
+            v.push(3);
+            let a = &v[..];
+            let b = &v[1..];
+            let c = &v[..2];
+            let d = &v[0..2];
+        }";
+        let events = run_pipeline(source).expect("all four range forms compile");
+        let slice_writes: Vec<u64> = events.iter().filter_map(|e| match e {
+            crate::MemEvent::SlotWrite { value: crate::Value::Slice { len, .. }, .. } => Some(*len),
+            _ => None,
+        }).collect();
+        assert_eq!(
+            slice_writes,
+            vec![3, 2, 2, 2],
+            "expected slice lengths 3, 2, 2, 2 for &v[..], &v[1..], &v[..2], &v[0..2]"
+        );
+    }
+
+    #[test]
+    fn run_pipeline_slice_oob_start_gt_end() {
+        let source = "fn main() {
+            let mut v: Vec<i32> = Vec::new();
+            v.push(1);
+            v.push(2);
+            let s = &v[2..1];
+        }";
+        let events = run_pipeline(source).expect("slice start>end compiles; halts");
+        let has_inv = events.iter().any(|e| matches!(e,
+            crate::MemEvent::Note { kind: crate::NoteKind::RuntimeError, message, .. }
+                if message.contains("slice start > end")
+        ));
+        assert!(has_inv, "expected runtime error for inverted slice range");
     }
 }

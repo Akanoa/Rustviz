@@ -339,7 +339,15 @@ function renderArrows(arrows) {
       // +6 per additional arrow keeps lanes from merging when multiple
       // arrows share the heap row.
       const laneY = tgt.top - 20 - arrIdx * 6 - overlayBox.top;
-      const targetX = tgt.left + tgt.width / 2 - overlayBox.left;
+      // **M07.1**: distribute arrowhead landing X across the target block's
+      // top edge so multiple arrows targeting the same heap block (e.g. an
+      // owning arrow from `v` PLUS a slice arrow from `&v[..]`) land at
+      // different columns instead of collapsing onto the single midpoint.
+      // Uses the same per-target indexing as the slot-target routing below.
+      const tList = byTarget.get(targetKey(a));
+      const tIdx = tList.indexOf(a);
+      const xOffsetTgt = distOffset(tgt.width, tIdx, tList.length);
+      const targetX = tgt.left + tgt.width / 2 + xOffsetTgt - overlayBox.left;
       const targetTopY = tgt.top - overlayBox.top;
       const laneX = Math.min(x1, targetX) - (10 + arrIdx * 6);
       d = `M${x1},${y1} H${laneX} V${laneY} H${targetX} V${targetTopY}`;
@@ -362,7 +370,125 @@ function renderArrows(arrows) {
               : "arrow-shared";
     path.setAttribute("class", cls);
     overlay.appendChild(path);
+
+    // **M07.1**: slice arrows highlight their covered region in the target
+    // heap block on hover — both the byte-cells (byte_offset + byte_len)
+    // AND the element-span labels (elem_start + len). For `&v[1..3]` of
+    // Vec<i32>: bytes [4, 12) light up alongside elements `2_i32, 3_i32`
+    // in the display string.
+    if (
+      targetIsHeap
+      && a.byte_offset !== undefined && a.byte_offset !== null
+      && a.byte_len !== undefined && a.byte_len !== null
+    ) {
+      const heapBox = document.querySelector(`[data-heap-addr="${a.target.Heap}"]`);
+      const cellsEl = heapBox ? heapBox.querySelector(".heap-cells") : null;
+      const dispEl = heapBox ? heapBox.querySelector(".heap-display") : null;
+      const byteStart = Number(a.byte_offset);
+      const byteEnd = byteStart + Number(a.byte_len);
+      const elemStart = a.elem_start !== undefined && a.elem_start !== null
+        ? Number(a.elem_start) : null;
+      const elemEnd = elemStart !== null && a.len !== undefined && a.len !== null
+        ? elemStart + Number(a.len) : null;
+      const setHighlight = (on) => {
+        if (cellsEl) {
+          for (let i = byteStart; i < byteEnd && i < cellsEl.children.length; i++) {
+            cellsEl.children[i].classList.toggle("byte-slice-highlighted", on);
+          }
+        }
+        if (dispEl && elemStart !== null && elemEnd !== null) {
+          for (let i = elemStart; i < elemEnd; i++) {
+            const span = dispEl.querySelector(`[data-elem-idx="${i}"]`);
+            if (span) span.classList.toggle("elem-slice-highlighted", on);
+          }
+        }
+      };
+      path.addEventListener("mouseenter", () => setHighlight(true));
+      path.addEventListener("mouseleave", () => setHighlight(false));
+    }
+
+    // **M07.1**: slice arrows carry a length annotation. When `len` is
+    // present, render a small `[len: N]` label near the arrowhead so the
+    // learner sees the fat-pointer's length alongside the data-pointer arrow.
+    if (a.len !== undefined && a.len !== null) {
+      const label = document.createElementNS(NS, "text");
+      // Position: just above the arrowhead's V-segment start for heap targets
+      // (the laneY/targetX point), or above the H-bend for slot targets.
+      // For both routings we have the final approach segment; mid-X near the
+      // arrowhead with a small Y offset reads well without crowding the
+      // arrowhead marker.
+      let labelX, labelY;
+      if (targetIsHeap) {
+        // Recompute the per-arrow X distribution so the label sits next to
+        // THIS arrow's actual landing column (not the block's midpoint).
+        const tList = byTarget.get(targetKey(a));
+        const tIdx = tList.indexOf(a);
+        const xOffsetTgt = distOffset(tgt.width, tIdx, tList.length);
+        const targetX = tgt.left + tgt.width / 2 + xOffsetTgt - overlayBox.left;
+        const laneY = tgt.top - 20 - arrIdx * 6 - overlayBox.top;
+        // Place mid-way between laneY and target top, slightly to the right
+        // of the descending V segment so it doesn't sit on the arrow line.
+        labelX = targetX + 6;
+        labelY = laneY + 10;
+      } else {
+        const tList = byTarget.get(targetKey(a));
+        const tIdx = tList.indexOf(a);
+        const yOffsetTgt = distOffset(tgt.height, tIdx, tList.length);
+        const globalNudge = (arrIdx - (arrows.length - 1) / 2) * 4;
+        const x2 = tgt.left - overlayBox.left;
+        const y2 = tgt.top + tgt.height / 2 + yOffsetTgt + globalNudge - overlayBox.top;
+        labelX = x2 - 36;
+        labelY = y2 - 4;
+      }
+      label.setAttribute("x", String(labelX));
+      label.setAttribute("y", String(labelY));
+      label.setAttribute("class", "arrow-len-label");
+      label.textContent = `[len: ${a.len}]`;
+      overlay.appendChild(label);
+    }
   }
+}
+
+// **M07.1**: render a heap-box's display, segmenting Vec elements into
+// `<span data-elem-idx="i">` so the slice hover handler can highlight
+// individual elements. Match `Vec [e0, e1, ...] (cap=N, len=N)`. For
+// other shapes (Box, String) fall back to plain text.
+//
+// The element splitting uses a balanced-bracket walker rather than a naive
+// split on `,` so element renderings that themselves contain commas (none
+// today, but a defensive choice) wouldn't break the segmentation. Elements
+// are trimmed individually.
+function renderHeapDisplay(dispEl, display) {
+  dispEl.textContent = ""; // clear any prior contents (textNodes + spans)
+  const vecMatch = display.match(/^(Vec )\[(.*)\]( \(.*\))?$/);
+  if (!vecMatch) {
+    dispEl.textContent = display;
+    return;
+  }
+  const [, prefix, inner, suffix] = vecMatch;
+  dispEl.appendChild(document.createTextNode(prefix + "["));
+  // Split inner on top-level commas (defensive: handles nested brackets).
+  const parts = [];
+  let depth = 0, start = 0;
+  for (let i = 0; i < inner.length; i++) {
+    const c = inner[i];
+    if (c === "[" || c === "(" || c === "{") depth++;
+    else if (c === "]" || c === ")" || c === "}") depth--;
+    else if (c === "," && depth === 0) {
+      parts.push(inner.slice(start, i));
+      start = i + 1;
+    }
+  }
+  if (start < inner.length) parts.push(inner.slice(start));
+  parts.forEach((part, idx) => {
+    if (idx > 0) dispEl.appendChild(document.createTextNode(", "));
+    const span = document.createElement("span");
+    span.className = "elem-cell";
+    span.setAttribute("data-elem-idx", String(idx));
+    span.textContent = part.trim();
+    dispEl.appendChild(span);
+  });
+  dispEl.appendChild(document.createTextNode("]" + (suffix || "")));
 }
 
 // **M07**: render the heap panel. Each HeapView in state.heap becomes a
@@ -396,7 +522,13 @@ function renderHeap(heap) {
     box.setAttribute("data-heap-addr", String(h.addr));
     box.querySelector(".heap-addr").textContent =
       h.freed ? `heap #${h.addr} (freed, ${h.size}B)` : `heap #${h.addr} (${h.size}B)`;
-    box.querySelector(".heap-display").textContent = h.display;
+    // **M07.1**: for Vec displays (format: `Vec [e0, e1, ...] (cap=N, len=N)`),
+    // segment each element into a `<span data-elem-idx="i">` so the slice
+    // hover handler can light up the elements covered by `[elem_start,
+    // elem_start + len)`. For Box / String / other shapes the display is
+    // rendered as plain text.
+    const dispEl = box.querySelector(".heap-display");
+    renderHeapDisplay(dispEl, h.display);
     box.classList.toggle("heap-freed", !!h.freed);
     // **M07**: byte-level cells. One cell per byte of total capacity.
     // First `used` cells filled (current value); rest empty (allocated

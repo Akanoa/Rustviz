@@ -285,6 +285,11 @@ pub fn lex(file: FileId, source_map: &SourceMap) -> Result<Vec<Token>, ParseErro
             // **M07**: `.`, `[`, `]` as single-char tokens. The numeric-literal
             // lexer arm consumes `.digit` greedily for floats; bare `.` reaches
             // here only as the postfix method-call separator.
+            // **M07.1**: `..` (DotDot) two-char arm comes first — handles `1..3`,
+            // `..3`, `1..`, `..` inside `[ ]`. The numeric arm already consumed
+            // `1.0` greedily for floats, so a `.` here followed by `.` is always
+            // the range operator.
+            (b'.', Some(b'.')) => (TokenKind::DotDot, 2),
             (b'.', _) => (TokenKind::Dot, 1),
             (b'[', _) => (TokenKind::LBracket, 1),
             (b']', _) => (TokenKind::RBracket, 1),

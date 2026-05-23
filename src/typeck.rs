@@ -185,6 +185,11 @@ pub enum Ty {
     Vec(Box<Ty>),
     /// **M07**: heap-owning UTF-8 byte sequence. Non-Copy.
     String,
+    /// **M07.1**: slice type `&[T]`. Always shared (immutable) in M07.1.
+    /// The leading `&` is absorbed into this variant — `Ty::Slice(T)` IS
+    /// the `&[T]` type, matching Rust's "[T] only appears behind a
+    /// reference" rule. Carries the element type.
+    Slice(Box<Ty>),
 }
 
 impl Ty {
@@ -207,6 +212,8 @@ impl Ty {
             Self::Box(inner) => format!("Box<{}>", inner.name()),
             Self::Vec(inner) => format!("Vec<{}>", inner.name()),
             Self::String => "String".to_owned(),
+            // M07.1: slice. Leading `&` is part of the type name; always shared in M07.1.
+            Self::Slice(inner) => format!("&[{}]", inner.name()),
         }
     }
 
@@ -220,6 +227,9 @@ impl Ty {
             Self::Ref { mutable: false, .. } => true,
             Self::Ref { mutable: true, .. } => false,
             Self::Box(_) | Self::Vec(_) | Self::String => false,
+            // M07.1: slices are non-Copy (they carry a borrow_id; cloning would
+            // duplicate the borrow registration).
+            Self::Slice(_) => false,
         }
     }
 }
@@ -773,7 +783,22 @@ impl<'a> Typechecker<'a> {
                 }
             }
             // **M06**: borrow expressions `&place` and `&mut place`.
+            // **M07.1**: peephole — `&v[range]` (range index inside a `&`) produces
+            // `Ty::Slice(T)` directly, absorbing the leading `&` into the slice
+            // type (matches Rust's `&[T]` shape). Detected structurally here so
+            // the normal Borrow → Ref wrap doesn't fire.
             ast::Expr::Borrow { inner, mutable, span } => {
+                if let ast::Expr::Index { receiver, index, span: idx_span } = inner.as_ref()
+                    && matches!(index.as_ref(), ast::Expr::Range { .. })
+                {
+                    return self.typecheck_slice_borrow(
+                        receiver,
+                        index,
+                        *mutable,
+                        *idx_span,
+                        *span,
+                    );
+                }
                 self.typecheck_borrow(inner, *mutable, *span)
             }
             // **M06.1**: deref expression `*r`. Inner must be a reference;
@@ -810,7 +835,16 @@ impl<'a> Typechecker<'a> {
                 self.typecheck_method_call(&receiver_ty, name, args, *span)
             }
             // **M07**: indexing — receiver must be Vec, index must be Int.
+            // **M07.1**: a range index inside a bare `v[range]` (no leading `&`)
+            // is not a usable expression — Rust requires `&v[range]` to produce
+            // a slice. Reject with a clear message pointing the user at `&`.
             ast::Expr::Index { receiver, index, span } => {
+                if matches!(index.as_ref(), ast::Expr::Range { .. }) {
+                    return Err(ParseError {
+                        message: "range indexing produces an unsized slice; prefix with `&` to take a slice (e.g. `&v[1..3]`)".into(),
+                        span: *span,
+                    });
+                }
                 let receiver_ty = self.typecheck_expr(receiver)?;
                 let index_ty = self.typecheck_expr(index)?;
                 let elem_ty = match receiver_ty {
@@ -831,7 +865,71 @@ impl<'a> Typechecker<'a> {
                 let _ = span;
                 Ok(elem_ty)
             }
+            // **M07.1**: standalone range expression. Only valid inside an
+            // `Expr::Index.index` position, and that path is handled
+            // structurally above (Index + Borrow peek for Range). Any Range
+            // reaching here is being used as a standalone expression.
+            ast::Expr::Range { span, .. } => Err(ParseError {
+                message: "range expressions are only valid inside index brackets in M07.1".into(),
+                span: *span,
+            }),
         }
+    }
+
+    /// **M07.1**: typecheck a slice borrow `&v[range]` (or rejected `&mut v[range]`).
+    /// Returns `Ty::Slice(elem_ty)` — the leading `&` is absorbed into the slice
+    /// type per Rust's `&[T]` semantics. Records the slice type on the index
+    /// expression's span (so eval can recover it).
+    fn typecheck_slice_borrow(
+        &mut self,
+        receiver: &ast::Expr,
+        index: &ast::Expr,
+        mutable: bool,
+        idx_span: Span,
+        borrow_span: Span,
+    ) -> Result<Ty, ParseError> {
+        if mutable {
+            return Err(ParseError {
+                message: "mutable slices are out of scope in M07.1 — only &[T] (shared) is supported".into(),
+                span: borrow_span,
+            });
+        }
+        // Receiver must be a Vec.
+        let receiver_ty = self.typecheck_expr(receiver)?;
+        let elem_ty = match receiver_ty {
+            Ty::Vec(inner) => *inner,
+            other => {
+                return Err(ParseError {
+                    message: format!(
+                        "cannot slice value of type `{}`; expected Vec",
+                        other.name()
+                    ),
+                    span: receiver.span(),
+                });
+            }
+        };
+        // Range bounds must be integer.
+        let (start, end) = match index {
+            ast::Expr::Range { start, end, .. } => (start.as_deref(), end.as_deref()),
+            _ => unreachable!("caller guarantees Range"),
+        };
+        for bound in [start, end].iter().flatten() {
+            let bound_ty = self.typecheck_expr(bound)?;
+            if !matches!(bound_ty, Ty::Int(_)) {
+                return Err(ParseError {
+                    message: format!(
+                        "range bound must be integer, found `{}`",
+                        bound_ty.name()
+                    ),
+                    span: bound.span(),
+                });
+            }
+        }
+        // Record the slice type on the inner Index span so eval can confirm
+        // the slice-borrow shape; also on the Borrow span (caller does this).
+        let slice_ty = Ty::Slice(Box::new(elem_ty));
+        self.types.expr_types.insert(idx_span, slice_ty.clone());
+        Ok(slice_ty)
     }
 
     /// **M07**: dispatch a path-fn call against the hardcoded static-fn table.
@@ -945,6 +1043,16 @@ impl<'a> Typechecker<'a> {
                 }
                 Ok(Ty::Int(IntKind::U64))
             }
+            // M07.1: `Slice::len() -> u64`. Same signature as Vec::len.
+            (Ty::Slice(_), "len") => {
+                if !args.is_empty() {
+                    return Err(ParseError {
+                        message: "Slice::len takes no args".into(),
+                        span,
+                    });
+                }
+                Ok(Ty::Int(IntKind::U64))
+            }
             (Ty::String, "push_str") => {
                 if args.len() != 1 {
                     return Err(ParseError {
@@ -964,7 +1072,7 @@ impl<'a> Typechecker<'a> {
             }
             _ => Err(ParseError {
                 message: format!(
-                    "no method `{name}` on type `{}` (M07 supports only Vec::push/len, String::push_str)",
+                    "no method `{name}` on type `{}` (supported: Vec::push/len, String::push_str, Slice::len)",
                     receiver_ty.name()
                 ),
                 span,
@@ -1361,6 +1469,18 @@ fn ty_from_ast(t: &ast::Type) -> Result<Ty, ParseError> {
                     span: *span,
                 }),
             }
+        }
+        // **M07.1**: slice annotation `&[T]` / `&mut [T]`. M07.1 only supports
+        // shared slices; `&mut [T]` is rejected here.
+        ast::Type::Slice { inner, mutable, span } => {
+            if *mutable {
+                return Err(ParseError {
+                    message: "mutable slices are out of scope in M07.1 — only &[T] (shared) is supported".into(),
+                    span: *span,
+                });
+            }
+            let inner_ty = ty_from_ast(inner)?;
+            Ok(Ty::Slice(Box::new(inner_ty)))
         }
     }
 }

@@ -142,16 +142,24 @@ impl Parser {
             });
         }
         // M06: `&T` and `&mut T` reference types.
+        // **M07.1**: `&[T]` and `&mut [T]` slice types — when `[` follows the
+        // `&` (or `&mut`), this is a slice annotation, not a regular ref.
         if self.at(&TokenKind::Amp) || self.at(&TokenKind::AmpMut) {
             let amp = self.bump();
             let mutable = matches!(amp.kind, TokenKind::AmpMut);
+            // M07.1: slice annotation `&[T]` / `&mut [T]`.
+            if self.at(&TokenKind::LBracket) {
+                self.bump(); // `[`
+                let inner = self.parse_type()?;
+                let rbracket = self.expect(&TokenKind::RBracket, "`]`")?;
+                return Ok(Type::Slice {
+                    inner: Box::new(inner),
+                    mutable,
+                    span: amp.span.merge(rbracket.span),
+                });
+            }
             let inner = self.parse_type()?;
-            let inner_span = match &inner {
-                Type::Path { span, .. }
-                | Type::Unit { span }
-                | Type::Ref { span, .. }
-                | Type::Generic { span, .. } => *span,
-            };
+            let inner_span = type_span(&inner);
             return Ok(Type::Ref {
                 inner: Box::new(inner),
                 mutable,
@@ -269,9 +277,12 @@ impl Parser {
                 continue;
             }
             // **M07**: postfix indexing `expr[index]`.
+            // **M07.1**: indexing also accepts a range `[ start? .. end? ]`.
+            // The four range forms (`a..b`, `..b`, `a..`, `..`) all parse here
+            // and produce an `Expr::Index { index: Expr::Range { .. }, .. }`.
             if self.at(&TokenKind::LBracket) {
-                self.bump(); // `[`
-                let index = self.parse_expr(0)?;
+                let lbracket = self.bump(); // `[`
+                let index = self.parse_index_inner(lbracket.span)?;
                 let rbracket = self.expect(&TokenKind::RBracket, "`]`")?;
                 let span = lhs.span().merge(rbracket.span);
                 lhs = Expr::Index {
@@ -331,6 +342,60 @@ impl Parser {
             };
         }
         Ok(lhs)
+    }
+
+    /// **M07.1**: parse the contents of an index bracket `[ ... ]`. This is the
+    /// only context where a range expression (`..`, `a..b`, `..b`, `a..`) is
+    /// accepted in M07.1. Returns either a scalar `Expr` (existing M07
+    /// single-element index behavior) or an `Expr::Range { .. }`.
+    ///
+    /// `lbracket_span` is the span of the consumed `[`, used to give the
+    /// `..` (no-start, no-end) form a meaningful span.
+    fn parse_index_inner(&mut self, lbracket_span: Span) -> Result<Expr, ParseError> {
+        // Case 1: starts with `..` — no `start`.
+        if self.at(&TokenKind::DotDot) {
+            let dotdot = self.bump();
+            // `..` immediately followed by `]` → full range `..`.
+            if self.at(&TokenKind::RBracket) {
+                return Ok(Expr::Range {
+                    start: None,
+                    end: None,
+                    span: lbracket_span.merge(dotdot.span),
+                });
+            }
+            // `..end`.
+            let end = self.parse_expr(0)?;
+            let span = lbracket_span.merge(end.span());
+            return Ok(Expr::Range {
+                start: None,
+                end: Some(Box::new(end)),
+                span,
+            });
+        }
+        // Case 2: parse a primary expression (potential `start`), then decide.
+        let first = self.parse_expr(0)?;
+        if self.at(&TokenKind::DotDot) {
+            self.bump(); // `..`
+            // `start..` immediately followed by `]` → open-ended range.
+            if self.at(&TokenKind::RBracket) {
+                let span = first.span();
+                return Ok(Expr::Range {
+                    start: Some(Box::new(first)),
+                    end: None,
+                    span,
+                });
+            }
+            // `start..end`.
+            let end = self.parse_expr(0)?;
+            let span = first.span().merge(end.span());
+            return Ok(Expr::Range {
+                start: Some(Box::new(first)),
+                end: Some(Box::new(end)),
+                span,
+            });
+        }
+        // Scalar-index path (existing M07 behavior).
+        Ok(first)
     }
 
     fn parse_atom(&mut self) -> Result<Expr, ParseError> {
@@ -487,6 +552,7 @@ fn type_span(ty: &Type) -> Span {
         Type::Path { span, .. }
         | Type::Unit { span }
         | Type::Ref { span, .. }
-        | Type::Generic { span, .. } => *span,
+        | Type::Generic { span, .. }
+        | Type::Slice { span, .. } => *span,
     }
 }

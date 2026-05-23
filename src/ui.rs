@@ -72,6 +72,28 @@ pub struct ArrowView {
     pub target: ArrowTarget,
     /// Visual style.
     pub kind: ArrowKind,
+    /// **M07.1**: optional length annotation for slice arrows. `None` for
+    /// non-slice borrows and owning arrows; `Some(n)` when the arrow
+    /// originates from a `Value::Slice { len: n, .. }`. The renderer adds
+    /// a `[len: N]` label to slice arrows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub len: Option<u64>,
+    /// **M07.1**: byte offset of the slice's view within the target heap
+    /// block. Drives the hover-highlight: on `mouseenter` the renderer
+    /// highlights byte-cells `[byte_offset, byte_offset + byte_len)` in
+    /// the target heap-box to show which bytes the slice covers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub byte_offset: Option<u64>,
+    /// **M07.1**: byte length of the slice's view (paired with `byte_offset`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub byte_len: Option<u64>,
+    /// **M07.1**: element index where the slice starts (the range's `start`
+    /// bound). Drives the element-span highlight on hover: spans
+    /// `[elem_start, elem_start + len)` in the target heap-box's display
+    /// get the highlight class — so `&v[1..3]` lights up the 2nd and 3rd
+    /// element labels (`2_i32, 3_i32`) alongside their bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elem_start: Option<u64>,
 }
 
 /// **M07**: arrow target — slot (for borrows-of-locals) or heap (for borrows-of-heap and ownership).
@@ -245,6 +267,13 @@ impl Cursor {
                         BorrowTarget::Heap(addr) => ArrowTarget::Heap(addr),
                     },
                     kind: if b.mutable { ArrowKind::Mut } else { ArrowKind::Shared },
+                    // M07.1: slice borrows carry length + byte-range + element
+                    // start. Populated from the source slot's Value::Slice.
+                    // Single-element borrows (Value::Ref) leave these None.
+                    len: b.slice_len,
+                    byte_offset: b.slice_byte_offset,
+                    byte_len: b.slice_byte_len,
+                    elem_start: b.slice_elem_start,
                 })
             })
             .collect::<Vec<ArrowView>>();
@@ -255,6 +284,10 @@ impl Cursor {
                 source_slot: o.source_slot,
                 target: ArrowTarget::Heap(o.target_heap),
                 kind: ArrowKind::Owning,
+                len: None,
+                byte_offset: None,
+                byte_len: None,
+                elem_start: None,
             });
         }
         let heap = world.heap.iter().map(|h| HeapView {
@@ -307,6 +340,19 @@ struct ActiveBorrowState {
     /// M07: a borrow can target a slot OR a heap allocation.
     target: BorrowTarget,
     mutable: bool,
+    /// **M07.1**: `Some(len)` when this borrow is a slice (the source slot
+    /// holds a `Value::Slice { len, .. }`); `None` for single-element borrows.
+    /// Populated by the SlotWrite arm when it sees a Value::Slice.
+    slice_len: Option<u64>,
+    /// **M07.1**: byte offset of the slice's view within the target heap
+    /// block; populated alongside `slice_len`. Used by the renderer to
+    /// drive the hover-highlight on byte-cells.
+    slice_byte_offset: Option<u64>,
+    /// **M07.1**: byte length of the slice's view.
+    slice_byte_len: Option<u64>,
+    /// **M07.1**: element index where the slice starts; populated alongside
+    /// the byte fields. Drives the element-span highlight on hover.
+    slice_elem_start: Option<u64>,
 }
 
 #[derive(Copy, Clone)]
@@ -403,6 +449,8 @@ fn apply_event(world: &mut World, event: &MemEvent) {
         }
         MemEvent::SlotWrite { slot_id, value, .. } => {
             // M06: if this write lands a Value::Ref, bind the borrow's source_slot.
+            // M07.1: if this write lands a Value::Slice, bind source_slot AND
+            // record the slice's length on the borrow (drives the [len: N] label).
             if let Value::Ref { borrow_id, .. } = value {
                 if let Some(borrow) = world
                     .borrows
@@ -410,6 +458,19 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                     .find(|b| b.borrow_id == borrow_id.0)
                 {
                     borrow.source_slot = Some(slot_id.0);
+                }
+            }
+            if let Value::Slice { borrow_id, start, len, byte_offset, byte_len, .. } = value {
+                if let Some(borrow) = world
+                    .borrows
+                    .iter_mut()
+                    .find(|b| b.borrow_id == borrow_id.0)
+                {
+                    borrow.source_slot = Some(slot_id.0);
+                    borrow.slice_len = Some(*len);
+                    borrow.slice_byte_offset = Some(*byte_offset);
+                    borrow.slice_byte_len = Some(*byte_len);
+                    borrow.slice_elem_start = Some(*start);
                 }
             }
             // M06.1: render Value::Ref using the *binding name* of the target
@@ -440,6 +501,8 @@ fn apply_event(world: &mut World, event: &MemEvent) {
             // owning relationship AND suppress the redundant value-cell text
             // (the black owning arrow + the type column already convey the
             // pointer; `Vec→heap[2]` adds noise without adding info).
+            // M07.1: same suppression for Value::Slice — the blue arrow with
+            // its [len: N] annotation conveys everything; text would clutter.
             let rendered = if let Value::Box { addr } | Value::Vec { addr } | Value::String { addr } = value {
                 world.owning.retain(|o| o.source_slot != slot_id.0);
                 world.owning.push(OwningState {
@@ -447,6 +510,8 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                     target_heap: addr.0,
                 });
                 String::new() // empty value cell — arrow says it all
+            } else if matches!(value, Value::Slice { .. }) {
+                String::new() // empty value cell — slice arrow + [len: N] annotation say it all
             } else {
                 rendered
             };
@@ -489,6 +554,10 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                 source_slot: None,
                 target: t,
                 mutable: false,
+                slice_len: None,
+                slice_byte_offset: None,
+                slice_byte_len: None,
+                slice_elem_start: None,
             });
         }
         MemEvent::BorrowMut { borrow_id, target, .. } => {
@@ -501,6 +570,10 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                 source_slot: None,
                 target: t,
                 mutable: true,
+                slice_len: None,
+                slice_byte_offset: None,
+                slice_byte_len: None,
+                slice_elem_start: None,
             });
         }
         MemEvent::BorrowEnd { borrow_id, .. } => {
@@ -695,6 +768,12 @@ fn render_value(value: &Value) -> String {
         Value::Vec { addr } => format!("Vec→heap[{}]", addr.0),
         Value::String { addr } => format!("String→heap[{}]", addr.0),
         Value::Str(s) => format!("\"{s}\""),
+        // M07.1: slice fallback render. Normal path (SlotWrite) uses empty
+        // text because the arrow + length-annotation conveys everything.
+        Value::Slice { target, len, .. } => match target {
+            crate::event::Pointee::Heap(addr) => format!("&heap[{}; {len}]", addr.0),
+            crate::event::Pointee::Slot(id) => format!("&slot{}; {len}]", id.0),
+        },
     }
 }
 

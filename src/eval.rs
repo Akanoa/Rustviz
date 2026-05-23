@@ -142,6 +142,8 @@ fn ty_size_bytes(ty: &Ty) -> u32 {
         Ty::Bool => 1,
         Ty::Unit => 0,
         Ty::Ref { .. } | Ty::Box(_) | Ty::String | Ty::Vec(_) => 8,
+        // M07.1: slice is a fat pointer (data ptr + length) — 16 bytes on 64-bit.
+        Ty::Slice(_) => 16,
     }
 }
 
@@ -164,6 +166,8 @@ fn value_size_bytes(v: &Value) -> u32 {
         Value::Unit => 0,
         Value::Ref { .. } | Value::Box { .. } | Value::String { .. } | Value::Vec { .. } => 8,
         Value::Str(_) => 0,
+        // M07.1: slice fat pointer = 16 bytes on 64-bit.
+        Value::Slice { .. } => 16,
     }
 }
 
@@ -407,17 +411,25 @@ impl<'a> Evaluator<'a> {
                 }
             }
         }
-        // Dangling-borrow detection: scan locals for Value::Ref with
-        // target = Pointee::Heap(from). After the addr change, these refs
-        // still hold the OLD addr, which is freed — they're dangling.
+        // Dangling-borrow detection: scan locals for `Value::Ref` OR
+        // `Value::Slice` whose target is `Pointee::Heap(from)`. Both variants
+        // carry borrow_ids registered in the same scope; after the realloc
+        // the addr changed but their stored target still points at the OLD
+        // freed addr — they're dangling.
+        // **M07.1**: slice borrows share this code path; the realloc-time
+        // pedagogy is identical to single-element borrows (just at slice
+        // granularity).
         let mut dangling: Vec<Span> = Vec::new();
         for frame in self.frames.iter() {
             for scope in frame.scopes.iter() {
                 for local in scope.locals.iter() {
-                    if let Value::Ref { target: crate::event::Pointee::Heap(a), .. } = local.value {
-                        if a == from {
-                            dangling.push(local.decl_span);
-                        }
+                    let dangles = match local.value {
+                        Value::Ref { target: crate::event::Pointee::Heap(a), .. } => a == from,
+                        Value::Slice { target: crate::event::Pointee::Heap(a), .. } => a == from,
+                        _ => false,
+                    };
+                    if dangles {
+                        dangling.push(local.decl_span);
                     }
                 }
             }
@@ -1053,7 +1065,25 @@ impl<'a> Evaluator<'a> {
                 }
             }
             // M06: `&place` / `&mut place`. typeck guarantees inner is an Ident.
+            // M07: `&v[i]` — target is the Vec's heap allocation.
+            // M07.1: `&v[range]` — slice borrow; result is `Value::Slice` with
+            // length metadata. Detected structurally (Index whose index is Range).
             ast::Expr::Borrow { inner, mutable, span } => {
+                // M07.1: slice borrow `&v[range]` — separate path because the
+                // result Value is `Value::Slice { len, .. }`, not `Value::Ref`.
+                if let ast::Expr::Index { receiver, index, span: idx_span } = inner.as_ref()
+                    && let ast::Expr::Range { start, end, span: range_span } = index.as_ref()
+                {
+                    return self.eval_slice_borrow(
+                        receiver,
+                        start.as_deref(),
+                        end.as_deref(),
+                        *mutable,
+                        *idx_span,
+                        *range_span,
+                        *span,
+                    );
+                }
                 // M06 + M07: determine the borrow target (Slot or Heap).
                 let target = match inner.as_ref() {
                     ast::Expr::Ident(_, sp) => {
@@ -1067,7 +1097,7 @@ impl<'a> Evaluator<'a> {
                             .expect("local slot exists for borrowed binding");
                         crate::event::Pointee::Slot(slot_id)
                     }
-                    // **M07**: `&v[i]` — target is the Vec's heap allocation.
+                    // **M07**: `&v[i]` (scalar index) — target is the Vec's heap allocation.
                     ast::Expr::Index { receiver, .. } => {
                         // Evaluate receiver to get its Value::Vec.
                         let recv_v = self.eval_expr(receiver);
@@ -1170,6 +1200,12 @@ impl<'a> Evaluator<'a> {
             ast::Expr::Index { receiver, index, span } => {
                 self.eval_index(receiver, index, *span)
             }
+            // **M07.1**: standalone range — typeck rejects this. Eval never
+            // sees a Range outside of `Expr::Borrow.inner = Expr::Index { .. }`
+            // (handled in the Borrow arm above).
+            ast::Expr::Range { .. } => {
+                panic!("typeck should have rejected standalone range expression")
+            }
         }
     }
 
@@ -1264,6 +1300,13 @@ impl<'a> Evaluator<'a> {
                 self.string_push_str(*addr, &suffix, span);
                 Value::Unit
             }
+            // M07.1: `Slice::len()` returns the slice's stored length as u64.
+            // Distinct from the underlying Vec's length — a partial-range
+            // slice `&v[1..3]` returns 2, not v.len().
+            (Value::Slice { len, .. }, "len") => {
+                let _ = span;
+                Value::Int { kind: IntKind::U64, bits: *len as i128 }
+            }
             _ => panic!("typeck should reject this method call"),
         }
     }
@@ -1288,28 +1331,73 @@ impl<'a> Evaluator<'a> {
             _ => panic!("vec_push on non-Vec heap object"),
         };
         if cur_len + 1 > cur_cap {
-            // ── Phase 1: announce the realloc ─────────────────────────────
             let new_cap = if cur_cap == 0 { 1 } else { cur_cap * 2 };
+            // **M07.1**: in-place growth when the block has room to extend
+            // (heuristic: this is the last live block in the heap, so nothing
+            // physically blocks growth into the adjacent region). Same addr,
+            // larger capacity, **no copy** — matches what a real allocator's
+            // `realloc()` does when it can grow in place. Crucially: borrows
+            // into the block remain valid because the data didn't move.
+            let can_grow_in_place = self
+                .heap
+                .objects
+                .keys()
+                .position(|a| *a == addr)
+                .map(|i| i == self.heap.objects.len() - 1)
+                .unwrap_or(false);
+            if can_grow_in_place {
+                // ── Phase 1: announce in-place growth ─────────────────────
+                self.events.push(MemEvent::Note {
+                    kind: NoteKind::Info,
+                    message: format!(
+                        "Vec capacity exceeded ({cur_cap} → {new_cap}); growing in place at heap #{addr_n} (no copy, borrows remain valid)",
+                        addr_n = addr.0,
+                    ),
+                    span,
+                });
+                // ── Phase 2: extend capacity in place, then push ──────────
+                if let Some(HeapObject::Vec { capacity, elements, .. }) = self.heap.objects.get_mut(&addr) {
+                    *capacity = new_cap;
+                    elements.push(value);
+                }
+                let (total, used) = self.heap.objects.get(&addr)
+                    .map(heap_object_bytes).unwrap_or((0, 0));
+                let new_display = self.heap.objects.get(&addr)
+                    .map(heap_object_display)
+                    .unwrap_or_default();
+                // Emit a single HeapRealloc with from==to carrying the new
+                // size + display. The renderer treats from==to as "update
+                // this block in place" — same path used for non-cap-changing
+                // pushes — so the byte-cells expand to fill the new capacity.
+                self.events.push(MemEvent::HeapRealloc {
+                    from: addr,
+                    to: addr,
+                    new_size: total,
+                    new_used: used,
+                    new_display,
+                    span,
+                });
+                let _ = old_elements;
+                let _ = elem_ty;
+                return;
+            }
+            // ── copy-realloc path ─────────────────────────────────────────
+            // Phase 1: announce the realloc (with the names of blocks that
+            // are forcing the copy).
             let other_blocks: Vec<u32> = self.heap.objects.keys()
                 .filter(|a| **a != addr)
                 .map(|a| a.0)
                 .collect();
-            let pre_msg = if other_blocks.is_empty() {
-                format!(
-                    "Vec capacity exceeded ({cur_cap} → {new_cap}); allocator will copy the bytes to a fresh location and free the old block"
-                )
-            } else {
-                let others_str = other_blocks.iter().map(|a| format!("#{a}")).collect::<Vec<_>>().join(", ");
-                format!(
-                    "Vec capacity exceeded ({cur_cap} → {new_cap}); cannot grow in place because heap blocks [{others_str}] occupy the adjacent region — allocator will copy the bytes to a fresh location and free the old block"
-                )
-            };
+            let others_str = other_blocks.iter().map(|a| format!("#{a}")).collect::<Vec<_>>().join(", ");
+            let pre_msg = format!(
+                "Vec capacity exceeded ({cur_cap} → {new_cap}); cannot grow in place because heap blocks [{others_str}] occupy the adjacent region — allocator will copy the bytes to a fresh location and free the old block"
+            );
             self.events.push(MemEvent::Note {
                 kind: NoteKind::Info,
                 message: pre_msg,
                 span,
             });
-            // ── Phase 2: realloc (alloc new + copy old contents, free old) ──
+            // Phase 2: realloc (alloc new + copy old contents, free old).
             // The new block holds the OLD elements at the NEW capacity. The
             // actual push hasn't happened yet — that's phase 3.
             let copy_obj = HeapObject::Vec {
@@ -1319,7 +1407,7 @@ impl<'a> Evaluator<'a> {
             };
             let new_size = (new_cap * 4) as u32;
             let new_addr = self.realloc_heap(addr, copy_obj, new_size, span);
-            // ── Phase 3: the actual push, in place on the new buffer ──────
+            // Phase 3: the actual push, in place on the new buffer.
             if let Some(HeapObject::Vec { elements, .. }) = self.heap.objects.get_mut(&new_addr) {
                 elements.push(value);
             }
@@ -1369,6 +1457,43 @@ impl<'a> Evaluator<'a> {
         if needed > cur_cap {
             let mut new_cap = if cur_cap == 0 { 1 } else { cur_cap * 2 };
             while new_cap < needed { new_cap *= 2; }
+            // **M07.1**: in-place growth when nothing physically blocks it
+            // (same heuristic as vec_push: this is the last live block).
+            let can_grow_in_place = self
+                .heap
+                .objects
+                .keys()
+                .position(|a| *a == addr)
+                .map(|i| i == self.heap.objects.len() - 1)
+                .unwrap_or(false);
+            if can_grow_in_place {
+                self.events.push(MemEvent::Note {
+                    kind: NoteKind::Info,
+                    message: format!(
+                        "String capacity exceeded ({cur_cap} → {new_cap}); growing in place at heap #{addr_n} (no copy, borrows remain valid)",
+                        addr_n = addr.0,
+                    ),
+                    span,
+                });
+                if let Some(HeapObject::Str { bytes, capacity }) = self.heap.objects.get_mut(&addr) {
+                    bytes.push_str(suffix);
+                    *capacity = new_cap;
+                }
+                let (total, used) = self.heap.objects.get(&addr)
+                    .map(heap_object_bytes).unwrap_or((0, 0));
+                let new_display = self.heap.objects.get(&addr)
+                    .map(heap_object_display)
+                    .unwrap_or_default();
+                self.events.push(MemEvent::HeapRealloc {
+                    from: addr,
+                    to: addr,
+                    new_size: total,
+                    new_used: used,
+                    new_display,
+                    span,
+                });
+                return;
+            }
             let new_bytes = match self.heap.objects.get(&addr) {
                 Some(HeapObject::Str { bytes, .. }) => {
                     let mut b = bytes.clone();
@@ -1403,6 +1528,119 @@ impl<'a> Evaluator<'a> {
 
     /// **M07**: evaluate `receiver[index]`. Receiver must be a Vec; index any Int.
     /// Returns a copy of the element (bounds-checked).
+    /// **M07.1**: evaluate `&v[start..end]` (or any of the four range forms).
+    /// Bounds-checks the range, emits a `BorrowShared` event targeting the
+    /// Vec's heap allocation, registers the borrow (so M07's realloc-time
+    /// dangling scan catches it), and returns `Value::Slice { len, .. }`.
+    /// `mutable` is always rejected at typeck for M07.1; we keep the parameter
+    /// for forward-compat with M07.x mutable slices.
+    #[allow(clippy::too_many_arguments)]
+    fn eval_slice_borrow(
+        &mut self,
+        receiver: &ast::Expr,
+        start: Option<&ast::Expr>,
+        end: Option<&ast::Expr>,
+        mutable: bool,
+        idx_span: Span,
+        _range_span: Span,
+        borrow_span: Span,
+    ) -> Value {
+        // Evaluate receiver — must be Value::Vec.
+        let recv = self.eval_expr(receiver);
+        if self.halted { return Value::Unit; }
+        let addr = match recv {
+            Value::Vec { addr } => addr,
+            _ => panic!("typeck should reject slice of non-Vec"),
+        };
+        // Look up the Vec's current length + element size (for byte-range
+        // computation used by the UI hover highlight).
+        let (vec_len, elem_size): (i128, u64) = {
+            let obj = self.heap.objects.get(&addr).expect("vec exists");
+            if let HeapObject::Vec { elements, elem_ty, .. } = obj {
+                (elements.len() as i128, ty_size_bytes(elem_ty) as u64)
+            } else {
+                panic!("slice of non-Vec heap object")
+            }
+        };
+        // Evaluate bounds. Defaults: start=0, end=vec_len.
+        let start_i: i128 = if let Some(e) = start {
+            let v = self.eval_expr(e);
+            if self.halted { return Value::Unit; }
+            match v {
+                Value::Int { bits, .. } => bits,
+                _ => panic!("typeck should reject non-Int range bound"),
+            }
+        } else { 0 };
+        let end_i: i128 = if let Some(e) = end {
+            let v = self.eval_expr(e);
+            if self.halted { return Value::Unit; }
+            match v {
+                Value::Int { bits, .. } => bits,
+                _ => panic!("typeck should reject non-Int range bound"),
+            }
+        } else { vec_len };
+        // Bounds-check.
+        if start_i < 0 || start_i > vec_len {
+            self.emit_runtime_error(
+                format!(
+                    "slice start out of bounds: start is {start_i}, vec len is {vec_len}"
+                ),
+                idx_span,
+            );
+            return Value::Unit;
+        }
+        if end_i < 0 || end_i > vec_len {
+            self.emit_runtime_error(
+                format!(
+                    "slice end out of bounds: end is {end_i}, vec len is {vec_len}"
+                ),
+                idx_span,
+            );
+            return Value::Unit;
+        }
+        if start_i > end_i {
+            self.emit_runtime_error(
+                format!(
+                    "slice start > end: start is {start_i}, end is {end_i}"
+                ),
+                idx_span,
+            );
+            return Value::Unit;
+        }
+        // Allocate a borrow_id, emit BorrowShared targeting the Vec's heap.
+        // mutable=false enforced (typeck rejects mutable slices in M07.1).
+        let _ = mutable; // forward-compat marker
+        let target = crate::event::Pointee::Heap(addr);
+        let borrow_id = self.alloc_borrow_id();
+        self.events.push(MemEvent::BorrowShared {
+            borrow_id,
+            target,
+            span: borrow_span,
+        });
+        self.frames
+            .last_mut()
+            .expect("frame active")
+            .scopes
+            .last_mut()
+            .expect("scope active")
+            .borrows
+            .push(borrow_id);
+        // Snapshot heap generation for the dangling-borrow detection scan.
+        let generation = self.heap_generations.get(&addr).copied().unwrap_or(0);
+        self.borrow_generations.insert(borrow_id, generation);
+        let len = (end_i - start_i) as u64;
+        let start = start_i as u64;
+        Value::Slice {
+            borrow_id,
+            target,
+            start,
+            len,
+            mutable: false,
+            byte_offset: start * elem_size,
+            byte_len: len * elem_size,
+        }
+    }
+
     fn eval_index(&mut self, receiver: &ast::Expr, index: &ast::Expr, span: Span) -> Value {
         let recv = self.eval_expr(receiver);
         if self.halted { return Value::Unit; }
@@ -1718,6 +1956,8 @@ fn render_value_for_note(value: &Value) -> String {
         Value::Vec { .. } => "Vec".to_owned(),
         Value::String { .. } => "String".to_owned(),
         Value::Str(s) => format!("\"{s}\""),
+        // M07.1: slice. Abstract render with length for notes.
+        Value::Slice { len, .. } => format!("&[_; {len}]"),
     }
 }
 
