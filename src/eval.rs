@@ -370,24 +370,20 @@ impl<'a> Evaluator<'a> {
         let (addr, fragment) = self.alloc_heap_addr_sized(size);
         let (_, used) = heap_object_bytes(&obj);
         self.heap.objects.insert(addr, obj);
+        // **M07.2**: emit ONE HeapAlloc carrying both the new live block
+        // AND any leftover freed fragment (when the allocator split a
+        // larger freed chunk). Previously these were two consecutive
+        // events — the cursor step in between showed the reuse without
+        // the remainder, which read as "the freed bytes disappeared".
         self.events.push(MemEvent::HeapAlloc {
             addr,
             size,
             used,
             ty_name,
             fragment_of: None,
+            split_remainder: fragment.map(|(faddr, fsize)| (faddr, fsize)),
             span,
         });
-        if let Some((frag_addr, frag_size)) = fragment {
-            self.events.push(MemEvent::HeapAlloc {
-                addr: frag_addr,
-                size: frag_size,
-                used: 0,
-                ty_name: "(fragment from split)".to_owned(),
-                fragment_of: Some(addr),
-                span,
-            });
-        }
         // Track this alloc for HeapFree on scope exit.
         if let Some(scope) = self
             .frames

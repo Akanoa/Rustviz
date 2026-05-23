@@ -306,12 +306,22 @@ pub enum MemEvent {
         ty_name: String,
         /// **M07**: `Some(parent_addr)` if this "allocation" is actually
         /// a leftover fragment after the allocator split the freed block
-        /// at `parent_addr` (the new live request was smaller than the
-        /// recycled block; the unused bytes stay on the free list as
-        /// their own visible chunk, inserted right after `parent_addr` in
-        /// the heap panel). `None` for real allocations.
+        /// at `parent_addr`. Kept for backwards-compat with earlier
+        /// traces; M07.2+ uses `split_remainder` on the same event
+        /// instead so the alloc + fragment appear at the same cursor
+        /// step (avoids a transient misleading "the freed bytes
+        /// disappeared" frame between the two events).
         #[serde(default)]
         fragment_of: Option<HeapAddr>,
+        /// **M07.2**: when this allocation reuses a freed chunk that was
+        /// larger than `size`, the leftover bytes are reported here so
+        /// the UI inserts them as a sibling freed block at the SAME
+        /// cursor step as the main allocation. Without this, the
+        /// allocator-split was emitted as two consecutive events; the
+        /// in-between cursor state showed the reuse without the
+        /// remainder, which read as "the freed bytes vanished".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        split_remainder: Option<(HeapAddr, u32)>,
         /// Source location of the allocating expression.
         span: Span,
     },
@@ -485,6 +495,7 @@ mod tests {
             used: 8,
             ty_name: "i32".into(),
             fragment_of: None,
+            split_remainder: None,
             span: dummy_span(),
         };
         assert!(format!("{e:?}").contains("HeapAlloc"));

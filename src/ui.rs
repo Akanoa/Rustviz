@@ -672,7 +672,7 @@ fn apply_event(world: &mut World, event: &MemEvent) {
             world.borrows.retain(|b| b.borrow_id != borrow_id.0);
         }
         // **M07**: heap events.
-        MemEvent::HeapAlloc { addr, size, used, ty_name, fragment_of, .. } => {
+        MemEvent::HeapAlloc { addr, size, used, ty_name, fragment_of, split_remainder, .. } => {
             let new_state = HeapAllocState {
                 addr: addr.0,
                 ty_name: ty_name.clone(),
@@ -681,14 +681,15 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                 used: *used,
                 freed: fragment_of.is_some(),
             };
-            if let Some(parent) = fragment_of {
-                // Fragment: insert immediately after the parent live block
-                // (the just-allocated one this fragment was split from).
+            let inserted_at = if let Some(parent) = fragment_of {
+                // (Legacy path) Fragment: insert immediately after the parent
+                // live block. M07.2 collapses this into split_remainder on
+                // the same event, but old traces still go through here.
                 let parent_idx = world.heap.iter()
                     .position(|h| h.addr == parent.0 && !h.freed);
                 match parent_idx {
-                    Some(i) => world.heap.insert(i + 1, new_state),
-                    None => world.heap.push(new_state),
+                    Some(i) => { world.heap.insert(i + 1, new_state); i + 1 }
+                    None => { world.heap.push(new_state); world.heap.len() - 1 }
                 }
             } else {
                 // Real allocation: if reusing a freed addr, REPLACE the
@@ -697,9 +698,25 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                 let idx = world.heap.iter()
                     .position(|h| h.addr == addr.0 && h.freed);
                 match idx {
-                    Some(i) => world.heap[i] = new_state,
-                    None => world.heap.push(new_state),
+                    Some(i) => { world.heap[i] = new_state; i }
+                    None => { world.heap.push(new_state); world.heap.len() - 1 }
                 }
+            };
+            // **M07.2**: if the allocator split a larger freed chunk to
+            // satisfy this request, materialize the leftover as a freed
+            // fragment block immediately after the live block — at the
+            // SAME cursor step so the user never sees a transient frame
+            // where the freed bytes appear to have vanished.
+            if let Some((frag_addr, frag_size)) = split_remainder {
+                let frag = HeapAllocState {
+                    addr: frag_addr.0,
+                    ty_name: "(fragment from split)".to_owned(),
+                    display: "(fragment from split)".to_owned(),
+                    size: *frag_size,
+                    used: 0,
+                    freed: true,
+                };
+                world.heap.insert(inserted_at + 1, frag);
             }
         }
         MemEvent::HeapRealloc { from, to, new_size, new_used, new_display, .. } => {
