@@ -370,6 +370,24 @@ impl<'a> Evaluator<'a> {
         let (addr, fragment) = self.alloc_heap_addr_sized(size);
         let (_, used) = heap_object_bytes(&obj);
         self.heap.objects.insert(addr, obj);
+        // **M07.2**: pedagogical Info note explaining the allocator's
+        // first-fit + split behavior. Fires BEFORE the HeapAlloc event
+        // so the learner reads "what's about to happen" then sees the
+        // heap update on the next cursor step. Only emits when there's
+        // a leftover fragment — a fresh-addr alloc (no reuse) is
+        // self-explanatory.
+        if let Some((frag_addr, frag_size)) = fragment {
+            let total = size + frag_size;
+            self.events.push(MemEvent::Note {
+                kind: NoteKind::Info,
+                message: format!(
+                    "Allocator first-fit: heap #{from_addr} (was {total}B freed) reused for this {size}B request. The {frag_size}B leftover stays freed as heap #{frag_addr_num} — available for the next request that fits.",
+                    from_addr = addr.0,
+                    frag_addr_num = frag_addr.0,
+                ),
+                span,
+            });
+        }
         // **M07.2**: emit ONE HeapAlloc carrying both the new live block
         // AND any leftover freed fragment (when the allocator split a
         // larger freed chunk). Previously these were two consecutive
