@@ -87,14 +87,21 @@ struct Evaluator<'a> {
 
 /// **M07**: heap state. Each live allocation is one HeapObject indexed by
 /// its HeapAddr. Realloc replaces (old, new): the `from` addr is removed,
-/// the `to` addr is added with the new contents.
+/// the `to` addr is added with the new contents. The `free_list` tracks
+/// freed `(addr, size)` chunks so new allocations can reuse them AND
+/// fragment them when the request is smaller than the freed chunk — same
+/// behavior as a real first-fit allocator.
 struct HeapState {
     objects: indexmap::IndexMap<crate::event::HeapAddr, HeapObject>,
+    free_list: Vec<(crate::event::HeapAddr, u32)>,
 }
 
 impl HeapState {
     fn new() -> Self {
-        Self { objects: indexmap::IndexMap::new() }
+        Self {
+            objects: indexmap::IndexMap::new(),
+            free_list: Vec::new(),
+        }
     }
 }
 
@@ -113,6 +120,68 @@ enum HeapObject {
         bytes: String,
         capacity: usize,
     },
+}
+
+/// **M07**: bytes occupied by a value of the given type. Used to size heap
+/// allocations realistically — `Box<f32>` allocates 4 bytes, `Box<f64>` 8,
+/// `Vec<u8>` cap=N allocates N bytes, `Vec<i32>` cap=N allocates 4*N.
+fn ty_size_bytes(ty: &Ty) -> u32 {
+    use crate::typeck::{IntKind, FloatKind};
+    match ty {
+        Ty::Int(k) => match k {
+            IntKind::I8 | IntKind::U8 => 1,
+            IntKind::I16 | IntKind::U16 => 2,
+            IntKind::I32 | IntKind::U32 => 4,
+            IntKind::I64 | IntKind::U64 | IntKind::ISize | IntKind::USize => 8,
+            IntKind::I128 | IntKind::U128 => 16,
+        },
+        Ty::Float(k) => match k {
+            FloatKind::F32 => 4,
+            FloatKind::F64 => 8,
+        },
+        Ty::Bool => 1,
+        Ty::Unit => 0,
+        Ty::Ref { .. } | Ty::Box(_) | Ty::String | Ty::Vec(_) => 8,
+    }
+}
+
+/// **M07**: bytes occupied by a value (derived from its runtime kind).
+fn value_size_bytes(v: &Value) -> u32 {
+    use crate::typeck::{IntKind, FloatKind};
+    match v {
+        Value::Int { kind, .. } => match kind {
+            IntKind::I8 | IntKind::U8 => 1,
+            IntKind::I16 | IntKind::U16 => 2,
+            IntKind::I32 | IntKind::U32 => 4,
+            IntKind::I64 | IntKind::U64 | IntKind::ISize | IntKind::USize => 8,
+            IntKind::I128 | IntKind::U128 => 16,
+        },
+        Value::Float { kind, .. } => match kind {
+            FloatKind::F32 => 4,
+            FloatKind::F64 => 8,
+        },
+        Value::Bool(_) => 1,
+        Value::Unit => 0,
+        Value::Ref { .. } | Value::Box { .. } | Value::String { .. } | Value::Vec { .. } => 8,
+        Value::Str(_) => 0,
+    }
+}
+
+/// **M07**: total + used bytes for a heap object.
+fn heap_object_bytes(obj: &HeapObject) -> (u32, u32) {
+    match obj {
+        HeapObject::Box(v) => {
+            let s = value_size_bytes(v);
+            (s, s)
+        }
+        HeapObject::Vec { elements, capacity, elem_ty } => {
+            let es = ty_size_bytes(elem_ty);
+            ((*capacity as u32) * es, (elements.len() as u32) * es)
+        }
+        HeapObject::Str { bytes, capacity } => {
+            (*capacity as u32, bytes.len() as u32)
+        }
+    }
 }
 
 struct Frame {
@@ -205,24 +274,59 @@ impl<'a> Evaluator<'a> {
         id
     }
 
-    /// **M07**: allocate a fresh HeapAddr.
+    /// **M07**: allocate a HeapAddr. Always increments — used for realloc's
+    /// new allocation where we don't want free-list reuse (the just-freed
+    /// `from` would trivially recycle and undo the realloc pedagogically).
     fn alloc_heap_addr(&mut self) -> crate::event::HeapAddr {
         let id = crate::event::HeapAddr(self.next_heap_addr);
         self.next_heap_addr += 1;
         id
     }
 
+    /// **M07**: allocate a HeapAddr that prefers reusing a freed chunk
+    /// (first-fit). If the freed chunk is larger than `needed`, splits it
+    /// — the leftover bytes become their own free chunk with a fresh addr
+    /// (visible in the UI as a freed-block fragment, available for future
+    /// reuse). Returns `(addr, Option<(fragment_addr, fragment_size)>)`.
+    fn alloc_heap_addr_sized(&mut self, needed: u32) -> (crate::event::HeapAddr, Option<(crate::event::HeapAddr, u32)>) {
+        if let Some(idx) = self.heap.free_list.iter().position(|(_, s)| *s >= needed) {
+            let (addr, size) = self.heap.free_list.remove(idx);
+            if size > needed {
+                let frag_addr = crate::event::HeapAddr(self.next_heap_addr);
+                self.next_heap_addr += 1;
+                let frag_size = size - needed;
+                self.heap.free_list.push((frag_addr, frag_size));
+                return (addr, Some((frag_addr, frag_size)));
+            }
+            return (addr, None);
+        }
+        (self.alloc_heap_addr(), None)
+    }
+
     /// **M07**: allocate a heap object and emit `HeapAlloc`. Returns the
     /// new addr. Tracks the addr in the current scope for HeapFree on exit.
     fn alloc_heap(&mut self, obj: HeapObject, ty_name: String, size: u32, span: Span) -> crate::event::HeapAddr {
-        let addr = self.alloc_heap_addr();
+        let (addr, fragment) = self.alloc_heap_addr_sized(size);
+        let (_, used) = heap_object_bytes(&obj);
         self.heap.objects.insert(addr, obj);
         self.events.push(MemEvent::HeapAlloc {
             addr,
             size,
+            used,
             ty_name,
+            fragment_of: None,
             span,
         });
+        if let Some((frag_addr, frag_size)) = fragment {
+            self.events.push(MemEvent::HeapAlloc {
+                addr: frag_addr,
+                size: frag_size,
+                used: 0,
+                ty_name: "(fragment from split)".to_owned(),
+                fragment_of: Some(addr),
+                span,
+            });
+        }
         // Track this alloc for HeapFree on scope exit.
         if let Some(scope) = self
             .frames
@@ -247,14 +351,25 @@ impl<'a> Evaluator<'a> {
             (Some(HeapObject::Str { capacity: oc, .. }), HeapObject::Str { capacity: nc, .. }) => (*oc, *nc, "String"),
             _ => (0, 0, "heap object"),
         };
-        // Allocate a NEW addr for the copy.
+        // Allocate a NEW addr for the copy. NOTE: the addr returned by
+        // alloc_heap_addr won't be `from` itself because we haven't yet
+        // pushed `from` to the free-list — that happens right after the
+        // allocation, mirroring how realloc semantically does free-then-
+        // alloc but in eval order we need the new addr before freeing.
         let to = self.alloc_heap_addr();
+        // Read the freed block's size BEFORE removing it so we know what to
+        // push back to the free list.
+        let from_size = self.heap.objects.get(&from)
+            .map(heap_object_bytes).map(|(t, _)| t).unwrap_or(0);
         self.heap.objects.shift_remove(&from);
+        self.heap.free_list.push((from, from_size));
+        let (_, new_used) = heap_object_bytes(&obj);
         self.heap.objects.insert(to, obj);
         self.events.push(MemEvent::HeapRealloc {
             from,
             to,
             new_size,
+            new_used,
             new_display,
             span,
         });
@@ -320,10 +435,14 @@ impl<'a> Evaluator<'a> {
         to
     }
 
-    /// **M07**: free a heap object — emit HeapFree, remove from state.
+    /// **M07**: free a heap object — emit HeapFree, remove from state,
+    /// push the addr+size to the free-list for potential reuse by a later
+    /// alloc (with split if the reuse is smaller than the freed chunk).
     fn free_heap(&mut self, addr: crate::event::HeapAddr, span: Span) {
-        if self.heap.objects.shift_remove(&addr).is_some() {
+        if let Some(obj) = self.heap.objects.shift_remove(&addr) {
+            let (size, _) = heap_object_bytes(&obj);
             self.events.push(MemEvent::HeapFree { addr, span });
+            self.heap.free_list.push((addr, size));
         }
     }
 
@@ -1072,9 +1191,8 @@ impl<'a> Evaluator<'a> {
                     Value::Bool(_) => "bool".to_owned(),
                     _ => "?".to_owned(),
                 };
-                let size = 8; // M07: simplification — uniform 8 bytes for primitives.
-                // M07: embed value in the display label so the heap panel
-                // shows e.g. "Box<i32> = 5_i32" instead of just "Box<i32>".
+                // M07: per-type byte size (Box<f32> = 4, Box<f64> = 8, etc).
+                let size = value_size_bytes(&v);
                 let value_str = render_value_for_note(&v);
                 let display = format!("Box<{inner_ty_name}> = {value_str}");
                 let addr = self.alloc_heap(
@@ -1086,16 +1204,13 @@ impl<'a> Evaluator<'a> {
                 Value::Box { addr }
             }
             ["Vec", "new"] => {
-                // M07: initial capacity = 2 (pedagogical default; pushes fit
-                // in-place until they exceed). Matches the user-friendly
-                // mental model where the heap addr stays stable until a
-                // genuine realloc happens.
                 let elem_ty = Ty::Int(IntKind::I32);
                 let initial_cap: usize = 2;
+                let elem_size = ty_size_bytes(&elem_ty);
                 let addr = self.alloc_heap(
                     HeapObject::Vec { elements: Vec::new(), capacity: initial_cap, elem_ty },
                     format!("Vec [] (cap={initial_cap})"),
-                    (initial_cap * 4) as u32,
+                    initial_cap as u32 * elem_size,
                     span,
                 );
                 Value::Vec { addr }
@@ -1208,13 +1323,16 @@ impl<'a> Evaluator<'a> {
             if let Some(HeapObject::Vec { elements, .. }) = self.heap.objects.get_mut(&new_addr) {
                 elements.push(value);
             }
+            let (push_total, push_used) = self.heap.objects.get(&new_addr)
+                .map(heap_object_bytes).unwrap_or((0, 0));
             let push_display = self.heap.objects.get(&new_addr)
                 .map(heap_object_display)
                 .unwrap_or_default();
             self.events.push(MemEvent::HeapRealloc {
                 from: new_addr,
                 to: new_addr,
-                new_size,
+                new_size: push_total,
+                new_used: push_used,
                 new_display: push_display,
                 span,
             });
@@ -1224,13 +1342,16 @@ impl<'a> Evaluator<'a> {
             if let Some(HeapObject::Vec { elements, .. }) = self.heap.objects.get_mut(&addr) {
                 elements.push(value);
             }
+            let (total, used) = self.heap.objects.get(&addr)
+                .map(heap_object_bytes).unwrap_or((0, 0));
             let new_display = self.heap.objects.get(&addr)
                 .map(heap_object_display)
                 .unwrap_or_default();
             self.events.push(MemEvent::HeapRealloc {
                 from: addr,
                 to: addr,
-                new_size: (cur_cap * 4) as u32,
+                new_size: total,
+                new_used: used,
                 new_display,
                 span,
             });
@@ -1264,13 +1385,16 @@ impl<'a> Evaluator<'a> {
             if let Some(HeapObject::Str { bytes, .. }) = self.heap.objects.get_mut(&addr) {
                 bytes.push_str(suffix);
             }
+            let (total, used) = self.heap.objects.get(&addr)
+                .map(heap_object_bytes).unwrap_or((0, 0));
             let new_display = self.heap.objects.get(&addr)
                 .map(heap_object_display)
                 .unwrap_or_default();
             self.events.push(MemEvent::HeapRealloc {
                 from: addr,
                 to: addr,
-                new_size: cur_cap as u32,
+                new_size: total,
+                new_used: used,
                 new_display,
                 span,
             });
@@ -1540,16 +1664,29 @@ impl<'a> Evaluator<'a> {
 }
 
 /// **M07**: render a heap object's content for display (used in heap panel
-/// labels and realloc Info notes).
+/// labels and realloc Info notes). Vec/String include empty-slot
+/// placeholders up to capacity so the difference between used and
+/// allocated bytes is visible — important pedagogy when freed heap blocks
+/// get reused for a smaller allocation.
 fn heap_object_display(obj: &HeapObject) -> String {
     match obj {
         HeapObject::Box(v) => format!("Box = {}", render_value_for_note(v)),
         HeapObject::Vec { elements, capacity, .. } => {
-            let elems: Vec<String> = elements.iter().map(render_value_for_note).collect();
-            format!("Vec [{}] (cap={})", elems.join(", "), capacity)
+            // Empty capacity is conveyed by the byte-cell row in the UI;
+            // the text label only lists the actual elements.
+            let cells: Vec<String> = elements.iter().map(render_value_for_note).collect();
+            format!(
+                "Vec [{}] (cap={}, len={})",
+                cells.join(", "),
+                capacity,
+                elements.len()
+            )
         }
         HeapObject::Str { bytes, capacity } => {
-            format!("String \"{bytes}\" (cap={capacity})")
+            format!(
+                "String \"{bytes}\" (cap={capacity}, len={})",
+                bytes.len()
+            )
         }
     }
 }

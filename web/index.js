@@ -385,17 +385,37 @@ function renderHeap(heap) {
       addr.textContent = `heap #${h.addr}`;
       const disp = document.createElement("div");
       disp.className = "heap-display";
+      const cells = document.createElement("div");
+      cells.className = "heap-cells";
       box.appendChild(addr);
       box.appendChild(disp);
+      box.appendChild(cells);
       heapEl.appendChild(box);
       heapElements.set(h.addr, box);
     }
-    // Update content + addr label every render (covers in-place updates).
     box.setAttribute("data-heap-addr", String(h.addr));
     box.querySelector(".heap-addr").textContent =
-      h.freed ? `heap #${h.addr} (freed)` : `heap #${h.addr}`;
+      h.freed ? `heap #${h.addr} (freed, ${h.size}B)` : `heap #${h.addr} (${h.size}B)`;
     box.querySelector(".heap-display").textContent = h.display;
     box.classList.toggle("heap-freed", !!h.freed);
+    // **M07**: byte-level cells. One cell per byte of total capacity.
+    // First `used` cells filled (current value); rest empty (allocated
+    // but unused). Makes per-type physical size differences obvious:
+    // Box<f32> = 4 cells, Box<f64> = 8 cells, Vec<i32> cap=4 = 16 cells,
+    // Vec<u8> cap=4 = 4 cells.
+    const cellsEl = box.querySelector(".heap-cells");
+    const wantCells = h.size;
+    while (cellsEl.children.length < wantCells) {
+      const c = document.createElement("span");
+      c.className = "byte-cell";
+      cellsEl.appendChild(c);
+    }
+    while (cellsEl.children.length > wantCells) {
+      cellsEl.removeChild(cellsEl.lastChild);
+    }
+    for (let i = 0; i < cellsEl.children.length; i++) {
+      cellsEl.children[i].className = i < h.used ? "byte-cell byte-used" : "byte-cell";
+    }
   }
   // Remove DOM elements for addrs that no longer exist (HeapFree).
   for (const [addr, el] of [...heapElements.entries()]) {
@@ -403,6 +423,15 @@ function renderHeap(heap) {
       el.remove();
       heapElements.delete(addr);
     }
+  }
+  // **M07**: reorder heap-box DOM children to match state.heap's order.
+  // appendChild on an EXISTING child moves it to the end — iterating
+  // state.heap and re-appending each box in order rebuilds the panel's
+  // child sequence (so a split fragment inserted in state.heap right
+  // after its parent ends up adjacent in the DOM too).
+  for (const h of heap) {
+    const box = heapElements.get(h.addr);
+    if (box) heapEl.appendChild(box);
   }
 }
 
@@ -573,15 +602,15 @@ function showBuildId() {
   const wasmMatch = preload?.href?.match(/rustviz-([a-f0-9]+)\.js/);
   const cssHash = cssMatch ? cssMatch[1].slice(0, 8) : "?";
   const wasmHash = wasmMatch ? wasmMatch[1].slice(0, 8) : "?";
-  const el = document.createElement("div");
+  const el = document.createElement("span");
   el.id = "build-id";
   el.textContent = `build: css ${cssHash} / wasm ${wasmHash}`;
   el.title = "Click to copy";
   el.style.cssText =
-    "position:fixed; bottom:4px; right:4px; font-size:10px; color:#555; " +
+    "margin-left:0.75rem; font-size:10px; color:#777; " +
     "font-family:ui-monospace,monospace; user-select:text; cursor:copy; " +
-    "z-index:9999; background:rgba(255,255,255,0.85); " +
-    "border:1px solid #ccc; padding:2px 6px; border-radius:3px;";
+    "background:rgba(0,0,0,0.04); border:1px solid #ccc; " +
+    "padding:1px 6px; border-radius:3px; vertical-align:middle;";
   el.addEventListener("click", async () => {
     try {
       await navigator.clipboard.writeText(el.textContent);
@@ -596,7 +625,13 @@ function showBuildId() {
       window.getSelection().addRange(range);
     }
   });
-  document.body.appendChild(el);
+  // Append next to the <h1>rustviz</h1> title in the header.
+  const title = document.querySelector("header h1");
+  if (title) {
+    title.appendChild(el);
+  } else {
+    document.body.appendChild(el);
+  }
 }
 
 if (window.wasmBindings) {

@@ -255,10 +255,21 @@ pub enum MemEvent {
     HeapAlloc {
         /// Identifier of the new allocation.
         addr: HeapAddr,
-        /// Size in bytes.
+        /// Total capacity in bytes.
         size: u32,
+        /// **M07**: used bytes (≤ size). Box always = size; Vec = len*elem_size; String = len.
+        #[serde(default)]
+        used: u32,
         /// Human-readable type name (e.g. `"i32"`, `"Vec<i32>"`).
         ty_name: String,
+        /// **M07**: `Some(parent_addr)` if this "allocation" is actually
+        /// a leftover fragment after the allocator split the freed block
+        /// at `parent_addr` (the new live request was smaller than the
+        /// recycled block; the unused bytes stay on the free list as
+        /// their own visible chunk, inserted right after `parent_addr` in
+        /// the heap panel). `None` for real allocations.
+        #[serde(default)]
+        fragment_of: Option<HeapAddr>,
         /// Source location of the allocating expression.
         span: Span,
     },
@@ -268,12 +279,12 @@ pub enum MemEvent {
         from: HeapAddr,
         /// New heap address.
         to: HeapAddr,
-        /// New size in bytes.
+        /// New total capacity in bytes.
         new_size: u32,
-        /// **M07 polish**: human-readable display of the new contents
-        /// (e.g. `"Vec [1_i32, 2_i32] (cap=2)"`). The UI updates the heap
-        /// panel's box label with this string so the learner sees the
-        /// updated contents after realloc, not the original alloc's label.
+        /// **M07**: used bytes after the realloc.
+        #[serde(default)]
+        new_used: u32,
+        /// **M07 polish**: human-readable display of the new contents.
         new_display: String,
         /// Source location of the operation triggering the realloc.
         span: Span,
@@ -395,7 +406,9 @@ mod tests {
         let e = MemEvent::HeapAlloc {
             addr: HeapAddr(0),
             size: 8,
+            used: 8,
             ty_name: "i32".into(),
+            fragment_of: None,
             span: dummy_span(),
         };
         assert!(format!("{e:?}").contains("HeapAlloc"));

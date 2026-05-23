@@ -165,6 +165,39 @@ main > section {
   font-weight: 500;
 }
 
+/* **M07**: byte-level physical view. One small cell per byte of allocated
+   capacity. Filled = used, empty = unused capacity. Makes per-type byte
+   size differences visible (Box<f32> vs Box<f64>, Vec<i32> vs Vec<u8>). */
+.heap-box .heap-cells {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1px;
+  margin-top: 4px;
+  max-width: 280px;
+}
+
+.heap-box .byte-cell {
+  width: 8px;
+  height: 8px;
+  border: 1px solid #bbb;
+  background: #fff;
+  box-sizing: border-box;
+}
+
+.heap-box .byte-cell.byte-used {
+  background: #4a90c8;
+  border-color: #2a6fa5;
+}
+
+.heap-box.heap-freed .byte-cell {
+  border-style: dashed;
+  background: repeating-linear-gradient(
+    45deg,
+    transparent, transparent 2px,
+    rgba(0,0,0,0.1) 2px, rgba(0,0,0,0.1) 4px
+  );
+}
+
 /* M07: freed heap blocks stay visible (allocator "free list" pedagogy)
    but render grayed-out to convey they're available for reuse. */
 .heap-box.heap-freed {

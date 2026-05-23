@@ -103,8 +103,11 @@ pub struct HeapView {
     pub ty_name: String,
     /// Renderer-ready content display.
     pub display: String,
-    /// Size in bytes.
+    /// Total capacity in bytes (Box<f32>=4, Box<f64>=8, Vec<i32> cap=N → N*4).
     pub size: u32,
+    /// **M07**: used bytes (Box always = size, Vec = len*elem_size, String = len).
+    /// JS renders `size` byte-cells with the first `used` filled, the rest empty.
+    pub used: u32,
     /// **M07**: `true` if the block has been freed. Renderer shows a grayed
     /// "freed, ready to be reused" visual instead of removing the DOM element.
     pub freed: bool,
@@ -259,6 +262,7 @@ impl Cursor {
             ty_name: h.ty_name.clone(),
             display: h.display.clone(),
             size: h.size,
+            used: h.used,
             freed: h.freed,
         }).collect::<Vec<HeapView>>();
         StateSnapshot {
@@ -316,6 +320,7 @@ struct HeapAllocState {
     ty_name: String,
     display: String,
     size: u32,
+    used: u32,
     /// **M07**: true after the allocation has been freed but kept visible
     /// in the heap panel (grayed) to convey "memory still physically there,
     /// just available for the allocator to reuse." Same pedagogy as M03.1's
@@ -502,25 +507,44 @@ fn apply_event(world: &mut World, event: &MemEvent) {
             world.borrows.retain(|b| b.borrow_id != borrow_id.0);
         }
         // **M07**: heap events.
-        MemEvent::HeapAlloc { addr, size, ty_name, .. } => {
-            world.heap.push(HeapAllocState {
+        MemEvent::HeapAlloc { addr, size, used, ty_name, fragment_of, .. } => {
+            let new_state = HeapAllocState {
                 addr: addr.0,
                 ty_name: ty_name.clone(),
                 display: ty_name.clone(),
                 size: *size,
-                freed: false,
-            });
+                used: *used,
+                freed: fragment_of.is_some(),
+            };
+            if let Some(parent) = fragment_of {
+                // Fragment: insert immediately after the parent live block
+                // (the just-allocated one this fragment was split from).
+                let parent_idx = world.heap.iter()
+                    .position(|h| h.addr == parent.0 && !h.freed);
+                match parent_idx {
+                    Some(i) => world.heap.insert(i + 1, new_state),
+                    None => world.heap.push(new_state),
+                }
+            } else {
+                // Real allocation: if reusing a freed addr, REPLACE the
+                // freed entry IN PLACE (keeps the visual position stable
+                // instead of moving the block to the end of the panel).
+                let idx = world.heap.iter()
+                    .position(|h| h.addr == addr.0 && h.freed);
+                match idx {
+                    Some(i) => world.heap[i] = new_state,
+                    None => world.heap.push(new_state),
+                }
+            }
         }
-        MemEvent::HeapRealloc { from, to, new_size, new_display, .. } => {
+        MemEvent::HeapRealloc { from, to, new_size, new_used, new_display, .. } => {
             if from == to {
-                // **In-place** update: just refresh display + size.
                 if let Some(h) = world.heap.iter_mut().find(|h| h.addr == from.0 && !h.freed) {
                     h.size = *new_size;
+                    h.used = *new_used;
                     h.display = new_display.clone();
                 }
             } else {
-                // **Real realloc** — `from` is freed (kept visible, grayed);
-                // `to` is a new live block with the copied contents.
                 if let Some(h) = world.heap.iter_mut().find(|h| h.addr == from.0 && !h.freed) {
                     h.freed = true;
                 }
@@ -529,6 +553,7 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                     ty_name: new_display.clone(),
                     display: new_display.clone(),
                     size: *new_size,
+                    used: *new_used,
                     freed: false,
                 });
                 // Update owning relationships from `from` to `to`.
