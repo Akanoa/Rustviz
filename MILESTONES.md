@@ -15,6 +15,8 @@ M01 ──► M02 ──► M03 ──► M04 ──► M05 ──► M06 ──
              each extends MemEvent enum payloads defined in M03)
 
 M03 ──► M03.1     # additive protocol revision; M04+ consume it once shipped
+M07 ──► M07.1 ──► M07.2  # slices, then &str + static memory
+            └──► M07.3   # arrays (sibling of M07.2; both depend only on M07.1)
 ```
 
 Acyclic. The drawn order is one valid topological sort. Edges from M03 to M05–M08 are real direct dependencies (each later milestone fills payloads in the event enum M03 defines), not just transitive. **M03.1** is a *revision* milestone — it patches M03's event protocol after M03 closed, based on pedagogical issues uncovered during M04's manual QA. Revisions don't sit in the main chain; they hang off the milestone they patch and improve downstream milestones' behavior once shipped.
@@ -520,6 +522,53 @@ Acyclic. The drawn order is one valid topological sort. Edges from M03 to M05–
 **Demo.** Browser. `m07_2_str_literal.rs`: `let s = "toto";`, observe the static-memory region + the &str arrow. `m07_2_string_from.rs`: `String::from("hi")` shows the static "hi" PLUS the new heap allocation with a copy.
 
 **Notes.** Closes M07's known type-incorrectness (string literals shouldn't be `String`). The static-memory region is a new visual concept worth its own pedagogy — distinguishes "this binding's bytes are baked into the binary" from "this binding owns a heap allocation."
+
+---
+
+### M07.3 — Arrays (`[T; N]`, stack-allocated sequences)
+
+- **Kind**: feature (revision-style — fills a Level-3 gap by introducing the stack-allocated counterpart to `Vec<T>`)
+- **Status**: planned
+- **Complexity**: M (modules: 3, bullets: 4, boundaries: 2)
+- **Depends on**: M07.1
+- **Authority**: Rust language reference for arrays `[T; N]`; M07.1's slice infrastructure (slicing an array produces `&[T]`).
+
+**Goal.** Introduce fixed-size, stack-allocated arrays `[T; N]` end to end. Arrays are Rust's compile-time-sized sequence stored INLINE in the stack slot — no heap allocation, no realloc, no destructor. This is the natural counterpart to `Vec<T>`: same indexing/slicing/`len()` surface, different storage location. Slicing an array (`&t[1..3]`) produces an `&[T]` whose `target` is `Pointee::Slot(_)` — the first scenario in the project where `Value::Slice` carries a Slot target (M07.1 declared the variant but only ever constructed Heap-targeted slices).
+
+**In scope.**
+- Array literal expression `[e1, e2, e3]` — new AST node `Expr::ArrayLit { elements: Vec<Expr>, span }`.
+- Array type annotation `[T; N]` — new AST `Type::Array { inner, size, span }` and `Ty::Array(Box<Ty>, u64)`. Size is a literal integer (no const-eval beyond `LitInt`).
+- Array indexing `t[i]` — extends M07's Vec-only `Expr::Index` typeck to accept `Ty::Array(_, _)` receivers; same runtime bounds-check + RuntimeError pedagogy.
+- Array slicing `&t[range]` produces `Ty::Slice(T)` with `Value::Slice { target: Pointee::Slot(t_slot), .. }` — extends M07.1's `typecheck_slice_borrow` to accept array receivers, and `eval_slice_borrow` to emit `BorrowShared { target: Pointee::Slot(_), .. }`.
+- `t.len()` — extend the method dispatch with `(Ty::Array(_, N), "len") -> u64`; eval returns the array's size (no runtime lookup needed, it's compile-time-known).
+- Visualization: array binding renders its bytes inline in its stack slot — multi-cell display (similar to M07's heap byte-cells but inside the slot value-column). Slice arrows into arrays route from slot to slot (M06-style routing) instead of slot to heap.
+- ≥ 3 new reference samples (`m07_3_*.rs`): basic array, array indexing, slice-into-array.
+
+**Out of scope.**
+- Array repeat syntax `[v; N]` (e.g. `[0; 100]`) — deferred.
+- Multi-dimensional arrays `[[T; N]; M]` — deferred.
+- Arrays of non-Copy types (`[Box<i32>; 3]`) — deferred (matches M07's Vec-of-primitives restriction).
+- Mutation through index `t[0] = 5;` — would require extending M06.1's place-expression set to include `Expr::Index`; deferred.
+- `t.iter()`, `for x in t`, slice methods beyond `len()` — out of scope (matches M07.1's deferrals).
+
+**Entry criteria.**
+- M07.1 closed (slice infrastructure: `Ty::Slice`, `Value::Slice`, range parsing).
+
+**Exit criteria.**
+- `let t = [1, 2, 3];` typechecks as `Ty::Array(Ty::Int(I32), 3)`; the t slot in the stacks panel renders 3 inline i32 cells (no heap event fires).
+- `let s = &t[1..]` typechecks as `Ty::Slice(Ty::Int(I32))`; produces a `Value::Slice { target: Pointee::Slot(t_slot), len: 2, .. }`; slice arrow points from s's slot to t's slot (NOT a heap block); `[len: 2]` annotation visible on the arrow; hover highlights cover the t-slot's 2nd and 3rd cells.
+- `t.len()` returns `Value::Int { kind: U64, bits: 3 }`.
+- Out-of-bounds index `t[100]` and out-of-bounds slice `&t[0..100]` fire the same `Note { RuntimeError }` messages as their Vec counterparts (reuses M07/M07.1 bounds-check infrastructure).
+- ≥ 3 new `m07_3_*.rs` reference programs ship.
+- All M01-M07.2 tests pass byte-identical (additive variant only; existing samples don't construct `Ty::Array`).
+- WASM bundle growth ≤ +15% vs M07.2 baseline (small surface — one Ty variant, one AST expr, slice-target Pointee::Slot path that already exists in the renderer).
+
+**Demo.**
+- Format: browser
+- Inputs: `tests/samples/m07_3_array_basic.rs` (`let t = [1, 2, 3]; let n = t.len();`), `m07_3_array_index.rs` (`let t = [10, 20, 30]; let x = t[1];`), `m07_3_array_slice.rs` (`let t = [1, 2, 3, 4]; let s = &t[1..3];`).
+- Outputs (browser-observed steps): for array_basic — t's slot displays `[1_i32, 2_i32, 3_i32]` inline, no heap activity, n = 3_u64. For array_slice — load → step → at `let s` step, observe blue slice arrow from s to t (slot-to-slot, NOT slot-to-heap), `[len: 2]` annotation visible, hover lights up t's 2nd and 3rd element cells.
+
+**Notes.** First milestone where `Value::Slice.target = Pointee::Slot(_)` is actually constructed — exercises a code path M07.1 declared but didn't reach. The hover-highlight infrastructure from M07.1 (byte-cells + element-spans) should generalize: instead of `[data-heap-addr]` lookups, slot-target slices look up `[data-slot-id]` then find the slot's inline byte-cells. Plan-phase decides whether to render array bytes as a Vec-style horizontal cell strip or a more compact form. Pedagogically the headline contrast is **storage**: arrays live in the stack frame (bytes vanish when the frame leaves; no Drop, no free, no realloc); Vec lives on the heap (owning arrow + HeapAlloc + HeapFree). Same `len()`, same indexing, same slicing — different memory location.
 
 ---
 
