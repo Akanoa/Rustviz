@@ -17,9 +17,10 @@ M01 ──► M02 ──► M03 ──► M04 ──► M05 ──► M06 ──
 M03 ──► M03.1     # additive protocol revision; M04+ consume it once shipped
 M07 ──► M07.1 ──► M07.2  # slices, then &str + static memory
             └──► M07.3   # arrays (sibling of M07.2; both depend only on M07.1)
-            └──► M07.4 ──► M07.5 ──► M07.6
-                            # structs/impl → generics → traits
-                            # M07.5 unlocks `T:` payoff; M07.6 layers static dispatch on top
+            └──► M07.4 ──► M07.5 ──► M07.6 ──► M07.7
+                            # structs/impl → generics → traits (static) → trait objects (dynamic)
+                            # M07.5 unlocks `T:` payoff; M07.6 layers static dispatch;
+                            # M07.7 adds `&dyn Trait` fat pointer + vtable viz
 ```
 
 Acyclic. The drawn order is one valid topological sort. Edges from M03 to M05–M08 are real direct dependencies (each later milestone fills payloads in the event enum M03 defines), not just transitive. **M03.1** is a *revision* milestone — it patches M03's event protocol after M03 closed, based on pedagogical issues uncovered during M04's manual QA. Revisions don't sit in the main chain; they hang off the milestone they patch and improve downstream milestones' behavior once shipped.
@@ -730,6 +731,68 @@ Acyclic. The drawn order is one valid topological sort. Edges from M03 to M05–
 **Demo.** Browser. `m07_6_trait_basic.rs`: `trait Show { fn show(&self) -> String; } impl Show for Point { ... } let s = p.show();` — dispatch resolves to the trait impl; frame opens for `Point::<Show>::show` (or similar mangled name). `m07_6_default_method.rs`: trait with default body; impl skips the override; the trait's default method body runs. `m07_6_generic_bound.rs`: `fn print<T: Show>(x: T) { let s = x.show(); }` — call site with a type implementing Show works; with one that doesn't, typeck error. `m07_6_multi_bound.rs`: `T: Show + Clone`.
 
 **Notes.** Sized XL. 10th invocation of the closed-enum-with-revisions rule (additive `Item::Trait`; extends `Item::Impl` with `trait_name: Option<String>`). The headline pedagogy is the **bound payoff** — `fn print<T: Show>` shows why generics + traits together unlock polymorphism (whereas either alone is half-built). Considered alternatives: combining generics + traits into one mega-milestone (rejected — would slip XL to XXL+); landing traits before generics (rejected — without bounds, traits feel like syntactic organization without a punch). The two-milestone sequence (M07.5 → M07.6) lets each ship a clean pedagogical headline.
+
+---
+
+### M07.7 — Trait objects (`&dyn Trait`, vtables, dynamic dispatch)
+
+- **Kind**: feature (revision-style — adds dynamic dispatch to the polymorphism surface M07.6 established statically; closes the complete polymorphism story together with M07.5 + M07.6)
+- **Status**: planned
+- **Complexity**: XL (modules: 5+, bullets: 9, boundaries: 3 — fat-pointer Value variant, vtables panel UI, runtime dispatch event flow)
+- **Depends on**: M07.6
+- **Authority**: Rust language reference for trait objects + dynamic dispatch + vtables; M07.6's `TraitRegistry` + `TraitImplRegistry` as the foundation for vtable construction; M07.1's fat-pointer pattern (data ptr + length) generalized to (data ptr + vtable ptr); M07.2's static-memory region pattern reused for the vtables panel.
+
+**Goal.** Introduce `&dyn Trait` (and `Box<dyn Trait>`) end to end — Rust's **dynamic dispatch** mechanism. M07.6 shipped static dispatch via generic bounds (`fn print<T: Show>(x: T)` — compile-time monomorphization, one `print::<Point>` per type). M07.7 ships dynamic dispatch (`fn print(x: &dyn Show)` — ONE compiled `print`, runtime vtable lookup per call). The headline pedagogy is the **fat pointer + vtable**: `&dyn Show` is 16 bytes (data ptr + vtable ptr) vs `&T`'s 8; the value carries a pointer into a per-`(type, trait)` vtable; method calls go through a runtime indirection visible as a two-step arrow at the call site (value's vtable_ptr → vtable, then vtable's method slot → method body).
+
+**In scope.**
+- **`&dyn Trait` type syntax**: parse `&dyn Show` / `&mut dyn Show` as a new `Type::DynTrait { trait_name, mutable, span }` AST shape. Lexer keyword `dyn`.
+- **`Box<dyn Trait>` type syntax**: parses naturally via existing `Box<T>` machinery once `Type::DynTrait` is a valid inner type — no extra parser work beyond accepting `dyn Trait` in generic positions.
+- **`&p as &dyn Show` coercion**: the standard explicit coercion from `&T` (where `T: Show`) to `&dyn Show`. Typeck verifies `T` implements `Show` via the `TraitImplRegistry`. Eval constructs the fat-pointer value.
+- **Implicit coercion at function-arg sites**: `fn print(x: &dyn Show) { ... } print(&p);` works without the explicit `as` cast (Rust's implicit ref-to-dyn coercion).
+- **`Value::DynRef` variant**: fat pointer `(target: Pointee, vtable: VtableAddr, mutable)`. Sibling of `Value::Ref` and `Value::Slice` (both already fat-pointer-ish — Slice's second field is len; DynRef's second field is vtable_ptr).
+- **Vtable registry**: typeck phase 1 builds a vtable per `(trait, type)` pair from `TraitImplRegistry`. Each vtable is an array of method-pointer slots (one per trait method, in declaration order). Eval-side mirror with FnDecl references.
+- **Dynamic dispatch at call sites**: `d.show()` where `d: &dyn Show` emits a `FrameEnter` whose body lookup goes through the vtable. The mangled frame name uses the concrete type discovered at runtime — `<Point as Show>::show` — same convention as M07.6's static dispatch (so the trace shows the same dispatch destination regardless of which dispatch mechanism got there).
+- **Object-safety checking**: traits with `Self` return type or generic methods can't be made into objects. M07.6 already restricts both — so every M07.6-valid trait is object-safe; this becomes a non-issue at this milestone but should be enforced defensively for future-proofing.
+- **Vtables panel UI**: a new "VTABLES" panel (alongside STATIC MEMORY) showing one box per `(type, trait)` vtable; each box lists the methods + their target FnDecl as labels. Vtable boxes never deallocate (live for trace duration).
+- **Fat-pointer slot rendering**: `d: &dyn Show` renders with TWO labeled slots in the slot's value area — `data: → p` and `vtable: → <Point as Show>` — making the 16-byte fat-pointer composition visible. Reuses M07.1's fat-pointer pattern (Slice already has `target + len`; DynRef has `target + vtable_ptr`).
+- **Dispatch arrow visualization**: at the call site, two arrows are visible: (a) the value's vtable_ptr → the vtable box in the VTABLES panel; (b) the vtable's method slot → the resolved method's frame card (when it opens). On hover of the call site, both arrows pulse.
+- **Restrictions**: single trait per dyn (`&dyn Show + Counter` rejected — not standard Rust anyway, requires auto-traits which are deferred); no `dyn Trait` without a borrow (`fn foo(x: dyn Show)` requires `Box<dyn Show>` indirection — covered); no upcasting (no supertraits in M07.6 anyway); no trait-object-safety for traits with Self return or generic methods.
+
+**Out of scope.**
+- **Multi-trait objects** (`&dyn A + B`): Rust mostly doesn't allow this either (only one trait + lifetime + auto-traits). Deferred.
+- **Upcasting** (`&dyn Child` → `&dyn Parent`): requires supertraits (not in M07.6). Deferred.
+- **`?Sized` and custom DSTs**: deferred. The only DSTs M07.7 supports are `dyn Trait` (always behind a borrow / Box).
+- **Trait-object-safety enforcement for hypothetical violations**: M07.6 already restricts the violation patterns; M07.7 inherits the restrictions. If they're lifted in a future milestone, object-safety becomes a real check.
+- **Vtable layout details** (vptr placement, alignment, etc.): pedagogically we treat the vtable as an opaque per-`(type, trait)` table of method pointers; the actual ABI is not part of the visualization.
+- **Generic methods on traits made into objects** (would block object-safety): not in M07.6 anyway.
+- **`fn` pointers vs trait objects**: deferred (could be a future "function values" milestone).
+- **Method-name disambiguation for dyn** — irrelevant since `&dyn Show` only sees Show's methods.
+
+**Entry criteria.**
+- M07.6 closed (`TraitRegistry` + `TraitImplRegistry` populated and dispatching correctly).
+- M07.7 doesn't depend on M08 (threads) — sibling milestone.
+
+**Exit criteria.**
+- `trait Show { fn show(&self) -> i32; } impl Show for Point { fn show(&self) -> i32 { self.x } } let d: &dyn Show = &p; let s = d.show();` typechecks; the trace contains a `FrameEnter` for the resolved trait method; `s = 1_i32`.
+- `d`'s slot renders as a fat pointer with two labeled components: data → p, vtable → `<Point as Show>` vtable box in the VTABLES panel.
+- At `d.show()` dispatch, both indirection arrows are visible — vtable_ptr → vtable box, then vtable slot → method body.
+- The VTABLES panel shows one box per `(trait, type)` pair. Each box lists the trait's methods with their dispatch targets.
+- `fn print(x: &dyn Show) -> i32 { x.show() } let r = print(&p);` works via implicit coercion; ONE `print` frame (no monomorphization-style per-type copies), the inner trait dispatch frame is `<Point as Show>::show`.
+- Box variant: `let b: Box<dyn Show> = Box::new(p);` typechecks; b stored on heap; method call via b dispatches through the vtable.
+- Object-safety violation (hypothetical — would require lifting M07.6 restrictions) → typeck error citing the violation.
+- ≥ 4 new `m07_7_*.rs` reference programs ship: basic &dyn cast + dispatch, &dyn parameter, Box<dyn Trait>, fat-pointer visualization.
+- All M01–M07.6 tests pass byte-identical (additive AST + Value + ui shape changes don't affect existing traces).
+- WASM bundle growth ≤ +25% vs M07.6 baseline (~378 KB → ≤ ~473 KB raw). Substantial new surface: AST node, Value variant, vtables panel UI + CSS, dispatch arrow rendering.
+
+**Demo.** Browser. `m07_7_dyn_basic.rs`: `let d: &dyn Show = &p; let s = d.show();` — d renders as fat pointer with two cells (data + vtable); a new VTABLES panel shows the `<Point as Show>` vtable box; on `d.show()`, two arrows light up (data ptr → p, vtable ptr → vtable box → method). `m07_7_dyn_param.rs`: `fn print(x: &dyn Show)` — ONE compiled `print` frame (vs M07.5/M07.6's `print::<Point>` monomorphized form); dispatch resolves at runtime via vtable. `m07_7_box_dyn.rs`: `Box<dyn Show>` — heap-owning trait object; combines M07's Box machinery with vtable dispatch. `m07_7_static_vs_dyn.rs` (paired-comparison sample): side-by-side `fn s<T: Show>(x: T)` vs `fn d(x: &dyn Show)` — same input Point, different dispatch flavors; trace shows the static version produces a `print::<Point>` frame and the dyn version produces a `print` frame with a vtable lookup. Headline learning moment.
+
+**Notes.** Sized XL. 11th invocation of the closed-enum-with-revisions rule. New AST `Type::DynTrait`; new `Value::DynRef { target, vtable, mutable }`; new `VtableAddr` newtype (analog of `StaticAddr` from M07.2); new `MemEvent::VtableAlloc { addr, trait_name, type_name, methods: Vec<String>, span }` (analog of `StaticAlloc`); new `Pointee::Vtable(VtableAddr)`? — plan-phase decides whether vtable pointers ride as `Pointee::Vtable` or as a separate `VtableAddr` field on `Value::DynRef`. Recommendation: separate field, since vtables aren't borrow targets like Slot/Heap/Static. New SlotRowView extension `dyn_view: Option<DynView>` for the fat-pointer rendering in the slot. New `VtableView` for the VTABLES panel. JS gains a vtable-panel renderer + a dispatch-arrow handler that draws the two-step vtable→method arrow. This is a meaty UI milestone — the fat-pointer rendering and the vtables panel are the iterate-on-this pieces (similar to M07.4's struct view); a UX checkpoint after the first cut is appropriate.
+
+**Pedagogical contrast with M07.6.** The two milestones together form the polymorphism story:
+- M07.6 (static): `fn print<T: Show>(x: T)` → trace shows `print::<Point>` AND `print::<Q>` (monomorphized; ONE frame type per concrete type at each call site). Compile-time specialization.
+- M07.7 (dynamic): `fn print(x: &dyn Show)` → trace shows ONE `print` frame regardless of how many types call it. Inside, a vtable lookup arrow makes the runtime indirection tangible. Runtime dispatch.
+
+The recommended sample order in the dropdown should place `m07_7_static_vs_dyn.rs` LAST (after the foundational ones) so the learner has internalized both dispatch flavors before seeing them side-by-side.
 
 ---
 
