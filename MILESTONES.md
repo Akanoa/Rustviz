@@ -799,7 +799,7 @@ The recommended sample order in the dropdown should place `m07_7_static_vs_dyn.r
 ### M08 — Level 4: threads (thread::spawn, Arc, Mutex)
 
 - **Kind**: feature
-- **Status**: planned
+- **Status**: shipped as M08 v1 (commit `0f1863c`) — US1 (spawn+join multi-column), US2 (Arc clone/drop + dashed-purple + refcount), US4 (Arc<Mutex<T>> headline). US3 parked-thread visual deferred to M08.1 (real contention requires async/continuation eval).
 - **Complexity**: L (modules: 3, bullets: 3, boundaries: 2)
 - **Depends on**: M07, M03
 - **Authority**: CLAUDE.md › Supported Rust subset › "Level 4: thread::spawn, Arc, Mutex, Send/Sync"; CLAUDE.md › Event model › "Threads: ThreadSpawn, ThreadJoin, ThreadPark"; CLAUDE.md › Event model › "Synchronization: LockAcquire, LockRelease, ArcClone, ArcDrop"
