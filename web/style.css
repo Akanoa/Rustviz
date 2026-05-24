@@ -265,6 +265,89 @@ main > section {
   border-color: #2a6fa5;
 }
 
+/* **M07.3**: a slot-value holding an array's inline cells needs to allow
+   the cells + labels to stack vertically inside it. Convert the
+   originally-inline `.slot-value` span into a column-flex container when
+   it contains stack-inline-cells. */
+.slot-row .slot-value:has(.stack-inline-cells) {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+}
+
+/* **M07.3**: inline byte-cells for stack-allocated arrays. Rendered
+   inside the slot's value area (NOT in the heap panel). Gray-tinted
+   to distinguish from heap blocks' blue cells — pedagogically conveys
+   "this memory lives in the stack, not the heap". Wraps to multiple
+   rows when there are too many bytes to fit (e.g. an array of 9
+   i32s = 36 cells). */
+.stack-inline-cells {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1px;
+  max-width: 200px;
+}
+
+.stack-inline-cells .byte-cell {
+  width: 8px;
+  height: 8px;
+  border: 1px solid #999;
+  background: #fff;
+  box-sizing: border-box;
+}
+
+.stack-inline-cells .byte-cell.byte-used {
+  background: #c8c8c6;
+  border-color: #999;
+}
+
+/* **M07.3**: element labels for stack-allocated arrays. Default
+   horizontal layout for short arrays; when the array has more elements
+   than the inline limit, first N labels show inline followed by a
+   clickable `+M more` toggle that expands to a vertical stack. */
+.stack-elem-labels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-size: 11px;
+  color: var(--muted);
+  max-width: 220px;
+}
+
+/* Collapsed mode: hide labels beyond the inline limit (CSS-driven so
+   the toggle expansion is just a class flip). The limit (4) matches
+   the JS-side INLINE_ELEM_LIMIT — keep them in sync. */
+.stack-elem-labels.collapsed .elem-cell:nth-of-type(n+5) {
+  display: none;
+}
+
+/* Expanded mode: vertical stack of all elements. */
+.stack-elem-labels.expanded {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+}
+
+/* The +N more / collapse toggle: looks like an inline link, no button
+   chrome. Cursor pointer to invite the click. */
+.stack-elem-toggle {
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  color: #4d8fcd;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.stack-elem-toggle:hover {
+  color: #2a6fa5;
+}
+
 /* **M07.1**: byte-cells covered by a slice get a bright yellow outline + a
    soft glow when the user hovers the slice's arrow. Makes the slice's
    "view of these specific bytes" tangible — `&v[1..3]` lights up the

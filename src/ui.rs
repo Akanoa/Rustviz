@@ -229,6 +229,27 @@ pub struct SlotRowView {
     pub ty: String,
     /// Rendered value, or `None` between `SlotAlloc` and the first `SlotWrite`.
     pub value: Option<String>,
+    /// **M07.3**: present when the slot holds a `Value::Array`. The JS
+    /// renders inline byte-cells in the slot's value area (instead of
+    /// the text `value` field). Mirrors the per-byte-cell + per-element
+    /// rendering used for heap blocks, but visually distinct (gray-tinted)
+    /// to convey "stack memory" not "heap memory".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline_cells: Option<InlineCellsView>,
+}
+
+/// **M07.3**: inline byte-cell rendering for a stack-allocated array.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InlineCellsView {
+    /// Total byte size (`N * elem_size`).
+    pub size: u32,
+    /// Used bytes — for arrays always equals `size` (fully populated at
+    /// construction). Kept as a field for parallelism with HeapView.
+    pub used: u32,
+    /// Per-element display strings (e.g. `["1_i32", "2_i32", "3_i32"]`).
+    /// Drives both the byte-cell count AND the per-element hover-highlight
+    /// when a slice arrow points into this slot.
+    pub elements: Vec<String>,
 }
 
 /// Status message — present when the most recent event was a `Note`.
@@ -468,6 +489,9 @@ struct LiveSlot {
     name: String,
     ty: String,
     value: Option<String>,
+    /// **M07.3**: populated when the slot holds a `Value::Array` — drives
+    /// the inline byte-cell rendering in the slot's value area.
+    inline_cells: Option<InlineCellsView>,
 }
 
 fn apply_event(world: &mut World, event: &MemEvent) {
@@ -511,6 +535,7 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                     name: name.clone(),
                     ty: render_ty(ty),
                     value: None,
+                    inline_cells: None,
                 });
             }
         }
@@ -602,12 +627,33 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                 String::new() // empty value cell — arrow says it all
             } else if matches!(value, Value::Slice { .. }) {
                 String::new() // empty value cell — slice arrow + [len: N] annotation say it all
+            } else if matches!(value, Value::Array { .. }) {
+                // M07.3: text value suppressed; the inline byte-cells (set
+                // below) are the visualization.
+                String::new()
             } else {
                 rendered
+            };
+            // **M07.3**: if Value::Array, build the InlineCellsView from
+            // element values + size. The slot's `value` is set to empty
+            // (handled above); the inline_cells field carries the per-byte
+            // / per-element rendering data.
+            let inline_cells = if let Value::Array { elements, elem_ty } = value {
+                let elem_size = ty_size_bytes_ui(elem_ty);
+                let size = elements.len() as u32 * elem_size;
+                let elem_strs: Vec<String> = elements.iter().map(render_value).collect();
+                Some(InlineCellsView {
+                    size,
+                    used: size,
+                    elements: elem_strs,
+                })
+            } else {
+                None
             };
             for frame in &mut world.frames {
                 if let Some(slot) = frame.slots.iter_mut().find(|s| s.slot_id == slot_id.0) {
                     slot.value = Some(rendered);
+                    slot.inline_cells = inline_cells;
                     return;
                 }
             }
@@ -799,6 +845,7 @@ fn frame_to_view(frame: FrameInProgress, current_frame_id: Option<u32>) -> Frame
                 name: s.name,
                 ty: s.ty,
                 value: s.value,
+                inline_cells: s.inline_cells,
             })
             .collect(),
         active: frame.active,
@@ -866,6 +913,31 @@ fn lookup_slot_name(frames: &[FrameInProgress], slot_id: u32) -> Option<String> 
     None
 }
 
+/// **M07.3**: byte size of a `Ty` for UI sizing — duplicates the eval-side
+/// `ty_size_bytes` to avoid pulling eval into ui's compile graph. Element
+/// types are restricted to primitives in M07.3, so the surface is small.
+fn ty_size_bytes_ui(ty: &Ty) -> u32 {
+    use crate::typeck::{IntKind, FloatKind};
+    match ty {
+        Ty::Int(k) => match k {
+            IntKind::I8 | IntKind::U8 => 1,
+            IntKind::I16 | IntKind::U16 => 2,
+            IntKind::I32 | IntKind::U32 => 4,
+            IntKind::I64 | IntKind::U64 | IntKind::ISize | IntKind::USize => 8,
+            IntKind::I128 | IntKind::U128 => 16,
+        },
+        Ty::Float(k) => match k {
+            FloatKind::F32 => 4,
+            FloatKind::F64 => 8,
+        },
+        Ty::Bool => 1,
+        Ty::Unit => 0,
+        Ty::Ref { .. } | Ty::Box(_) | Ty::String | Ty::Vec(_) => 8,
+        Ty::Slice(_) | Ty::Str => 16,
+        Ty::Array(inner, size) => ty_size_bytes_ui(inner) * (*size as u32),
+    }
+}
+
 fn render_value(value: &Value) -> String {
     match value {
         // M03.2: type-tag suffix on numeric values (`5_i32`, `2.5_f64`, `NaN_f64`, ...).
@@ -921,6 +993,11 @@ fn render_value(value: &Value) -> String {
             // show the addr + len.
             crate::event::Pointee::Static(addr) => format!("&static[{}; {len}]", addr.0),
         },
+        // M07.3: array fallback. Normal path (SlotWrite) renders inline
+        // byte-cells via SlotRowView.inline_cells, so this text fallback
+        // is reached only outside that path (e.g. future ReturnValue of
+        // an array — not constructible currently).
+        Value::Array { elements, .. } => format!("[_; {}]", elements.len()),
     }
 }
 

@@ -650,6 +650,118 @@ mod tests {
         assert_eq!(err, back);
     }
 
+    // ─── M07.3 / US1: stack-allocated array literal + len() ───────────────
+
+    /// `let t = [10, 20, 30]; let n = t.len();` — typechecks as
+    /// `[i32; 3]`; SlotWrite carries Value::Array with 3 elements;
+    /// n's SlotWrite has `Int { U64, 3 }`.
+    #[test]
+    fn run_pipeline_array_basic() {
+        let source = "fn main() { let t = [10, 20, 30]; let n = t.len(); }";
+        let events = run_pipeline(source).expect("array compiles");
+        // SlotWrite of t with Value::Array of 3 elements.
+        let array_write = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite {
+                value: crate::Value::Array { elements, .. },
+                ..
+            } if elements.len() == 3
+        ));
+        assert!(array_write, "expected SlotWrite of Value::Array with 3 elements");
+        // SlotWrite of n with Int(U64, 3).
+        let n_eq_3 = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite {
+                value: crate::Value::Int { kind: crate::typeck::IntKind::U64, bits: 3 },
+                ..
+            }
+        ));
+        assert!(n_eq_3, "expected n = 3_u64 from t.len()");
+    }
+
+    // ─── M07.3 / US2: array indexing ──────────────────────────────────────
+
+    #[test]
+    fn run_pipeline_array_index() {
+        let source = "fn main() { let t = [10, 20, 30]; let x = t[1]; }";
+        let events = run_pipeline(source).expect("array index compiles");
+        let x_eq_20 = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite {
+                value: crate::Value::Int { kind: crate::typeck::IntKind::I32, bits: 20 },
+                ..
+            }
+        ));
+        assert!(x_eq_20, "expected x = t[1] = 20_i32");
+    }
+
+    #[test]
+    fn run_pipeline_array_index_oob() {
+        let source = "fn main() { let t = [10, 20]; let x = t[5]; }";
+        let events = run_pipeline(source).expect("OOB compiles; halts at runtime");
+        let has_oob = events.iter().any(|e| matches!(e,
+            crate::MemEvent::Note { kind: crate::NoteKind::RuntimeError, message, .. }
+                if message.contains("array len is 2") && message.contains("index is 5")
+        ));
+        assert!(has_oob, "expected RuntimeError 'index out of bounds: array len is 2 but the index is 5'");
+    }
+
+    // ─── M07.3 / US3: array slicing (slot-target slice) ───────────────────
+
+    /// `let t = [1, 2, 3, 4]; let s = &t[1..3];` — slicing an array
+    /// produces a `Value::Slice` with `target: Pointee::Slot(t_slot)`.
+    /// First scenario constructing the Slot variant on Value::Slice.
+    #[test]
+    fn run_pipeline_array_slice() {
+        let source = "fn main() { let t = [1, 2, 3, 4]; let s = &t[1..3]; }";
+        let events = run_pipeline(source).expect("array slice compiles");
+        // s's SlotWrite carries Value::Slice with Slot target.
+        let slot_slice = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite {
+                value: crate::Value::Slice {
+                    target: crate::event::Pointee::Slot(_),
+                    start: 1, len: 2, byte_offset: 4, byte_len: 8, ..
+                },
+                ..
+            }
+        ));
+        assert!(slot_slice, "expected SlotWrite of Value::Slice {{ target: Slot, len: 2, byte_offset: 4, byte_len: 8, .. }}");
+        // No BorrowShared events for Slot-target slices (M07.2 pattern).
+        let slot_borrows = events.iter().filter(|e| matches!(e,
+            crate::MemEvent::BorrowShared { target: crate::event::Pointee::Slot(_), .. }
+        )).count();
+        assert_eq!(slot_borrows, 0, "Slot-target slice borrows skip BorrowShared (lazy materialization in UI)");
+        // Zero heap events (array + slice both stack-resident).
+        let heap_count = events.iter().filter(|e| matches!(
+            e,
+            crate::MemEvent::HeapAlloc { .. } | crate::MemEvent::HeapRealloc { .. } | crate::MemEvent::HeapFree { .. }
+        )).count();
+        assert_eq!(heap_count, 0, "array slicing must not emit any heap events");
+    }
+
+    #[test]
+    fn run_pipeline_array_slice_oob() {
+        let source = "fn main() { let t = [1, 2]; let s = &t[0..5]; }";
+        let events = run_pipeline(source).expect("OOB slice compiles; halts");
+        let has_oob = events.iter().any(|e| matches!(e,
+            crate::MemEvent::Note { kind: crate::NoteKind::RuntimeError, message, .. }
+                if message.contains("slice end out of bounds")
+        ));
+        assert!(has_oob, "expected RuntimeError for OOB array slice");
+    }
+
+    /// **Headline pedagogical assertion** for M07.3: array-only programs
+    /// emit zero heap events. The heap panel stays empty.
+    #[test]
+    fn run_pipeline_array_no_heap() {
+        let source = "fn main() { let t = [10, 20, 30]; let n = t.len(); }";
+        let events = run_pipeline(source).expect("compiles");
+        let heap_event_count = events.iter().filter(|e| matches!(
+            e,
+            crate::MemEvent::HeapAlloc { .. }
+                | crate::MemEvent::HeapRealloc { .. }
+                | crate::MemEvent::HeapFree { .. }
+        )).count();
+        assert_eq!(heap_event_count, 0, "array-only program must emit zero heap events");
+    }
+
     // ─── M07.2 / US1: string literal as `&str` (slice into static memory) ──
 
     /// A string literal `let s = "toto";` typechecks as `&str`, evaluates

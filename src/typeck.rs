@@ -196,6 +196,11 @@ pub enum Ty {
     /// matching what Rust developers see. Method dispatch + borrow
     /// tracking treat `Ty::Str` interchangeably with the slice form.
     Str,
+    /// **M07.3**: array type `[T; N]`. Stack-allocated, fixed size known
+    /// at compile time. Distinct from `Ty::Vec(T)` (heap-allocated,
+    /// runtime size) and `Ty::Slice(T)` (size-erased borrow). Copy iff
+    /// `T: Copy` — M07.3 restricts elements to primitives so always Copy.
+    Array(Box<Ty>, u64),
 }
 
 impl Ty {
@@ -222,6 +227,8 @@ impl Ty {
             Self::Slice(inner) => format!("&[{}]", inner.name()),
             // M07.2: &str sugar — rendered as `"&str"` not `"&[u8]"`.
             Self::Str => "&str".to_owned(),
+            // M07.3: array — `[T; N]`.
+            Self::Array(inner, size) => format!("[{}; {}]", inner.name(), size),
         }
     }
 
@@ -239,6 +246,9 @@ impl Ty {
             // duplicate the borrow registration).
             // M07.2: &str follows the same rule (it's a Slice<u8> in disguise).
             Self::Slice(_) | Self::Str => false,
+            // M07.3: arrays are Copy iff their element type is Copy. M07.3
+            // restricts elements to primitives (all Copy), so always true.
+            Self::Array(inner, _) => inner.is_copy(),
         }
     }
 }
@@ -860,9 +870,11 @@ impl<'a> Typechecker<'a> {
                 let index_ty = self.typecheck_expr(index)?;
                 let elem_ty = match receiver_ty {
                     Ty::Vec(inner) => *inner,
+                    // M07.3: array receiver — same result type as Vec.
+                    Ty::Array(inner, _) => *inner,
                     other => {
                         return Err(ParseError {
-                            message: format!("cannot index value of type `{}`; expected Vec", other.name()),
+                            message: format!("cannot index value of type `{}`; expected Vec or array", other.name()),
                             span: receiver.span(),
                         });
                     }
@@ -884,7 +896,48 @@ impl<'a> Typechecker<'a> {
                 message: "range expressions are only valid inside index brackets in M07.1".into(),
                 span: *span,
             }),
+            // **M07.3**: array literal `[e1, e2, ..., eN]`. All elements
+            // must unify to a common type via `try_coerce_to`. Result:
+            // `Ty::Array(elem_ty, elements.len())`.
+            ast::Expr::ArrayLit { elements, span } => self.typecheck_array_lit(elements, *span),
         }
+    }
+
+    /// **M07.3**: typecheck `[e1, e2, ..., eN]`. The first element anchors
+    /// the type; subsequent elements coerce to it. Empty literal requires
+    /// a separate annotation-driven path (typeck errors here without it).
+    fn typecheck_array_lit(
+        &mut self,
+        elements: &[ast::Expr],
+        span: Span,
+    ) -> Result<Ty, ParseError> {
+        if elements.is_empty() {
+            return Err(ParseError {
+                message:
+                    "cannot infer element type for empty array literal — add a type annotation like `let t: [i32; 0] = [];`"
+                        .into(),
+                span,
+            });
+        }
+        let first_ty = self.typecheck_expr(&elements[0])?;
+        for el in &elements[1..] {
+            let el_ty = self.typecheck_expr(el)?;
+            // Try literal-narrowing coercion to match the first element's type.
+            let coerced = self
+                .try_coerce_to(el, el_ty.clone(), first_ty.clone())
+                .unwrap_or(el_ty);
+            if coerced != first_ty {
+                return Err(ParseError {
+                    message: format!(
+                        "array elements must all have the same type, found `{}` (expected `{}`)",
+                        coerced.name(),
+                        first_ty.name(),
+                    ),
+                    span: el.span(),
+                });
+            }
+        }
+        Ok(Ty::Array(Box::new(first_ty), elements.len() as u64))
     }
 
     /// **M07.1**: typecheck a slice borrow `&v[range]` (or rejected `&mut v[range]`).
@@ -925,10 +978,18 @@ impl<'a> Typechecker<'a> {
             // M07.2: sub-slicing a `&str` produces another `&str` (sugar
             // preserved). Underneath it's a slice of bytes.
             Ty::Str => (Ty::Int(IntKind::U8), Ty::Str),
+            // **M07.3**: slicing an array `[T; N]` produces `&[T]` —
+            // size is lost on the borrow (matches Rust; no `&[T; M]`
+            // borrows in M07.3 scope).
+            Ty::Array(inner, _) => {
+                let inner = *inner;
+                let result = Ty::Slice(Box::new(inner.clone()));
+                (inner, result)
+            }
             other => {
                 return Err(ParseError {
                     message: format!(
-                        "cannot slice value of type `{}`; expected Vec, &[T], or &str",
+                        "cannot slice value of type `{}`; expected Vec, &[T], &str, or array",
                         other.name()
                     ),
                     span: receiver.span(),
@@ -1082,7 +1143,8 @@ impl<'a> Typechecker<'a> {
             }
             // M07.1: `Slice::len() -> u64`. Same signature as Vec::len.
             // M07.2: `&str` is a sugar for `&[u8]`, so the same `len()` works.
-            (Ty::Slice(_), "len") | (Ty::Str, "len") => {
+            // M07.3: `[T; N]::len()` returns N (compile-time constant).
+            (Ty::Slice(_), "len") | (Ty::Str, "len") | (Ty::Array(_, _), "len") => {
                 if !args.is_empty() {
                     return Err(ParseError {
                         message: "len takes no args".into(),
@@ -1524,6 +1586,11 @@ fn ty_from_ast(t: &ast::Type) -> Result<Ty, ParseError> {
             }
             let inner_ty = ty_from_ast(inner)?;
             Ok(Ty::Slice(Box::new(inner_ty)))
+        }
+        // **M07.3**: array annotation `[T; N]`.
+        ast::Type::Array { inner, size, .. } => {
+            let inner_ty = ty_from_ast(inner)?;
+            Ok(Ty::Array(Box::new(inner_ty), *size))
         }
     }
 }

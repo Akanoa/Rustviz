@@ -141,6 +141,33 @@ impl Parser {
                 span: lparen.span.merge(rparen.span),
             });
         }
+        // **M07.3**: array type annotation `[T; N]`. Distinct from `&[T]`
+        // (slice — that's caught by the `&`-prefix path below). The size
+        // must be a non-negative integer literal (no const expressions).
+        if self.at(&TokenKind::LBracket) {
+            let lbracket = self.bump();
+            let inner = self.parse_type()?;
+            self.expect(&TokenKind::Semi, "`;`")?;
+            let size_tok = self.peek().clone();
+            let size = match size_tok.kind {
+                TokenKind::Int(n, _) if n >= 0 => {
+                    self.bump();
+                    n as u64
+                }
+                _ => {
+                    return Err(ParseError {
+                        message: "array size must be a non-negative integer literal".into(),
+                        span: size_tok.span,
+                    });
+                }
+            };
+            let rbracket = self.expect(&TokenKind::RBracket, "`]`")?;
+            return Ok(Type::Array {
+                inner: Box::new(inner),
+                size,
+                span: lbracket.span.merge(rbracket.span),
+            });
+        }
         // M06: `&T` and `&mut T` reference types.
         // **M07.1**: `&[T]` and `&mut [T]` slice types — when `[` follows the
         // `&` (or `&mut`), this is a slice annotation, not a regular ref.
@@ -399,6 +426,31 @@ impl Parser {
     }
 
     fn parse_atom(&mut self) -> Result<Expr, ParseError> {
+        // **M07.3**: array literal `[e1, e2, ..., eN]`. Detected at the
+        // atom level (before any other atom rule fires) — the existing
+        // postfix `[` rule for `expr[i]` indexing runs in `parse_expr`
+        // after `parse_atom`, so there's no grammar conflict.
+        if self.at(&TokenKind::LBracket) {
+            let lbracket = self.bump();
+            let mut elements = Vec::new();
+            if !self.at(&TokenKind::RBracket) {
+                loop {
+                    elements.push(self.parse_expr(0)?);
+                    if self.bump_if(&TokenKind::Comma).is_none() {
+                        break;
+                    }
+                    // Trailing comma allowed: `[1, 2, 3,]` parses.
+                    if self.at(&TokenKind::RBracket) {
+                        break;
+                    }
+                }
+            }
+            let rbracket = self.expect(&TokenKind::RBracket, "`]`")?;
+            return Ok(Expr::ArrayLit {
+                elements,
+                span: lbracket.span.merge(rbracket.span),
+            });
+        }
         let tok = self.peek().clone();
         match &tok.kind {
             TokenKind::Int(v, suffix) => {
@@ -553,6 +605,7 @@ fn type_span(ty: &Type) -> Span {
         | Type::Unit { span }
         | Type::Ref { span, .. }
         | Type::Generic { span, .. }
-        | Type::Slice { span, .. } => *span,
+        | Type::Slice { span, .. }
+        | Type::Array { span, .. } => *span,
     }
 }

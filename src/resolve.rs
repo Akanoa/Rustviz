@@ -253,6 +253,11 @@ impl Resolver {
                     self.resolve_expr(e)?;
                 }
             }
+            ast::Expr::ArrayLit { elements, .. } => {
+                for e in elements {
+                    self.resolve_expr(e)?;
+                }
+            }
             ast::Expr::Binary { lhs, rhs, .. } => {
                 self.resolve_expr(lhs)?;
                 self.resolve_expr(rhs)?;

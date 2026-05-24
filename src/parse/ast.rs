@@ -95,6 +95,16 @@ pub enum Type {
         /// Span from `&` (or `&mut`) through `]`.
         span: Span,
     },
+    /// **M07.3**: array type annotation `[T; N]` where N is an integer
+    /// literal. No const expressions, no const generics in M07.3.
+    Array {
+        /// Element type.
+        inner: Box<Type>,
+        /// Compile-time-known size N.
+        size: u64,
+        /// Span from `[` through `]`.
+        span: Span,
+    },
 }
 
 /// A block: zero or more statements followed by an optional tail expression.
@@ -271,6 +281,16 @@ pub enum Expr {
         /// Span covering the whole range expression, including any bounds.
         span: Span,
     },
+    /// **M07.3**: array literal `[e1, e2, ..., eN]`. Size N is implicit
+    /// (= `elements.len()`). Empty literal `[]` is allowed at parse time
+    /// but typeck-rejected unless paired with an explicit type annotation
+    /// (can't infer element type from zero elements).
+    ArrayLit {
+        /// Element expressions in source order.
+        elements: Vec<Expr>,
+        /// Span from `[` through `]`.
+        span: Span,
+    },
 }
 
 impl Expr {
@@ -291,7 +311,8 @@ impl Expr {
             | Self::Path { span, .. }
             | Self::MethodCall { span, .. }
             | Self::Index { span, .. }
-            | Self::Range { span, .. } => *span,
+            | Self::Range { span, .. }
+            | Self::ArrayLit { span, .. } => *span,
             Self::StrLit(_, s) => *s,
             Self::Block(b) => b.span,
         }

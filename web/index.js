@@ -182,8 +182,55 @@ function render(state) {
       } else if (slot.value === "") {
         // M07: empty value cell for heap-owning slots. The owning arrow +
         // the type column carry the pointer info; no `= ...` text needed.
+        // M07.3: also empty for arrays — replaced by inline byte-cells below.
       } else {
         valueEl.textContent = `= ${slot.value}`;
+      }
+      // **M07.3**: arrays render inline byte-cells + element labels INSIDE
+      // the value cell, so the row still consumes exactly 3 grid cells
+      // (name | type | value) — appending them as siblings of valueEl
+      // would push them into the next grid row and overflow into the
+      // following slot's columns.
+      if (slot.inline_cells) {
+        const ic = slot.inline_cells;
+        const cellsEl = el("div", { class: "stack-inline-cells" });
+        for (let i = 0; i < ic.size; i++) {
+          const c = el("span", { class: i < ic.used ? "byte-cell byte-used" : "byte-cell" });
+          cellsEl.appendChild(c);
+        }
+        valueEl.appendChild(cellsEl);
+        // Element labels: when there are more than INLINE_ELEM_LIMIT, show
+        // the first INLINE_ELEM_LIMIT inline and a clickable "+N more"
+        // toggle. Clicking expands to a vertical stack of all elements;
+        // click again collapses. Threshold is chosen so common small
+        // arrays (≤ 4 elements) display inline; anything bigger elides
+        // and stays clean.
+        const INLINE_ELEM_LIMIT = 4;
+        const overflowing = ic.elements.length > INLINE_ELEM_LIMIT;
+        const labelsEl = el("div", {
+          class: overflowing ? "stack-elem-labels collapsed" : "stack-elem-labels",
+        });
+        ic.elements.forEach((label, idx) => {
+          const span = el("span", { class: "elem-cell", text: label });
+          span.setAttribute("data-elem-idx", String(idx));
+          labelsEl.appendChild(span);
+        });
+        if (overflowing) {
+          const hidden = ic.elements.length - INLINE_ELEM_LIMIT;
+          const toggle = el("button", {
+            class: "stack-elem-toggle",
+            text: `+${hidden} more`,
+          });
+          toggle.setAttribute("type", "button");
+          toggle.addEventListener("click", (ev) => {
+            ev.stopPropagation();
+            const expanded = labelsEl.classList.toggle("expanded");
+            labelsEl.classList.toggle("collapsed", !expanded);
+            toggle.textContent = expanded ? "− collapse" : `+${hidden} more`;
+          });
+          labelsEl.appendChild(toggle);
+        }
+        valueEl.appendChild(labelsEl);
       }
       row.appendChild(valueEl);
       slotGrid.appendChild(row);
@@ -443,31 +490,51 @@ function renderArrows(arrows) {
     // Vec<i32>: bytes [4, 12) light up alongside elements `2_i32, 3_i32`
     // in the display string. **M07.2**: also toggles the `[len: N]`
     // label's visibility (hidden by default, shown on hover).
+    // M07.3: also enable highlight for Slot targets (arrays in stack slots).
+    const isSlotTarget = a.target && a.target.Slot !== undefined;
     if (
-      targetIsHeap
+      (targetIsHeap || isSlotTarget)
       && a.byte_offset !== undefined && a.byte_offset !== null
       && a.byte_len !== undefined && a.byte_len !== null
     ) {
-      // **M07.2**: target may be a heap block OR a static-memory block.
+      // **M07.2 / M07.3**: target may be a heap block, static block, OR
+      // a stack slot holding an array.
       // - Heap blocks: byte-cells in `.heap-cells`; element labels in
-      //   `.heap-display` indexed by `elem_start` + `len` (Vec elements).
+      //   `.heap-display` (Vec elements).
       // - Static blocks: byte-cells in `.static-cells`; byte spans in
-      //   `.static-display` indexed by `byte_offset` + `byte_len` (1 byte
-      //   = 1 char for our ASCII model — so hovering `&s[..2]` lights up
-      //   bytes 0-1 of `"hello"`, i.e. `he`).
+      //   `.static-display` (1 byte = 1 char for ASCII).
+      // - Slot (M07.3, array): byte-cells in `.stack-inline-cells`;
+      //   element labels in `.stack-elem-labels` (per-element strings).
       const isStatic = a.target.Static !== undefined;
-      const targetBox = isStatic
-        ? document.querySelector(`[data-static-addr="${a.target.Static}"]`)
-        : document.querySelector(`[data-heap-addr="${a.target.Heap}"]`);
+      let targetBox = null;
+      if (isStatic) {
+        targetBox = document.querySelector(`[data-static-addr="${a.target.Static}"]`);
+      } else if (isSlotTarget) {
+        // For slot targets, `data-slot-id` is on the .slot-name span;
+        // its enclosing .slot-row holds the .stack-inline-cells +
+        // .stack-elem-labels children.
+        const nameEl = document.querySelector(`[data-slot-id="${a.target.Slot}"]`);
+        targetBox = nameEl ? nameEl.closest(".slot-row") : null;
+      } else {
+        targetBox = document.querySelector(`[data-heap-addr="${a.target.Heap}"]`);
+      }
       const cellsEl = targetBox
-        ? targetBox.querySelector(isStatic ? ".static-cells" : ".heap-cells")
+        ? targetBox.querySelector(
+            isStatic ? ".static-cells"
+            : isSlotTarget ? ".stack-inline-cells"
+            : ".heap-cells",
+          )
         : null;
       const dispEl = targetBox
-        ? targetBox.querySelector(isStatic ? ".static-display" : ".heap-display")
+        ? targetBox.querySelector(
+            isStatic ? ".static-display"
+            : isSlotTarget ? ".stack-elem-labels"
+            : ".heap-display",
+          )
         : null;
       const byteStart = Number(a.byte_offset);
       const byteEnd = byteStart + Number(a.byte_len);
-      // For Vec slices, element-span highlight uses elem_start + len.
+      // For Vec/Array slices, element-span highlight uses elem_start + len.
       // For static slices, it uses byte_offset + byte_len (1:1 byte/char).
       const [elemStart, elemEnd] = isStatic
         ? [byteStart, byteEnd]

@@ -110,6 +110,17 @@ pub enum Value {
         /// Heap address of the String's underlying buffer.
         addr: HeapAddr,
     },
+    /// **M07.3**: array value — N elements held inline in the binding's
+    /// stack slot. No heap allocation; the slot's bytes ARE the array's
+    /// bytes. Slicing produces `Value::Slice` with `target: Pointee::Slot(_)`.
+    Array {
+        /// Element values in index order. Length matches the binding's
+        /// `Ty::Array(_, N).1` and never changes (arrays are fixed-size).
+        elements: Vec<Value>,
+        /// Element type — used for sizing (`N * elem_size`) and as the
+        /// parent type when this array is sliced (`Ty::Slice(elem_ty)`).
+        elem_ty: crate::typeck::Ty,
+    },
     /// **M07.1**: slice value — a fat pointer (target + length) into a heap
     /// allocation. Sibling of `Value::Ref` (not an extension); slices carry
     /// extra `len` metadata and live in the same active-borrow registry, so
@@ -162,6 +173,8 @@ impl Value {
             // M07.1: slice. Short tag — full `&[T]` rendering comes from the Ty layer.
             // M07.2: includes `&str` literals (Value::Slice with Pointee::Static target).
             Self::Slice { .. } => "&[]",
+            // M07.3: array. Short tag — full `[T; N]` rendering comes from the Ty layer.
+            Self::Array { .. } => "[]",
         }
     }
 }

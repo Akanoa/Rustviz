@@ -172,6 +172,8 @@ fn ty_size_bytes(ty: &Ty) -> u32 {
         // M07.1: slice is a fat pointer (data ptr + length) — 16 bytes on 64-bit.
         // M07.2: `&str` is a slice-shaped fat pointer too.
         Ty::Slice(_) | Ty::Str => 16,
+        // M07.3: array is the sum of its elements — N * elem_size.
+        Ty::Array(inner, size) => ty_size_bytes(inner) * (*size as u32),
     }
 }
 
@@ -196,6 +198,10 @@ fn value_size_bytes(v: &Value) -> u32 {
         // M07.1: slice fat pointer = 16 bytes on 64-bit.
         // M07.2: `&str` literals also flow through Value::Slice now.
         Value::Slice { .. } => 16,
+        // M07.3: array's total size = N * element_size.
+        Value::Array { elements, elem_ty } => {
+            elements.len() as u32 * ty_size_bytes(elem_ty)
+        }
     }
 }
 
@@ -1327,6 +1333,21 @@ impl<'a> Evaluator<'a> {
             ast::Expr::Range { .. } => {
                 panic!("typeck should have rejected standalone range expression")
             }
+            // **M07.3**: array literal — eval each element, wrap into
+            // `Value::Array` with the element type derived from typeck.
+            ast::Expr::ArrayLit { elements, span } => {
+                let elem_ty = match self.types.expr_types.get(span) {
+                    Some(Ty::Array(inner, _)) => (**inner).clone(),
+                    _ => Ty::Unit, // unreachable given typeck succeeded
+                };
+                let mut evaled = Vec::with_capacity(elements.len());
+                for el in elements {
+                    let v = self.eval_expr(el);
+                    if self.halted { return Value::Unit; }
+                    evaled.push(v);
+                }
+                Value::Array { elements: evaled, elem_ty }
+            }
         }
     }
 
@@ -1515,6 +1536,11 @@ impl<'a> Evaluator<'a> {
             (Value::Slice { len, .. }, "len") => {
                 let _ = span;
                 Value::Int { kind: IntKind::U64, bits: *len as i128 }
+            }
+            // M07.3: `[T; N]::len()` returns N (compile-time-known size).
+            (Value::Array { elements, .. }, "len") => {
+                let _ = span;
+                Value::Int { kind: IntKind::U64, bits: elements.len() as i128 }
             }
             _ => panic!("typeck should reject this method call"),
         }
@@ -1764,9 +1790,22 @@ impl<'a> Evaluator<'a> {
         // len=0-but-non-byte-element corner case where deriving via
         // byte_len/len would fail).
         let elem_size: u64 = match self.types.expr_types.get(&receiver.span()) {
-            Some(Ty::Vec(inner)) | Some(Ty::Slice(inner)) => ty_size_bytes(inner) as u64,
+            Some(Ty::Vec(inner)) | Some(Ty::Slice(inner)) | Some(Ty::Array(inner, _)) => ty_size_bytes(inner) as u64,
             Some(Ty::Str) => 1,
             _ => panic!("typeck should have recorded a sliceable receiver type"),
+        };
+        // **M07.3**: for Array receivers, the slice target is the
+        // receiver's STACK SLOT (Pointee::Slot). Derive the slot from
+        // the receiver's Expr::Ident *before* evaluating, since eval
+        // returns a Value::Array but loses the slot identity.
+        let array_receiver_slot: Option<SlotId> = if let ast::Expr::Ident(_, ident_span) = receiver {
+            self.resolution
+                .uses
+                .get(ident_span)
+                .copied()
+                .and_then(|binding_id| self.lookup_local_slot(binding_id))
+        } else {
+            None
         };
         let (target, base_byte_offset, base_len): (crate::event::Pointee, u64, i128) = match recv {
             Value::Vec { addr } => {
@@ -1782,6 +1821,12 @@ impl<'a> Evaluator<'a> {
                 // its existing byte_offset; the new range is interpreted
                 // relative to the receiver's window (length = len).
                 (target, byte_offset, len as i128)
+            }
+            Value::Array { elements, .. } => {
+                // M07.3: slot-target slice into a stack-allocated array.
+                let slot_id = array_receiver_slot
+                    .expect("slicing an array requires an Expr::Ident receiver in M07.3");
+                (crate::event::Pointee::Slot(slot_id), 0, elements.len() as i128)
             }
             _ => panic!("typeck should reject slice of non-sliceable value"),
         };
@@ -1844,8 +1889,17 @@ impl<'a> Evaluator<'a> {
         // cursor steps for any transient sub-slice consumed in a call.
         let _ = mutable; // forward-compat marker
         let borrow_id = self.alloc_borrow_id();
-        let is_static = matches!(target, crate::event::Pointee::Static(_));
-        if !is_static {
+        // **M07.2 / M07.3**: skip BorrowShared/BorrowEnd lifecycle for
+        // Static AND Slot targets (frames + static memory both
+        // disappear atomically; scope-exit BorrowEnd would be silent).
+        // UI materializes the arrow lazily at SlotWrite time. Only Heap
+        // targets need the explicit lifecycle (dangling-detection
+        // depends on tracking heap borrows).
+        let skip_borrow_events = matches!(
+            target,
+            crate::event::Pointee::Static(_) | crate::event::Pointee::Slot(_)
+        );
+        if !skip_borrow_events {
             self.events.push(MemEvent::BorrowShared {
                 borrow_id,
                 target,
@@ -1886,13 +1940,25 @@ impl<'a> Evaluator<'a> {
         if self.halted { return Value::Unit; }
         let idx_v = self.eval_expr(index);
         if self.halted { return Value::Unit; }
-        let addr = match recv {
-            Value::Vec { addr } => addr,
-            _ => panic!("typeck should reject non-Vec index"),
-        };
         let i = match idx_v {
             Value::Int { bits, .. } => bits,
             _ => panic!("typeck should reject non-Int index"),
+        };
+        // **M07.3**: handle Array receiver inline (elements held in the
+        // Value itself, not in heap state).
+        if let Value::Array { elements, .. } = recv {
+            if i < 0 || (i as usize) >= elements.len() {
+                self.emit_runtime_error(
+                    format!("index out of bounds: array len is {} but the index is {}", elements.len(), i),
+                    span,
+                );
+                return Value::Unit;
+            }
+            return elements[i as usize].clone();
+        }
+        let addr = match recv {
+            Value::Vec { addr } => addr,
+            _ => panic!("typeck should reject non-Vec/non-Array index"),
         };
         let obj = self.heap.objects.get(&addr).expect("vec exists");
         let elements = if let HeapObject::Vec { elements, .. } = obj { elements } else {
@@ -2198,6 +2264,8 @@ fn render_value_for_note(value: &Value) -> String {
         // M07.1: slice. Abstract render with length for notes.
         // M07.2: `&str` literals flow through Value::Slice with Pointee::Static.
         Value::Slice { len, .. } => format!("&[_; {len}]"),
+        // M07.3: array — render element count abstractly for notes.
+        Value::Array { elements, .. } => format!("[_; {}]", elements.len()),
     }
 }
 

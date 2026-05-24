@@ -123,6 +123,8 @@ src/
 - in-memory; no new files. M01/M02/M03 snapshot tests should stay byte-identical (existing samples don't construct `Value::Slice`, and `Ty::Slice` / `Value::Slice` are additive variants). (012-m07-1-slices)
 - Rust 2024 edition (same toolchain as M01–M07.1). No new toolchain requirements. + existing `indexmap`, `serde`, `serde_json`, `wasm-bindgen`, `js-sys`, `console_error_panic_hook`. **No new Rust deps**. **No JS deps changes**. (013-m07-2-str-static)
 - in-memory; no new files. M01/M02/M03 snapshot tests stay byte-identical (existing L1 samples don't construct string literals). M07's `m07_string` test re-baselines: alloc-count for `String::from("hi")` now stays 1 (heap) but the trace gains a `StaticAlloc` event for the `"hi"` literal that occurs BEFORE the `String::from` heap alloc. (013-m07-2-str-static)
+- Rust 2024 edition (same toolchain as M01–M07.2). No new toolchain requirements. + existing `indexmap`, `serde`, `serde_json`, `wasm-bindgen`, `js-sys`, `console_error_panic_hook`. **No new Rust deps**. **No JS deps changes**. (014-m07-3-arrays)
+- in-memory; no new files. Array contents live in the eval-side slot's `LocalSlot.value` as a new `Value::Array { elements: Vec<Value>, elem_ty: Ty }` variant. M01/M02/M03 snapshot tests stay byte-identical (existing L1 samples don't construct arrays). (014-m07-3-arrays)
 
 ## Recent Changes
 - 001-milestone-roadmap: Added N/A — deliverable is markdown documentation + `CLAUDE.md` (authoritative scope source); `specs/001-milestone-roadmap/spec.md` (this feature's spec)
