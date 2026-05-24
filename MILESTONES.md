@@ -17,6 +17,7 @@ M01 ──► M02 ──► M03 ──► M04 ──► M05 ──► M06 ──
 M03 ──► M03.1     # additive protocol revision; M04+ consume it once shipped
 M07 ──► M07.1 ──► M07.2  # slices, then &str + static memory
             └──► M07.3   # arrays (sibling of M07.2; both depend only on M07.1)
+            └──► M07.4   # structs + impl/methods (depends on M07.3 inline-cell pattern)
 ```
 
 Acyclic. The drawn order is one valid topological sort. Edges from M03 to M05–M08 are real direct dependencies (each later milestone fills payloads in the event enum M03 defines), not just transitive. **M03.1** is a *revision* milestone — it patches M03's event protocol after M03 closed, based on pedagogical issues uncovered during M04's manual QA. Revisions don't sit in the main chain; they hang off the milestone they patch and improve downstream milestones' behavior once shipped.
@@ -569,6 +570,64 @@ Acyclic. The drawn order is one valid topological sort. Edges from M03 to M05–
 - Outputs (browser-observed steps): for array_basic — t's slot displays `[1_i32, 2_i32, 3_i32]` inline, no heap activity, n = 3_u64. For array_slice — load → step → at `let s` step, observe blue slice arrow from s to t (slot-to-slot, NOT slot-to-heap), `[len: 2]` annotation visible, hover lights up t's 2nd and 3rd element cells.
 
 **Notes.** First milestone where `Value::Slice.target = Pointee::Slot(_)` is actually constructed — exercises a code path M07.1 declared but didn't reach. The hover-highlight infrastructure from M07.1 (byte-cells + element-spans) should generalize: instead of `[data-heap-addr]` lookups, slot-target slices look up `[data-slot-id]` then find the slot's inline byte-cells. Plan-phase decides whether to render array bytes as a Vec-style horizontal cell strip or a more compact form. Pedagogically the headline contrast is **storage**: arrays live in the stack frame (bytes vanish when the frame leaves; no Drop, no free, no realloc); Vec lives on the heap (owning arrow + HeapAlloc + HeapFree). Same `len()`, same indexing, same slicing — different memory location.
+
+---
+
+### M07.4 — Structs + impl blocks (named-field composite types with methods)
+
+- **Kind**: feature (revision-style — fills a Level-3 gap by introducing user-defined composite types, completing the in-the-language tools learners need to model their own data)
+- **Status**: planned
+- **Complexity**: XL (modules: 5, bullets: 9, boundaries: 3)
+- **Depends on**: M07.3
+- **Authority**: CLAUDE.md › Pedagogical goal › "Give a newcomer concrete intuition for Rust's memory mechanics: moves, borrows, lifetimes, drops, heap allocations" — structs are the primary tool a learner uses to MODEL data once they've understood primitives + sequences. Without structs, every example is a synthetic toy. CLAUDE.md › Supported Rust subset doesn't explicitly enumerate `struct`, but the broader pedagogical goal of "make Rust's memory mechanics tangible" requires the type system's core composite-type primitive.
+
+**Goal.** Introduce user-defined `struct` types with named fields, plus `impl` blocks providing associated functions and methods (with `&self`, `&mut self`, and `self` receivers). Inline rendering shows the struct's byte layout in the stack slot — one cell strip + per-field label per field — with field-borrow arrows pointing at the slot with a field-name annotation (analogous to slice arrows' `[len: N]` label). Method dispatch resolves via a per-type table populated from `impl` blocks.
+
+**In scope.**
+- **Struct declaration**: `struct Point { x: i32, y: i32 }` as a new `Item::Struct` AST node; named fields with types; declaration order significant for byte layout AND drop order.
+- **Struct literal**: `Point { x: 1, y: 2 }` as a new `Expr::StructLit { path, fields, span }` AST node. Field-shorthand `Point { x, y }` (when local has same name) included — small parser concession with big ergonomic payoff.
+- **Field access**: `p.x` as a new `Expr::FieldAccess { receiver, name, span }`. Rvalue — returns a copy of the field's value (assuming Copy element type).
+- **Field borrow**: `&p.x` produces `Value::Ref { target: Pointee::Slot(slot_id), .. }` with a new `field_offset` / `field_name` annotation that drives the per-field hover-highlight on the source slot. Plan-phase confirms the Value::Ref extension shape (extending Ref with optional field metadata vs. a new Value::FieldRef variant).
+- **`impl` blocks**: `impl Point { ... }` as a new `Item::Impl { ty_path, items, span }` AST node. Inside: associated functions (`fn new(x: i32, y: i32) -> Point`) and methods with self-receivers (`fn x(&self) -> i32 { self.x }`).
+- **Self-receivers**: `&self`, `&mut self`, `self` (owned — moves the receiver, becomes inaccessible after). Mirrors Rust's standard receiver semantics.
+- **Method call dispatch**: extends the M07 method dispatch table — first looks for matching `(receiver_ty, method_name)` rows in the M07 hardcoded built-ins (Vec/String/Slice/Array/Str), then in the user-defined impl-block registry built during typeck's collect-impls pre-pass.
+- **Associated function call**: `Point::new(1, 2)` extends the path-fn dispatch table — first the hardcoded built-ins (Box::new, Vec::new, String::from), then user-defined impl-block associated functions.
+- **Drop semantics**: per-field destructor in source declaration order at scope exit. For M07.4's primitive-only restriction (all fields are Copy), this is observable only as the slot's cells clearing in declaration order — but the pedagogy mechanic is established for future non-Copy field types.
+- **Inline rendering**: stack slot's value area shows byte-cell strips per field with field-name labels above each strip (similar to M07.3 array inline cells but per-field rather than per-element).
+- **Restrictions** preserving manageable scope: primitive field types only (Int/Float/Bool/Unit, matching M07's Vec/Array restriction); single-segment paths only (no `mod::Point`); one impl block per struct (multiple impl blocks deferred); no generic structs / generic methods; no derive macros.
+
+**Out of scope.**
+- **Generic structs** `Point<T>`, generic methods — deferred.
+- **Traits, trait impls, trait objects** — deferred.
+- **Derive macros** (`#[derive(Debug, Clone)]`) — deferred.
+- **Struct update syntax** `Point { x: 10, ..p }` — deferred.
+- **Tuple structs** `struct Pair(i32, i32)` — deferred.
+- **Unit structs** `struct Marker;` — deferred.
+- **Pattern matching on struct fields** `let Point { x, y } = p;` — deferred (no pattern matching in any milestone yet).
+- **Multiple `impl` blocks per struct** — only one impl block recognized per struct in M07.4.
+- **Non-Copy field types** (`struct Wrapper { v: Vec<i32> }`) — deferred. M07.4 restricts fields to primitives.
+- **Recursive structs** (`struct Node { next: Option<Box<Node>> }`) — deferred (would require Option / enum support).
+- **Associated constants** in impl blocks — deferred.
+- **`self` field shorthand** in impl methods (e.g. `self.x = 5;` requires extending M06.1's place-expression set; same restriction as array index-write) — partial; read-only field access works; field assignment deferred.
+
+**Entry criteria.**
+- M07.3 closed (inline byte-cell + per-element rendering pattern in stack slots).
+- M07.4 doesn't depend on M08 (threads) — sibling milestone.
+
+**Exit criteria.**
+- `struct Point { x: i32, y: i32 } fn main() { let p = Point { x: 1, y: 2 }; }` typechecks; the page renders p's slot with two byte-cell strips (one per field, labeled `x` and `y`) totaling 8 bytes.
+- `let a = p.x` evaluates to `1_i32`; the field-access expression doesn't move `p` (Copy semantics).
+- `let r = &p.x` produces a `Value::Ref { target: Pointee::Slot(_), .. }` with field metadata; the borrow arrow points from `r` to `p`'s slot with a `.x` annotation; hover highlights the `x` field's bytes specifically (not the whole struct).
+- `impl Point { fn x(&self) -> i32 { self.x } }`; `let v = p.x();` typechecks; method dispatch resolves to the impl block's method; `v == 1_i32`.
+- `let p = Point::new(1, 2);` typechecks; associated function call dispatches to the impl block; constructs the struct value.
+- At scope exit, the slot's cells clear in field declaration order (drop pedagogy).
+- ≥ 4 new `m07_4_*.rs` reference programs ship covering: struct literal + field access, field borrow, associated function (`Point::new`), method call (`p.x()`).
+- All M01–M07.3 tests pass byte-identical.
+- WASM bundle growth ≤ +25% vs M07.3 baseline (substantial new surface: AST nodes for struct/impl, typeck registry for user-defined types/methods, eval method dispatch).
+
+**Demo.** Browser. `m07_4_struct_basic.rs` (`struct Point { x: i32, y: i32 } let p = Point { x: 1, y: 2 }; let a = p.x;`): stack slot shows `p : Point` with two byte-cell strips. `m07_4_field_borrow.rs`: `&p.x` produces a slot-target arrow with `.x` field annotation. `m07_4_method.rs`: defines `impl Point { fn x(&self) -> i32 { self.x } }` and calls `p.x()` — dispatches via the impl registry. `m07_4_associated_fn.rs`: `Point::new(1, 2)` constructs the struct via associated function call.
+
+**Notes.** Sized XL by design — adds two new top-level Items (`Struct` and `Impl`), one new `Ty::Struct` variant carrying field schema, one new `Value::Struct` variant carrying field values, and the impl-block dispatch registry. Plan-phase will likely identify a clean US split (struct decl + literal + field access as US1/P1; field borrow as US2/P1; impl/methods as US3/P1; associated functions as US4/P2). 8th invocation of the closed-enum-with-revisions rule (additive Ty::Struct + Value::Struct + possibly Value::Ref field extension). Considered splitting into M07.4 (basic structs) + M07.5 (impl/methods) — maintainer chose to bundle for cohesive pedagogy, accepting larger scope. If implementation slips XL → XXL during execution, plan-phase splits in place per the M06/M06a/M06b precedent.
 
 ---
 
