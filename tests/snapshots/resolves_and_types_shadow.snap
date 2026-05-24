@@ -222,5 +222,6 @@ Ok {
                 Bool,
             ),
         },
+        call_substs: {},
     },
 }

@@ -1135,6 +1135,9 @@ fn ty_size_bytes_ui(ty: &Ty) -> u32 {
         Ty::Array(inner, size) => ty_size_bytes_ui(inner) * (*size as u32),
         // M07.4: struct = sum of field sizes (no padding).
         Ty::Struct { fields, .. } => fields.iter().map(|(_, t)| ty_size_bytes_ui(t)).sum(),
+        // M07.5: type parameter — unreachable at eval/UI time (typeck
+        // substitutes before any sizing query). Defensive: 0.
+        Ty::Param(_) => 0,
     }
 }
 

@@ -8,6 +8,7 @@ Ok(
             Fn(
                 FnDecl {
                     name: "main",
+                    type_params: [],
                     params: [],
                     return_ty: None,
                     body: Block {

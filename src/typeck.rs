@@ -206,12 +206,27 @@ pub enum Ty {
     /// schema without a registry round-trip; they're redundant for
     /// identity). M07.4 fields are restricted to primitives so the
     /// struct is always Copy.
+    /// **M07.5**: extended with `type_args` for generic instantiations.
+    /// Empty for non-generic structs (`Point`); non-empty for
+    /// `Wrapper<i32>` etc. Drives `Ty::name()` to render `"Wrapper<i32>"`
+    /// and drives nominal equality (`Wrapper<i32>` ≠ `Wrapper<bool>`).
     Struct {
         /// Type name (e.g. `"Point"`).
         name: String,
         /// Fields in declaration order. Mirrors `StructDecl.fields`.
         fields: Vec<(String, Ty)>,
+        /// **M07.5**: type-args for generic instantiations. Empty for
+        /// non-generic structs (M07.4 case). Serde-default-empty keeps
+        /// existing M03 snapshots byte-identical for the M07.4 case.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        type_args: Vec<Ty>,
     },
+    /// **M07.5**: type parameter (unresolved). Carries the param's name
+    /// (`"T"`) so error messages can reference it. Substituted at call
+    /// sites with concrete types via `apply_subst`. Should be unreachable
+    /// at eval time (typeck substitutes before any binding_types entry is
+    /// recorded that eval consults).
+    Param(String),
 }
 
 impl Ty {
@@ -241,7 +256,17 @@ impl Ty {
             // M07.3: array — `[T; N]`.
             Self::Array(inner, size) => format!("[{}; {}]", inner.name(), size),
             // M07.4: struct — bare type name (matches Rust's nominal typing).
-            Self::Struct { name, .. } => name.clone(),
+            // M07.5: extended with `<T1, T2>` suffix when type_args non-empty.
+            Self::Struct { name, type_args, .. } => {
+                if type_args.is_empty() {
+                    name.clone()
+                } else {
+                    let args = type_args.iter().map(|t| t.name()).collect::<Vec<_>>().join(", ");
+                    format!("{name}<{args}>")
+                }
+            }
+            // M07.5: type parameter — bare name (`T`).
+            Self::Param(name) => name.clone(),
         }
     }
 
@@ -266,6 +291,10 @@ impl Ty {
             // restricts fields to primitives so always true; future
             // milestones with non-Copy fields will produce false here.
             Self::Struct { fields, .. } => fields.iter().all(|(_, t)| t.is_copy()),
+            // M07.5: type parameter — without bounds we can't assume Copy.
+            // Safe default: false. At call sites the substituted concrete
+            // type's own is_copy() answer applies.
+            Self::Param(_) => false,
         }
     }
 }
@@ -299,6 +328,11 @@ pub struct TypeMap {
     pub expr_types: IndexMap<Span, Ty>,
     /// Maps each `BindingId` to its [`BindingType`].
     pub binding_types: IndexMap<BindingId, BindingType>,
+    /// **M07.5**: per-call-site substitution recorded by typeck. Empty for
+    /// non-generic calls; one entry per generic fn / method / assoc-fn
+    /// call site. Eval reads this to build mangled `FrameEnter.fn_name`
+    /// (e.g. `"id::<i32>"`).
+    pub call_substs: IndexMap<Span, Vec<(String, Ty)>>,
 }
 
 /// Type-check a resolved program.
@@ -325,6 +359,12 @@ pub fn typeck(program: &ast::Program, resolution: &Resolution) -> Result<TypeMap
                     .lookup_binding(|d| matches!(d.kind, BindingKind::Fn) && d.name == decl.name)
                     .expect("fn binding present after resolve");
                 t.types.binding_types.insert(id, BindingType::Fn(sig));
+                // **M07.5**: stash the fn's type-params for later turbofish lookup.
+                let tp_names: Vec<String> =
+                    decl.type_params.iter().map(|p| p.name.clone()).collect();
+                if !tp_names.is_empty() {
+                    t.fn_type_params.insert(id, tp_names);
+                }
             }
             // Structs already processed above.
             ast::Item::Struct(_) => {}
@@ -455,9 +495,13 @@ mod borrow_tracker {
 /// **M07.4**: per-struct schema collected during phase 1. Maps struct name →
 /// declaration-ordered field list. Phase 2 consults this to typecheck struct
 /// literals, field accesses, and field borrows.
+/// **M07.5**: also tracks generic type-params per struct (Vec<String> of
+/// names in declaration order). Empty for non-generic structs.
 #[derive(Default)]
 struct StructRegistry {
     schemas: IndexMap<String, Vec<(String, Ty)>>,
+    /// **M07.5**: per-struct type-params. Empty for non-generic structs.
+    type_params: IndexMap<String, Vec<String>>,
     /// Spans of the declaring `Item::Struct` for diagnostic anchoring on
     /// duplicate-definition errors.
     decl_spans: IndexMap<String, Span>,
@@ -494,6 +538,20 @@ struct Typechecker<'a> {
     structs: StructRegistry,
     /// **M07.4**: method + assoc-fn registry collected in phase 1.
     impls: ImplRegistry,
+    /// **M07.5**: stack of in-scope type-parameter names for the current
+    /// fn body. Pushed at body entry from the FnDecl's `type_params`;
+    /// popped at body exit. Top of stack = innermost generic context.
+    current_type_params: Vec<Vec<String>>,
+    /// **M07.5**: substitution stack — one entry per active generic-fn
+    /// call typecheck. Maps type-param name → concrete `Ty`. Pushed at
+    /// call-site typecheck entry, popped after. M07.5 max depth = 1
+    /// (no nested generic calls); the stack abstraction supports
+    /// future lifting of that restriction.
+    subst: Vec<std::collections::HashMap<String, Ty>>,
+    /// **M07.5**: per-free-fn type-params list. Populated in phase 1
+    /// alongside `binding_types`. Used at call sites to bind turbofish
+    /// type-args positionally.
+    fn_type_params: IndexMap<BindingId, Vec<String>>,
 }
 
 impl<'a> Typechecker<'a> {
@@ -506,6 +564,9 @@ impl<'a> Typechecker<'a> {
             scope_depth: 0,
             structs: StructRegistry::default(),
             impls: ImplRegistry::default(),
+            current_type_params: Vec::new(),
+            subst: Vec::new(),
+            fn_type_params: IndexMap::new(),
         }
     }
 
@@ -522,19 +583,33 @@ impl<'a> Typechecker<'a> {
                 span: decl.span,
             });
         }
+        // **M07.5**: register the struct's type-params first so field-type
+        // lowering can resolve `T` → `Ty::Param("T")` instead of "unknown type".
+        let tp_names: Vec<String> = decl.type_params.iter().map(|p| p.name.clone()).collect();
+        // Reject multi-type-param at typeck (parser-permissive).
+        if tp_names.len() > 1 {
+            return Err(ParseError {
+                message: "M07.5 supports a single type parameter; multi-type-param structs are out of scope".into(),
+                span: decl.span,
+            });
+        }
+        // Push to current_type_params so field-type lowering sees them.
+        self.current_type_params.push(tp_names.clone());
         let mut fields: Vec<(String, Ty)> = Vec::with_capacity(decl.fields.len());
         for field in &decl.fields {
-            let ty = ty_from_ast(&field.ty)?;
+            let ty = self.ty_from_ast_resolving_structs(&field.ty)?;
             // M07.4 restricts fields to primitive types (Int, Float, Bool,
-            // Unit). Non-Copy / composite types are out of scope.
-            let primitive = matches!(
+            // Unit). **M07.5**: also accept `Ty::Param(_)` so generic
+            // wrapper structs like `Wrapper<T> { v: T }` work.
+            let primitive_or_param = matches!(
                 ty,
-                Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Unit
+                Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Unit | Ty::Param(_)
             );
-            if !primitive {
+            if !primitive_or_param {
+                self.current_type_params.pop();
                 return Err(ParseError {
                     message: format!(
-                        "field `{}` of struct `{}` has type `{}`; M07.4 fields must be primitive types (i32, bool, etc.)",
+                        "field `{}` of struct `{}` has type `{}`; M07.4/M07.5 fields must be primitive types or the struct's own type parameter",
                         field.name,
                         decl.name,
                         ty.name()
@@ -544,9 +619,60 @@ impl<'a> Typechecker<'a> {
             }
             fields.push((field.name.clone(), ty));
         }
+        self.current_type_params.pop();
+        self.structs.type_params.insert(decl.name.clone(), tp_names);
         self.structs.schemas.insert(decl.name.clone(), fields);
         self.structs.decl_spans.insert(decl.name.clone(), decl.span);
         Ok(())
+    }
+
+    /// **M07.5**: recursively substitute `Ty::Param(name)` with the
+    /// concrete type from the current substitution scope (top of subst
+    /// stack). Returns `ty.clone()` for non-param Tys. Used at call sites
+    /// (typecheck_call/method_call/path_call/struct_lit) AFTER inferring
+    /// the substitution from args/turbofish, to lower a sig's generic
+    /// param types + return type to concrete Tys.
+    fn apply_subst(&self, ty: &Ty) -> Ty {
+        let active = self.subst.last();
+        self.apply_subst_with(ty, active)
+    }
+
+    fn apply_subst_with(
+        &self,
+        ty: &Ty,
+        sub: Option<&std::collections::HashMap<String, Ty>>,
+    ) -> Ty {
+        match ty {
+            Ty::Param(name) => match sub.and_then(|m| m.get(name)) {
+                Some(concrete) => concrete.clone(),
+                None => ty.clone(),
+            },
+            Ty::Struct { name, fields, type_args } => {
+                let new_fields = fields
+                    .iter()
+                    .map(|(fname, fty)| (fname.clone(), self.apply_subst_with(fty, sub)))
+                    .collect();
+                let new_args = type_args
+                    .iter()
+                    .map(|t| self.apply_subst_with(t, sub))
+                    .collect();
+                Ty::Struct {
+                    name: name.clone(),
+                    fields: new_fields,
+                    type_args: new_args,
+                }
+            }
+            Ty::Ref { inner, mutable } => Ty::Ref {
+                inner: Box::new(self.apply_subst_with(inner, sub)),
+                mutable: *mutable,
+            },
+            Ty::Box(inner) => Ty::Box(Box::new(self.apply_subst_with(inner, sub))),
+            Ty::Vec(inner) => Ty::Vec(Box::new(self.apply_subst_with(inner, sub))),
+            Ty::Slice(inner) => Ty::Slice(Box::new(self.apply_subst_with(inner, sub))),
+            Ty::Array(inner, n) => Ty::Array(Box::new(self.apply_subst_with(inner, sub)), *n),
+            // Primitives — no substitution structure.
+            Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Unit | Ty::String | Ty::Str => ty.clone(),
+        }
     }
 
     /// **M07.4**: struct-aware `ty_from_ast` wrapper. Used by phase-1 fn
@@ -555,13 +681,27 @@ impl<'a> Typechecker<'a> {
     /// of "unknown type `Point`". Falls back to the standard `ty_from_ast`
     /// for everything else.
     fn ty_from_ast_resolving_structs(&self, t: &ast::Type) -> Result<Ty, ParseError> {
-        if let ast::Type::Path { segments, .. } = t {
+        if let ast::Type::Path { segments, type_args, .. } = t {
             if segments.len() == 1 {
                 if let Some(fields) = self.structs.schemas.get(&segments[0]) {
+                    // M07.5: lower the AST type_args to Tys via recursion.
+                    let lowered_args: Vec<Ty> = type_args
+                        .iter()
+                        .map(|ta| self.ty_from_ast_resolving_structs(ta))
+                        .collect::<Result<_, _>>()?;
                     return Ok(Ty::Struct {
                         name: segments[0].clone(),
                         fields: fields.clone(),
+                        type_args: lowered_args,
                     });
+                }
+                // **M07.5**: bare identifier that's not a struct AND not a
+                // primitive (handled by ty_from_ast) — check if it's an
+                // in-scope type parameter from the current generic fn.
+                if let Some(top) = self.current_type_params.last() {
+                    if top.contains(&segments[0]) {
+                        return Ok(Ty::Param(segments[0].clone()));
+                    }
                 }
             }
         }
@@ -611,6 +751,7 @@ impl<'a> Typechecker<'a> {
         let struct_ty = Ty::Struct {
             name: struct_name.to_owned(),
             fields: self.structs.schemas[struct_name].clone(),
+            type_args: Vec::new(),
         };
         // Build the signature, treating the self-receiver (if present) as
         // ALREADY consumed — `params` here is the explicit-only param list.
@@ -678,7 +819,30 @@ impl<'a> Typechecker<'a> {
             .find_map(|(id, decl)| if pred(decl) { Some(*id) } else { None })
     }
 
-    fn build_fn_sig(&self, decl: &ast::FnDecl) -> Result<FnSig, ParseError> {
+    fn build_fn_sig(&mut self, decl: &ast::FnDecl) -> Result<FnSig, ParseError> {
+        // **M07.5**: reject bounds + multi-T per the M07.5 single-param
+        // restriction.
+        for tp in &decl.type_params {
+            if tp.bound.is_some() {
+                return Err(ParseError {
+                    message: format!(
+                        "trait bounds on generics (`{}: ...`) are deferred to M07.6",
+                        tp.name
+                    ),
+                    span: tp.span,
+                });
+            }
+        }
+        if decl.type_params.len() > 1 {
+            return Err(ParseError {
+                message: "M07.5 supports a single type parameter; multi-type-param fns are out of scope".into(),
+                span: decl.span,
+            });
+        }
+        // **M07.5**: push type-param scope so `T` in param/return types
+        // resolves to `Ty::Param("T")` via ty_from_ast_resolving_structs.
+        let tp_names: Vec<String> = decl.type_params.iter().map(|p| p.name.clone()).collect();
+        self.current_type_params.push(tp_names);
         let mut params = Vec::with_capacity(decl.params.len());
         for param in &decl.params {
             params.push(self.ty_from_ast_resolving_structs(&param.ty)?);
@@ -687,6 +851,7 @@ impl<'a> Typechecker<'a> {
             Some(t) => self.ty_from_ast_resolving_structs(t)?,
             None => Ty::Unit,
         };
+        self.current_type_params.pop();
         Ok(FnSig { params, ret })
     }
 
@@ -698,6 +863,10 @@ impl<'a> Typechecker<'a> {
             Some(BindingType::Fn(s)) => s.clone(),
             _ => panic!("fn sig must be set in Phase 1"),
         };
+        // **M07.5**: push the fn's type-param names so body code that uses
+        // `T` as a type resolves to `Ty::Param("T")`.
+        let tp_names: Vec<String> = decl.type_params.iter().map(|p| p.name.clone()).collect();
+        self.current_type_params.push(tp_names);
         for (param, param_ty) in decl.params.iter().zip(sig.params.iter()) {
             let pid = self
                 .lookup_binding(|d| matches!(d.kind, BindingKind::Param) && d.name_span == param.span)
@@ -709,6 +878,7 @@ impl<'a> Typechecker<'a> {
         let prev = self.current_fn_ret.replace(sig.ret.clone());
         let body_ty = self.typecheck_block(&decl.body)?;
         if body_ty != sig.ret {
+            self.current_type_params.pop();
             return Err(ParseError {
                 message: format!(
                     "function returns `{}`, but body has type `{}`",
@@ -724,6 +894,7 @@ impl<'a> Typechecker<'a> {
             });
         }
         self.current_fn_ret = prev;
+        self.current_type_params.pop();
         Ok(())
     }
 
@@ -741,6 +912,7 @@ impl<'a> Typechecker<'a> {
         let struct_ty = Ty::Struct {
             name: struct_name.to_owned(),
             fields: self.structs.schemas[struct_name].clone(),
+            type_args: Vec::new(),
         };
         // Look up the explicit-only sig from the registries.
         let key_method = (struct_name.to_owned(), decl.name.clone());
@@ -1291,8 +1463,8 @@ impl<'a> Typechecker<'a> {
             // **M07.4**: struct literal — verify path resolves to a known
             // struct; verify every declared field appears with the right
             // type; reject extras.
-            ast::Expr::StructLit { path, fields, span } => {
-                self.typecheck_struct_lit(path, fields, *span)
+            ast::Expr::StructLit { path, fields, span, type_args } => {
+                self.typecheck_struct_lit(path, type_args, fields, *span)
             }
             // **M07.4**: field access on a struct (or auto-deref a &Struct).
             ast::Expr::FieldAccess { receiver, name, span } => {
@@ -1309,6 +1481,7 @@ impl<'a> Typechecker<'a> {
     fn typecheck_struct_lit(
         &mut self,
         path: &[String],
+        type_args: &[ast::Type],
         fields: &[ast::StructLitField],
         span: Span,
     ) -> Result<Ty, ParseError> {
@@ -1328,10 +1501,49 @@ impl<'a> Typechecker<'a> {
                 });
             }
         };
+        // **M07.5**: build the substitution for this struct's type-params.
+        // Cases:
+        //   1. Non-generic struct (type_params empty): substitution stays
+        //      empty; existing M07.4 logic applies unchanged.
+        //   2. Turbofish (type_args non-empty): bind each type-param to the
+        //      corresponding type-arg positionally.
+        //   3. Inferred (type_args empty, type_params non-empty): walk the
+        //      schema fields; for each field whose type is `Ty::Param(name)`,
+        //      take the inference from the corresponding lit field's value
+        //      type. Conflicts → error.
+        let struct_tps = self.structs.type_params.get(struct_name).cloned().unwrap_or_default();
+        let lit_subst: std::collections::HashMap<String, Ty> = if !type_args.is_empty() {
+            // Turbofish path.
+            if type_args.len() != struct_tps.len() {
+                return Err(ParseError {
+                    message: format!(
+                        "struct `{struct_name}` expects {} type argument(s), found {}",
+                        struct_tps.len(),
+                        type_args.len()
+                    ),
+                    span,
+                });
+            }
+            let lowered: Vec<Ty> = type_args
+                .iter()
+                .map(|ta| self.ty_from_ast_resolving_structs(ta))
+                .collect::<Result<_, _>>()?;
+            struct_tps.iter().cloned().zip(lowered).collect()
+        } else if !struct_tps.is_empty() {
+            // Inferred path — must walk fields below to populate.
+            std::collections::HashMap::new()
+        } else {
+            // Non-generic struct — no substitution to build.
+            std::collections::HashMap::new()
+        };
+        // Push the substitution scope (for inferred case we'll mutate it
+        // during field walking; for turbofish/non-generic it's already final).
+        self.subst.push(lit_subst);
         // Pass 1: verify no extras. Each provided field name must exist in
         // the schema.
         for field in fields {
             if !schema.iter().any(|(n, _)| n == &field.name) {
+                self.subst.pop();
                 return Err(ParseError {
                     message: format!(
                         "no field `{}` on struct `{}`",
@@ -1343,9 +1555,14 @@ impl<'a> Typechecker<'a> {
         }
         // Pass 2: for each declared field, find the matching init OR
         // shorthand. Report missing fields.
-        for (declared_name, declared_ty) in &schema {
+        // **M07.5**: applies substitution to declared_ty before comparison.
+        // For the inferred case, also EXTENDS the substitution as it walks
+        // — first occurrence of `Ty::Param(T)` binds T from the value type.
+        let is_inferred_generic = !struct_tps.is_empty() && type_args.is_empty();
+        for (declared_name, declared_ty_raw) in &schema {
             let init = fields.iter().find(|f| &f.name == declared_name);
             let Some(init) = init else {
+                self.subst.pop();
                 return Err(ParseError {
                     message: format!(
                         "missing field `{}` in struct literal `{}`",
@@ -1354,16 +1571,10 @@ impl<'a> Typechecker<'a> {
                     span,
                 });
             };
-            // Determine the field's typecheck-result and coerce to the
-            // declared type. For shorthand (value: None), the bound local
-            // of the same name is the source.
             let (value_ty, value_span, expr_for_coerce): (Ty, Span, Option<&ast::Expr>) =
                 match &init.value {
                     Some(expr) => (self.typecheck_expr(expr)?, expr.span(), Some(expr)),
                     None => {
-                        // Shorthand: resolve via the field's span (which
-                        // resolve.rs registered as the use site for the
-                        // bare ident).
                         let bid = *self
                             .resolution
                             .uses
@@ -1378,13 +1589,40 @@ impl<'a> Typechecker<'a> {
                         (bty, init.span, None)
                     }
                 };
+            // **M07.5**: if the declared field type is `Ty::Param(T)` and we're
+            // in inferred-generic mode, bind T from value_ty (first occurrence)
+            // or verify agreement (subsequent occurrence).
+            if is_inferred_generic {
+                if let Ty::Param(tp_name) = declared_ty_raw {
+                    let cur = self.subst.last_mut().expect("subst pushed");
+                    if let Some(prev) = cur.get(tp_name).cloned() {
+                        if prev != value_ty {
+                            self.subst.pop();
+                            return Err(ParseError {
+                                message: format!(
+                                    "cannot infer `{tp_name}` from conflicting field values: `{}` vs `{}`",
+                                    prev.name(),
+                                    value_ty.name()
+                                ),
+                                span: value_span,
+                            });
+                        }
+                    } else {
+                        cur.insert(tp_name.clone(), value_ty.clone());
+                    }
+                    continue; // No further coercion / equality check needed for this field.
+                }
+            }
+            // Apply substitution to declared type, then coerce / check.
+            let declared_ty = self.apply_subst(declared_ty_raw);
             let coerced = match expr_for_coerce {
                 Some(e) => self
                     .try_coerce_to(e, value_ty.clone(), declared_ty.clone())
                     .unwrap_or(value_ty),
                 None => value_ty,
             };
-            if coerced != *declared_ty {
+            if coerced != declared_ty {
+                self.subst.pop();
                 return Err(ParseError {
                     message: format!(
                         "expected `{}`, found `{}`",
@@ -1395,11 +1633,10 @@ impl<'a> Typechecker<'a> {
                 });
             }
         }
-        // Duplicate-field check (`Point { x: 1, x: 2 }` — caught by the
-        // first scan finding a second match below the first one in pass 2's
-        // search, but easier to surface explicitly).
+        // Duplicate-field check.
         for (i, field) in fields.iter().enumerate() {
             if fields[..i].iter().any(|f| f.name == field.name) {
+                self.subst.pop();
                 return Err(ParseError {
                     message: format!(
                         "field `{}` specified more than once",
@@ -1409,9 +1646,37 @@ impl<'a> Typechecker<'a> {
                 });
             }
         }
+        // **M07.5**: build the final Ty::Struct with substituted fields
+        // + type_args populated from the (possibly inferred) substitution.
+        let final_subst = self.subst.pop().expect("subst pushed at fn entry");
+        let substituted_fields: Vec<(String, Ty)> = schema
+            .iter()
+            .map(|(n, t)| (n.clone(), self.apply_subst_with(t, Some(&final_subst))))
+            .collect();
+        let final_type_args: Vec<Ty> = struct_tps
+            .iter()
+            .map(|tp| {
+                final_subst.get(tp).cloned().unwrap_or_else(|| Ty::Param(tp.clone()))
+            })
+            .collect();
+        // **M07.5**: enforce that all type-params were bound (for inferred
+        // case where some fields don't use T at all).
+        if !struct_tps.is_empty() {
+            for tp in &struct_tps {
+                if !final_subst.contains_key(tp) {
+                    return Err(ParseError {
+                        message: format!(
+                            "cannot infer type parameter `{tp}` for struct `{struct_name}` — add a turbofish annotation like `{struct_name}::<...>`"
+                        ),
+                        span,
+                    });
+                }
+            }
+        }
         Ok(Ty::Struct {
             name: struct_name.clone(),
-            fields: schema,
+            fields: substituted_fields,
+            type_args: final_type_args,
         })
     }
 
@@ -1634,6 +1899,7 @@ impl<'a> Typechecker<'a> {
     fn typecheck_path_call(
         &mut self,
         segments: &[String],
+        _type_args: &[ast::Type],  // M07.5: wired in T008; ignored for now.
         path_span: Span,
         args: &[ast::Expr],
         call_span: Span,
@@ -2107,6 +2373,101 @@ impl<'a> Typechecker<'a> {
         }
     }
 
+    /// **M07.5**: handle a turbofish free-fn call (`id::<bool>(false)`).
+    /// The type-args are explicit (no inference); bind them positionally
+    /// to the fn's type-params, apply substitution to params + ret,
+    /// typecheck args against substituted param types, record the
+    /// substitution in `call_substs`.
+    fn typecheck_generic_free_call(
+        &mut self,
+        fn_binding: BindingId,
+        callee_name: &str,
+        type_args_ast: &[ast::Type],
+        args: &[ast::Expr],
+        callee_span: Span,
+        call_span: Span,
+    ) -> Result<Ty, ParseError> {
+        let sig = match self.types.binding_types.get(&fn_binding) {
+            Some(BindingType::Fn(s)) => s.clone(),
+            _ => panic!("turbofish on non-fn binding"),
+        };
+        // Look up the FnDecl to get its type-params list.
+        let fn_decl = self
+            .resolution
+            .bindings
+            .get(&fn_binding)
+            .expect("fn binding present");
+        // We need decl.type_params — find by walking program items. The
+        // typeck doesn't store FnDecls directly; we re-walk via lookup.
+        // Simpler path: store a `fn_type_params: IndexMap<BindingId, Vec<String>>`
+        // populated in phase 1. For now, look up via the binding's name
+        // in the impls registry (not applicable for free fns)... we need
+        // a phase-1-side stash of free-fn type-params. Add it now.
+        let _ = fn_decl;
+        let tp_names = self.fn_type_params.get(&fn_binding).cloned().unwrap_or_default();
+        if tp_names.len() != type_args_ast.len() {
+            return Err(ParseError {
+                message: format!(
+                    "`{callee_name}` expects {} type argument(s), found {}",
+                    tp_names.len(),
+                    type_args_ast.len()
+                ),
+                span: callee_span,
+            });
+        }
+        // Lower AST type-args to Tys.
+        let lowered_args: Vec<Ty> = type_args_ast
+            .iter()
+            .map(|ta| self.ty_from_ast_resolving_structs(ta))
+            .collect::<Result<_, _>>()?;
+        let local_subst: std::collections::HashMap<String, Ty> =
+            tp_names.iter().cloned().zip(lowered_args.into_iter()).collect();
+        // **M07.5**: reject nested generic call (single-level only in M07.5).
+        if !self.current_type_params.last().map(Vec::is_empty).unwrap_or(true) {
+            return Err(ParseError {
+                message: "generic-fn calls inside another generic fn's body are out of scope in M07.5".into(),
+                span: call_span,
+            });
+        }
+        // Typecheck args against substituted param types.
+        if args.len() != sig.params.len() {
+            return Err(ParseError {
+                message: format!(
+                    "function `{callee_name}` expects {} argument(s), found {}",
+                    sig.params.len(),
+                    args.len()
+                ),
+                span: call_span,
+            });
+        }
+        self.subst.push(local_subst.clone());
+        for (i, (arg, param_ty_raw)) in args.iter().zip(sig.params.iter()).enumerate() {
+            let param_ty = self.apply_subst(param_ty_raw);
+            let arg_ty = self.typecheck_expr(arg)?;
+            let arg_ty = self
+                .try_coerce_to(arg, arg_ty.clone(), param_ty.clone())
+                .unwrap_or(arg_ty);
+            if arg_ty != param_ty {
+                self.subst.pop();
+                return Err(ParseError {
+                    message: format!(
+                        "argument {}: expected `{}`, found `{}`",
+                        i + 1,
+                        param_ty.name(),
+                        arg_ty.name()
+                    ),
+                    span: arg.span(),
+                });
+            }
+        }
+        let ret = self.apply_subst(&sig.ret);
+        self.subst.pop();
+        // Record substitution for the mangled eval-side fn_name.
+        let subst_entries: Vec<(String, Ty)> = local_subst.into_iter().collect();
+        self.types.call_substs.insert(call_span, subst_entries);
+        Ok(ret)
+    }
+
     fn typecheck_call(
         &mut self,
         callee: &ast::Expr,
@@ -2114,8 +2475,27 @@ impl<'a> Typechecker<'a> {
         call_span: Span,
     ) -> Result<Ty, ParseError> {
         // **M07**: Path-callee → dispatch the static-fn table (Box::new, Vec::new, String::from).
-        if let ast::Expr::Path { segments, span: path_span } = callee {
-            return self.typecheck_path_call(segments, *path_span, args, call_span);
+        // **M07.5**: turbofish type-args (`id::<bool>(false)`) plumbed through typecheck_path_call.
+        if let ast::Expr::Path { segments, type_args, span: path_span } = callee {
+            // **M07.5**: single-segment turbofish (`id::<bool>`) is a
+            // free-fn call with explicit type-args. Look up the binding
+            // by name and dispatch as a regular generic call with
+            // pre-bound substitution.
+            if segments.len() == 1 && !type_args.is_empty() {
+                if let Some(bid) = self.lookup_binding(|d| {
+                    matches!(d.kind, BindingKind::Fn) && d.name == segments[0]
+                }) {
+                    return self.typecheck_generic_free_call(
+                        bid,
+                        &segments[0],
+                        type_args,
+                        args,
+                        *path_span,
+                        call_span,
+                    );
+                }
+            }
+            return self.typecheck_path_call(segments, type_args, *path_span, args, call_span);
         }
         // L1 supports direct function calls (callee must be an Ident).
         let (callee_name, callee_span) = match callee {
@@ -2142,8 +2522,6 @@ impl<'a> Typechecker<'a> {
             }
             None => panic!("binding {id:?} has no type"),
         };
-        // NB: do NOT record `expr_types[callee_span]` — the callee is a function
-        // reference, not a value (data-model.md VR-11).
         if args.len() != sig.params.len() {
             return Err(ParseError {
                 message: format!(
@@ -2154,9 +2532,51 @@ impl<'a> Typechecker<'a> {
                 span: call_span,
             });
         }
-        for (i, (arg, param_ty)) in args.iter().zip(sig.params.iter()).enumerate() {
-            let arg_ty = self.typecheck_expr(arg)?;
-            if arg_ty != *param_ty {
+        // **M07.5**: detect generic-fn calls. The sig's params/ret may
+        // contain `Ty::Param(_)`. Infer substitution from arg types via
+        // direct-match (the first occurrence of each Param binds it).
+        let is_generic_call = sig_uses_param(&sig);
+        // **M07.5**: reject generic-call-inside-generic-fn (nested
+        // substitution) per the M07.5 single-level restriction.
+        if is_generic_call && !self.current_type_params.last().map(Vec::is_empty).unwrap_or(true)
+        {
+            return Err(ParseError {
+                message: "generic-fn calls inside another generic fn's body are out of scope in M07.5".into(),
+                span: call_span,
+            });
+        }
+        let mut local_subst: std::collections::HashMap<String, Ty> = std::collections::HashMap::new();
+        let mut arg_typed: Vec<Ty> = Vec::with_capacity(args.len());
+        for arg in args {
+            arg_typed.push(self.typecheck_expr(arg)?);
+        }
+        if is_generic_call {
+            // Direct-match inference: walk param types; for each Ty::Param(T),
+            // record T = arg_ty. Subsequent occurrences of T must agree.
+            for (i, (param_ty, arg_ty)) in sig.params.iter().zip(arg_typed.iter()).enumerate() {
+                infer_subst(param_ty, arg_ty, &mut local_subst).map_err(|(tp, prev, found)| {
+                    ParseError {
+                        message: format!(
+                            "cannot infer `{tp}` from conflicting args: `{}` vs `{}`",
+                            prev.name(),
+                            found.name()
+                        ),
+                        span: args[i].span(),
+                    }
+                })?;
+            }
+        }
+        // Apply substitution + check arg types. Use literal coercion (M03.2)
+        // when no substitution applies.
+        self.subst.push(local_subst.clone());
+        for (i, (arg, param_ty_raw)) in args.iter().zip(sig.params.iter()).enumerate() {
+            let param_ty = self.apply_subst(param_ty_raw);
+            let arg_ty = arg_typed[i].clone();
+            let arg_ty = self
+                .try_coerce_to(arg, arg_ty.clone(), param_ty.clone())
+                .unwrap_or(arg_ty);
+            if arg_ty != param_ty {
+                self.subst.pop();
                 return Err(ParseError {
                     message: format!(
                         "argument {}: expected `{}`, found `{}`",
@@ -2168,7 +2588,15 @@ impl<'a> Typechecker<'a> {
                 });
             }
         }
-        Ok(sig.ret)
+        let ret = self.apply_subst(&sig.ret);
+        self.subst.pop();
+        // **M07.5**: record the substitution per call-site so eval can build
+        // the mangled `FrameEnter.fn_name`.
+        if is_generic_call {
+            let subst_entries: Vec<(String, Ty)> = local_subst.into_iter().collect();
+            self.types.call_substs.insert(call_span, subst_entries);
+        }
+        Ok(ret)
     }
 
     /// **M03.2**: attempt to coerce a literal expression's type to `target`.
@@ -2271,6 +2699,64 @@ impl<'a> Typechecker<'a> {
     }
 }
 
+/// **M07.5**: does this FnSig contain `Ty::Param(_)` anywhere in its
+/// params or return type? Drives generic-fn-call detection at the call site.
+fn sig_uses_param(sig: &FnSig) -> bool {
+    sig.params.iter().any(ty_contains_param) || ty_contains_param(&sig.ret)
+}
+
+fn ty_contains_param(ty: &Ty) -> bool {
+    match ty {
+        Ty::Param(_) => true,
+        Ty::Struct { fields, type_args, .. } => {
+            fields.iter().any(|(_, t)| ty_contains_param(t))
+                || type_args.iter().any(ty_contains_param)
+        }
+        Ty::Ref { inner, .. } => ty_contains_param(inner),
+        Ty::Box(i) | Ty::Vec(i) | Ty::Slice(i) => ty_contains_param(i),
+        Ty::Array(i, _) => ty_contains_param(i),
+        Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Unit | Ty::String | Ty::Str => false,
+    }
+}
+
+/// **M07.5**: direct-match inference. Walk `param_ty` against `arg_ty`;
+/// whenever a `Ty::Param(T)` is encountered, bind T = corresponding arg sub-Ty.
+/// If T was already bound and the new binding conflicts, return
+/// `Err((T, prev, found))`.
+fn infer_subst(
+    param_ty: &Ty,
+    arg_ty: &Ty,
+    subst: &mut std::collections::HashMap<String, Ty>,
+) -> Result<(), (String, Ty, Ty)> {
+    match (param_ty, arg_ty) {
+        (Ty::Param(name), arg) => {
+            if let Some(prev) = subst.get(name) {
+                if prev != arg {
+                    return Err((name.clone(), prev.clone(), arg.clone()));
+                }
+            } else {
+                subst.insert(name.clone(), arg.clone());
+            }
+            Ok(())
+        }
+        // Recurse on shaped types.
+        (Ty::Ref { inner: pi, .. }, Ty::Ref { inner: ai, .. }) => infer_subst(pi, ai, subst),
+        (Ty::Box(pi), Ty::Box(ai))
+        | (Ty::Vec(pi), Ty::Vec(ai))
+        | (Ty::Slice(pi), Ty::Slice(ai)) => infer_subst(pi, ai, subst),
+        (Ty::Array(pi, _), Ty::Array(ai, _)) => infer_subst(pi, ai, subst),
+        (Ty::Struct { type_args: pa, .. }, Ty::Struct { type_args: aa, .. })
+            if pa.len() == aa.len() =>
+        {
+            for (p, a) in pa.iter().zip(aa.iter()) {
+                infer_subst(p, a, subst)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()), // No substitution structure or non-matching shapes — caller's eq check catches mismatches.
+    }
+}
+
 fn ty_from_ast(t: &ast::Type) -> Result<Ty, ParseError> {
     match t {
         ast::Type::Unit { .. } => Ok(Ty::Unit),
@@ -2282,7 +2768,9 @@ fn ty_from_ast(t: &ast::Type) -> Result<Ty, ParseError> {
                 mutable: *mutable,
             })
         }
-        ast::Type::Path { segments, span } => {
+        ast::Type::Path { segments, span, type_args: _ } => {
+            // M07.5: type_args wired in T007's struct-aware ty_from_ast wrapper.
+            // The free ty_from_ast (used outside Typechecker) ignores them.
             if segments.len() != 1 {
                 return Err(ParseError {
                     message: "multi-segment type paths are not supported in L1".into(),

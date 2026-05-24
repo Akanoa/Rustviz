@@ -155,6 +155,40 @@ enum HeapObject {
     },
 }
 
+/// **M07.5**: substitute `Ty::Param(name)` occurrences in `ty` with the
+/// concrete types from `subst`. Used at frame-entry to lower a generic
+/// fn's params from `Ty::Param("T")` to e.g. `Ty::Int(I32)` per the
+/// call-site substitution recorded in `TypeMap.call_substs`.
+fn apply_subst_ty(ty: &Ty, subst: &std::collections::HashMap<String, Ty>) -> Ty {
+    if subst.is_empty() {
+        return ty.clone();
+    }
+    match ty {
+        Ty::Param(name) => subst.get(name).cloned().unwrap_or_else(|| ty.clone()),
+        Ty::Struct { name, fields, type_args } => {
+            let new_fields = fields
+                .iter()
+                .map(|(fname, fty)| (fname.clone(), apply_subst_ty(fty, subst)))
+                .collect();
+            let new_args = type_args.iter().map(|t| apply_subst_ty(t, subst)).collect();
+            Ty::Struct {
+                name: name.clone(),
+                fields: new_fields,
+                type_args: new_args,
+            }
+        }
+        Ty::Ref { inner, mutable } => Ty::Ref {
+            inner: Box::new(apply_subst_ty(inner, subst)),
+            mutable: *mutable,
+        },
+        Ty::Box(inner) => Ty::Box(Box::new(apply_subst_ty(inner, subst))),
+        Ty::Vec(inner) => Ty::Vec(Box::new(apply_subst_ty(inner, subst))),
+        Ty::Slice(inner) => Ty::Slice(Box::new(apply_subst_ty(inner, subst))),
+        Ty::Array(inner, n) => Ty::Array(Box::new(apply_subst_ty(inner, subst)), *n),
+        Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Unit | Ty::String | Ty::Str => ty.clone(),
+    }
+}
+
 /// **M07**: bytes occupied by a value of the given type. Used to size heap
 /// allocations realistically — `Box<f32>` allocates 4 bytes, `Box<f64>` 8,
 /// `Vec<u8>` cap=N allocates N bytes, `Vec<i32>` cap=N allocates 4*N.
@@ -183,6 +217,9 @@ fn ty_size_bytes(ty: &Ty) -> u32 {
         // M07.4: struct is the sum of its field sizes (no padding — the
         // pedagogical visualization shows a packed layout).
         Ty::Struct { fields, .. } => fields.iter().map(|(_, t)| ty_size_bytes(t)).sum(),
+        // M07.5: type parameter — unreachable at eval time (typeck
+        // substitutes before any sizing query). Defensive: 0.
+        Ty::Param(_) => 0,
     }
 }
 
@@ -660,7 +697,29 @@ impl<'a> Evaluator<'a> {
 
     fn call_fn(&mut self, fn_binding: BindingId, args: Vec<Value>, call_span: Span) -> Value {
         let decl = self.fn_decls[&fn_binding];
-        self.call_decl(decl, &decl.name.clone(), args, call_span)
+        // **M07.5**: for generic-fn calls, build the mangled name from
+        // typeck's per-call-site substitution record. Non-generic calls
+        // get the bare fn name (existing M07.4 behavior).
+        let display = self.mangle_fn_name(&decl.name, call_span);
+        self.call_decl(decl, &display, args, call_span)
+    }
+
+    /// **M07.5**: build the mangled display name for a call. Looks up
+    /// `types.call_substs[call_span]`. If a substitution was recorded
+    /// (generic call), returns `"source::<ty1, ty2>"`. Otherwise returns
+    /// the bare source name.
+    fn mangle_fn_name(&self, source_name: &str, call_span: Span) -> String {
+        match self.types.call_substs.get(&call_span) {
+            Some(subst) if !subst.is_empty() => {
+                let args = subst
+                    .iter()
+                    .map(|(_, t)| t.name())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{source_name}::<{args}>")
+            }
+            _ => source_name.to_owned(),
+        }
     }
 
     /// **M07.4**: shared call-frame entry. Used by both free-fn calls
@@ -721,11 +780,23 @@ impl<'a> Evaluator<'a> {
             scopes: vec![Scope { locals: Vec::new(), borrows: Vec::new(), heap_allocs: Vec::new() }],
         });
 
+        // **M07.5**: pre-build a per-call substitution map for type-param
+        // substitution at SlotAlloc emission time. Without this, generic
+        // params would carry `Ty::Param("T")` in SlotAlloc events; with
+        // this, they carry the substituted concrete type (e.g. Ty::Int(I32)
+        // for `id::<i32>(5)`).
+        let call_subst: std::collections::HashMap<String, Ty> = self
+            .types
+            .call_substs
+            .get(&call_span)
+            .map(|v| v.iter().cloned().collect())
+            .unwrap_or_default();
         // Emit per-param SlotAlloc + SlotWrite and push the locals.
         for (binding_id, slot_id, name, value, decl_span) in param_slots {
             let ty = self
                 .lookup_var_ty(binding_id)
                 .expect("param has BindingType::Var(_) after typeck");
+            let ty = apply_subst_ty(&ty, &call_subst);
             self.events.push(MemEvent::SlotAlloc {
                 slot_id,
                 name: name.clone(),
@@ -1517,7 +1588,7 @@ impl<'a> Evaluator<'a> {
             // shorthand via the local binding lookup), build
             // `Value::Struct { name, fields }` in declaration order
             // (drives byte layout and rendering).
-            ast::Expr::StructLit { path, fields, span } => {
+            ast::Expr::StructLit { path, fields, span, .. } => {
                 // Recover the struct's schema from typeck's recorded type
                 // on this expression's span. We need the declared field
                 // order (not the source order of the literal's inits).
@@ -1697,19 +1768,42 @@ impl<'a> Evaluator<'a> {
             _ => {
                 // **M07.4**: user-defined associated function. Look up the
                 // FnDecl, evaluate args, enter a new frame. No `self`.
+                // **M07.5**: single-segment turbofish (`id::<bool>(false)`)
+                // — look up the free-fn in fn_decls by name instead of
+                // assoc_fns (multi-segment).
                 let key: Vec<String> = segments.to_vec();
-                let decl = self
-                    .assoc_fns
-                    .get(&key)
-                    .copied()
-                    .expect("typeck verified the assoc fn exists");
+                let decl = if segments.len() == 1 {
+                    let bid = self
+                        .resolution
+                        .bindings
+                        .iter()
+                        .find_map(|(id, d)| {
+                            if matches!(d.kind, crate::resolve::BindingKind::Fn)
+                                && d.name == segments[0]
+                            {
+                                Some(*id)
+                            } else {
+                                None
+                            }
+                        })
+                        .expect("typeck verified the turbofish free-fn exists");
+                    self.fn_decls[&bid]
+                } else {
+                    self.assoc_fns
+                        .get(&key)
+                        .copied()
+                        .expect("typeck verified the assoc fn exists")
+                };
                 let mut arg_values: Vec<Value> = Vec::with_capacity(args.len());
                 for arg in args {
                     let v = self.eval_expr(arg);
                     if self.halted { return Value::Unit; }
                     arg_values.push(v);
                 }
-                let display = segments.join("::");
+                // **M07.5**: mangled name if typeck recorded a substitution
+                // for this call site (generic assoc fn).
+                let base = segments.join("::");
+                let display = self.mangle_fn_name(&base, span);
                 self.call_decl(decl, &display, arg_values, span)
             }
         }
@@ -1884,7 +1978,10 @@ impl<'a> Evaluator<'a> {
                     if self.halted { return Value::Unit; }
                     arg_values.push(v);
                 }
-                let display = format!("{struct_name}::{name}");
+                // **M07.5**: mangled name if typeck recorded a substitution
+                // for this call site (generic method); otherwise bare.
+                let base = format!("{struct_name}::{name}");
+                let display = self.mangle_fn_name(&base, span);
                 self.call_decl(method_decl, &display, arg_values, span)
             }
         }

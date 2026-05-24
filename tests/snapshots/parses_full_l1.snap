@@ -8,6 +8,7 @@ Ok(
             Fn(
                 FnDecl {
                     name: "add",
+                    type_params: [],
                     params: [
                         Param {
                             name: "x",
@@ -15,6 +16,7 @@ Ok(
                                 segments: [
                                     "i32",
                                 ],
+                                type_args: [],
                                 span: Span {
                                     start: 46,
                                     end: 49,
@@ -38,6 +40,7 @@ Ok(
                                 segments: [
                                     "i32",
                                 ],
+                                type_args: [],
                                 span: Span {
                                     start: 54,
                                     end: 57,
@@ -61,6 +64,7 @@ Ok(
                             segments: [
                                 "i32",
                             ],
+                            type_args: [],
                             span: Span {
                                 start: 62,
                                 end: 65,
@@ -124,6 +128,7 @@ Ok(
             Fn(
                 FnDecl {
                     name: "main",
+                    type_params: [],
                     params: [],
                     return_ty: None,
                     body: Block {

@@ -1467,4 +1467,179 @@ mod tests {
         )).count();
         assert_eq!(heap_count, 0, "struct-only programs must emit zero heap events");
     }
+
+    // ─── M07.5 / US1: generic identity fn with monomorphization ─────────
+
+    /// `fn id<T>(x: T) -> T { x } let a = id(5); let b = id(true);` —
+    /// monomorphization-visible pedagogy. Two distinct FrameEnter events
+    /// with mangled fn_name (`id::<i32>` and `id::<bool>`). Param + return
+    /// types carry the substituted concrete types.
+    #[test]
+    fn run_pipeline_generic_id_fn() {
+        let source = "fn id<T>(x: T) -> T {\n    x\n}\nfn main() {\n    let a = id(5);\n    let b = id(true);\n}\n";
+        let events = run_pipeline(source).expect("generic id fn compiles");
+        let id_i32 = events.iter().any(|e| matches!(e,
+            crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "id::<i32>"
+        ));
+        let id_bool = events.iter().any(|e| matches!(e,
+            crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "id::<bool>"
+        ));
+        assert!(id_i32, "expected FrameEnter `id::<i32>`");
+        assert!(id_bool, "expected FrameEnter `id::<bool>`");
+        // Param x slot carries concrete (substituted) types per call.
+        let x_i32 = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotAlloc { name, ty: crate::Ty::Int(crate::typeck::IntKind::I32), .. } if name == "x"
+        ));
+        let x_bool = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotAlloc { name, ty: crate::Ty::Bool, .. } if name == "x"
+        ));
+        assert!(x_i32, "expected SlotAlloc `x : i32` in id::<i32>");
+        assert!(x_bool, "expected SlotAlloc `x : bool` in id::<bool>");
+    }
+
+    /// `fn pair<T>(a: T, b: T) -> T { a } let _ = pair(5, true);` —
+    /// typeck error: cannot infer T from conflicting args.
+    #[test]
+    fn run_pipeline_generic_inference_mismatch() {
+        let source = "fn pair<T>(a: T, b: T) -> T {\n    a\n}\nfn main() {\n    let _ = pair(5, true);\n}\n";
+        let err = run_pipeline(source).expect_err("inference mismatch should fail typeck");
+        assert_eq!(err.stage, CompileStage::Typeck);
+        assert!(
+            err.message.contains("cannot infer") && err.message.contains("conflicting"),
+            "expected 'cannot infer ... conflicting' error, got: `{}`",
+            err.message
+        );
+    }
+
+    // ─── M07.5 / US2: generic struct ─────────────────────────────────────
+
+    /// `struct Wrapper<T> { v: T } let w = Wrapper { v: 5 }; let a = w.v;`
+    /// — w renders as `Wrapper<i32>` (substituted), field access yields 5_i32.
+    #[test]
+    fn run_pipeline_generic_struct() {
+        let source = "struct Wrapper<T> {\n    v: T,\n}\nfn main() {\n    let w = Wrapper { v: 5 };\n    let a = w.v;\n}\n";
+        let events = run_pipeline(source).expect("generic struct compiles");
+        // SlotWrite for w carries Value::Struct { name: "Wrapper", fields: [("v", Int{I32, 5})] }.
+        let w_write = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite {
+                value: crate::Value::Struct { name, fields },
+                ..
+            } if name == "Wrapper"
+                && matches!(&fields[0], (n, crate::Value::Int { bits: 5, .. }) if n == "v")
+        ));
+        assert!(w_write, "expected SlotWrite of Value::Struct(Wrapper, [(v, 5)])");
+        // SlotAlloc for w carries Ty::Struct { name: "Wrapper", type_args: [Int(I32)], .. }.
+        let w_alloc = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotAlloc {
+                name,
+                ty: crate::Ty::Struct { name: tn, type_args, .. },
+                ..
+            } if name == "w" && tn == "Wrapper" && type_args.len() == 1
+                && matches!(&type_args[0], crate::Ty::Int(crate::typeck::IntKind::I32))
+        ));
+        assert!(w_alloc, "expected SlotAlloc with type_args [Int(I32)]");
+        // a = w.v = 5_i32.
+        let a_write = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite {
+                value: crate::Value::Int { kind: crate::typeck::IntKind::I32, bits: 5 },
+                ..
+            }
+        ));
+        assert!(a_write, "expected a = 5_i32");
+    }
+
+    /// Two instantiations of the same generic struct produce distinct
+    /// substituted Tys (Wrapper<i32> vs Wrapper<bool>).
+    #[test]
+    fn run_pipeline_generic_struct_two_instantiations() {
+        let source = "struct Wrapper<T> {\n    v: T,\n}\nfn main() {\n    let w1 = Wrapper { v: 5 };\n    let w2 = Wrapper { v: true };\n}\n";
+        let events = run_pipeline(source).expect("compiles");
+        let i32_alloc = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotAlloc {
+                ty: crate::Ty::Struct { name, type_args, .. },
+                ..
+            } if name == "Wrapper" && matches!(type_args.first(), Some(crate::Ty::Int(crate::typeck::IntKind::I32)))
+        ));
+        let bool_alloc = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotAlloc {
+                ty: crate::Ty::Struct { name, type_args, .. },
+                ..
+            } if name == "Wrapper" && matches!(type_args.first(), Some(crate::Ty::Bool))
+        ));
+        assert!(i32_alloc, "expected Wrapper<i32> SlotAlloc");
+        assert!(bool_alloc, "expected Wrapper<bool> SlotAlloc");
+    }
+
+    // ─── M07.5 / US3: turbofish call ─────────────────────────────────────
+
+    /// `let v = id::<bool>(false);` — explicit type-arg pins T=bool;
+    /// frame labeled `id::<bool>`; v's SlotWrite carries Value::Bool(false).
+    #[test]
+    fn run_pipeline_turbofish() {
+        let source = "fn id<T>(x: T) -> T {\n    x\n}\nfn main() {\n    let v = id::<bool>(false);\n}\n";
+        let events = run_pipeline(source).expect("turbofish compiles");
+        let frame = events.iter().any(|e| matches!(e,
+            crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "id::<bool>"
+        ));
+        assert!(frame, "expected FrameEnter `id::<bool>`");
+        let v_write = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite { value: crate::Value::Bool(false), .. }
+        ));
+        assert!(v_write, "expected v = false");
+    }
+
+    /// `let v = id::<bool>(5);` — turbofish pins T=bool; arg is i32 →
+    /// typeck error.
+    #[test]
+    fn run_pipeline_turbofish_type_mismatch() {
+        let source = "fn id<T>(x: T) -> T {\n    x\n}\nfn main() {\n    let v = id::<bool>(5);\n}\n";
+        let err = run_pipeline(source).expect_err("turbofish mismatch should fail");
+        assert_eq!(err.stage, CompileStage::Typeck);
+        assert!(
+            err.message.contains("expected `bool`") && err.message.contains("found `i32`"),
+            "expected type-mismatch error mentioning bool + i32, got: `{}`",
+            err.message
+        );
+    }
+
+    // ─── M07.5 / rejection tests (out-of-scope shapes) ──────────────────
+
+    /// `fn pair<T, U>(...)` — typeck error: M07.5 supports single type-param.
+    #[test]
+    fn run_pipeline_generic_multi_param_rejected() {
+        let source = "fn pair<T, U>(a: T, b: U) -> T {\n    a\n}\nfn main() {\n    let _ = pair(5, true);\n}\n";
+        let err = run_pipeline(source).expect_err("multi-T should fail");
+        assert_eq!(err.stage, CompileStage::Typeck);
+        assert!(
+            err.message.contains("single type parameter"),
+            "expected single-param restriction error, got: `{}`",
+            err.message
+        );
+    }
+
+    /// `fn id<T: Foo>(...)` — typeck error: bounds deferred to M07.6.
+    #[test]
+    fn run_pipeline_generic_bound_rejected() {
+        let source = "fn id<T: Foo>(x: T) -> T {\n    x\n}\nfn main() {\n    let _ = id(5);\n}\n";
+        let err = run_pipeline(source).expect_err("bound should fail");
+        assert_eq!(err.stage, CompileStage::Typeck);
+        assert!(
+            err.message.contains("M07.6"),
+            "expected M07.6-pointer error, got: `{}`",
+            err.message
+        );
+    }
+
+    /// `fn outer<T>(x: T) -> T { id::<T>(x) }` — nested generic call rejected.
+    #[test]
+    fn run_pipeline_generic_nested_call_rejected() {
+        let source = "fn id<T>(x: T) -> T {\n    x\n}\nfn outer<T>(x: T) -> T {\n    id::<T>(x)\n}\nfn main() {\n    let _ = outer(5);\n}\n";
+        let err = run_pipeline(source).expect_err("nested generic call should fail");
+        assert_eq!(err.stage, CompileStage::Typeck);
+        assert!(
+            err.message.contains("out of scope in M07.5") || err.message.contains("inside another generic"),
+            "expected nested-call error, got: `{}`",
+            err.message
+        );
+    }
 }

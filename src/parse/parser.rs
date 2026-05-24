@@ -2,7 +2,7 @@
 
 use super::ast::{
     BinOp, Block, Expr, FnDecl, ImplBlock, Item, LetStmt, Param, ParamKind, Program, Stmt,
-    StructDecl, StructField, StructLitField, Type, UnOp,
+    StructDecl, StructField, StructLitField, Type, TypeParam, UnOp,
 };
 use super::error::ParseError;
 use super::span::{FileId, Span, SourceMap};
@@ -115,11 +115,43 @@ impl Parser {
         }
     }
 
+    /// **M07.5**: parse optional `<T>` / `<T, U>` type-parameter list. Bound
+    /// syntax `<T: Foo>` is parser-accepted (bound parsed and discarded
+    /// here — typeck rejects with the M07.6-pointer error). Multi-param
+    /// lists are parser-accepted too; typeck rejects.
+    fn parse_type_params(&mut self) -> Result<Vec<TypeParam>, ParseError> {
+        if !self.at(&TokenKind::Lt) {
+            return Ok(Vec::new());
+        }
+        self.bump(); // `<`
+        let mut params = Vec::new();
+        while !self.at(&TokenKind::Gt) {
+            let name_span = self.peek().span;
+            let name = self.expect_ident("type parameter name")?;
+            // **M07.5**: bound syntax `T: Foo` accepted at parse; typeck
+            // rejects with an M07.6-pointer message. Bound captured on
+            // TypeParam so typeck can see it.
+            let bound = if self.bump_if(&TokenKind::Colon).is_some() {
+                Some(self.expect_ident("trait name in bound")?)
+            } else {
+                None
+            };
+            params.push(TypeParam { name, bound, span: name_span });
+            if self.bump_if(&TokenKind::Comma).is_none() {
+                break;
+            }
+        }
+        self.expect(&TokenKind::Gt, "`>`")?;
+        Ok(params)
+    }
+
     /// **M07.4**: `struct Name { f1: T1, f2: T2 }`. At least one field
     /// required — empty structs rejected at parse time with a clear message.
+    /// **M07.5**: optional `<T>` between name and `{`.
     fn parse_struct_decl(&mut self) -> Result<StructDecl, ParseError> {
         let kw = self.expect(&TokenKind::Struct, "`struct`")?;
         let name = self.expect_ident("struct name")?;
+        let type_params = self.parse_type_params()?;
         self.expect(&TokenKind::LBrace, "`{`")?;
         let mut fields = Vec::new();
         let mut field_names: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -153,6 +185,7 @@ impl Parser {
         }
         Ok(StructDecl {
             name,
+            type_params,
             fields,
             span: kw.span.merge(rbrace.span),
         })
@@ -179,6 +212,7 @@ impl Parser {
     fn parse_fn_decl(&mut self) -> Result<FnDecl, ParseError> {
         let fn_kw = self.expect(&TokenKind::Fn, "`fn`")?;
         let name = self.expect_ident("function name")?;
+        let type_params = self.parse_type_params()?;
         self.expect(&TokenKind::LParen, "`(`")?;
         let mut params = Vec::new();
         let mut idx = 0usize;
@@ -199,6 +233,7 @@ impl Parser {
         let span = fn_kw.span.merge(body.span);
         Ok(FnDecl {
             name,
+            type_params,
             params,
             return_ty,
             body,
@@ -259,6 +294,7 @@ impl Parser {
                 let end_span = self_tok.span;
                 let placeholder_inner = Type::Path {
                     segments: vec!["__SelfPlaceholder".to_owned()],
+                    type_args: Vec::new(),
                     span: end_span,
                 };
                 let ty = match kind {
@@ -361,9 +397,10 @@ impl Parser {
         // M01 supports single-segment paths only; `::` tokenizer support is M02+.
         let segment_span = self.peek().span;
         let segment = self.expect_ident("type")?;
-        // **M07**: optional generic args `<T>` after the type name.
-        // Recognized for `Box<T>` and `Vec<T>`; typeck validates the segment
-        // name + arity. `String` parses as a bare Path with no generics.
+        // **M07** + **M07.5**: optional generic args `<T>` after the type name.
+        // Box/Vec route to `Type::Generic` (existing M07 typeck dispatch
+        // expects that shape). User-defined generic types (`Wrapper<i32>`)
+        // route to `Type::Path { type_args }` (M07.5).
         if self.at(&TokenKind::Lt) {
             let lt = self.bump();
             let mut args = Vec::new();
@@ -374,14 +411,23 @@ impl Parser {
                 }
             }
             let gt = self.expect(&TokenKind::Gt, "`>`")?;
-            return Ok(Type::Generic {
+            if segment == "Box" || segment == "Vec" {
+                return Ok(Type::Generic {
+                    segments: vec![segment],
+                    args,
+                    span: segment_span.merge(gt.span).merge(lt.span),
+                });
+            }
+            // M07.5: user-defined generic type.
+            return Ok(Type::Path {
                 segments: vec![segment],
-                args,
+                type_args: args,
                 span: segment_span.merge(gt.span).merge(lt.span),
             });
         }
         Ok(Type::Path {
             segments: vec![segment],
+            type_args: Vec::new(),
             span: segment_span,
         })
     }
@@ -667,17 +713,55 @@ impl Parser {
                 let name = name.clone();
                 let start_tok = self.bump();
                 // **M07**: if followed by `::Ident`, parse as multi-segment Path.
+                // **M07.5**: turbofish — after a `::`, if `Lt` follows (no
+                // intervening segment), parse type-args. Pattern:
+                //   `id::<bool>(...)` — turbofish call
+                //   `Wrapper::<i32> { ... }` — turbofish struct lit
                 if self.at(&TokenKind::ColonColon) {
                     let mut segments = vec![name];
                     let mut end_span = start_tok.span;
+                    let mut type_args: Vec<Type> = Vec::new();
                     while self.bump_if(&TokenKind::ColonColon).is_some() {
+                        // M07.5 turbofish: `::<` immediately after the last
+                        // segment we've consumed.
+                        if self.at(&TokenKind::Lt) {
+                            self.bump(); // `<`
+                            // M07.5 turbofish: re-enable struct literals
+                            // inside type args (defensive — unlikely but
+                            // keeps the cond-position flag consistent).
+                            let prev_restrict =
+                                std::mem::replace(&mut self.restrict_struct_lit, false);
+                            loop {
+                                type_args.push(self.parse_type()?);
+                                if self.bump_if(&TokenKind::Comma).is_none() {
+                                    break;
+                                }
+                            }
+                            self.restrict_struct_lit = prev_restrict;
+                            let gt = self.expect(&TokenKind::Gt, "`>`")?;
+                            end_span = gt.span;
+                            // Turbofish ends the path; no more `::Ident` after.
+                            break;
+                        }
                         let seg_tok = self.peek().clone();
                         let seg = self.expect_ident("path segment")?;
                         segments.push(seg);
                         end_span = seg_tok.span;
                     }
+                    // M07.5: turbofish struct literal `Wrapper::<i32> { v: 5 }`.
+                    if !type_args.is_empty()
+                        && self.at(&TokenKind::LBrace)
+                        && !self.restrict_struct_lit
+                    {
+                        return self.parse_struct_lit_with_args(
+                            segments,
+                            type_args,
+                            start_tok.span,
+                        );
+                    }
                     Ok(Expr::Path {
                         segments,
+                        type_args,
                         span: start_tok.span.merge(end_span),
                     })
                 } else if self.at(&TokenKind::LBrace) && !self.restrict_struct_lit {
@@ -804,6 +888,18 @@ impl Parser {
         path: Vec<String>,
         path_start_span: Span,
     ) -> Result<Expr, ParseError> {
+        self.parse_struct_lit_with_args(path, Vec::new(), path_start_span)
+    }
+
+    /// **M07.5**: `Wrapper::<i32> { v: 5 }` — same as `parse_struct_lit` but
+    /// the path carries turbofish `type_args`. Used for explicit-annotation
+    /// generic struct literals.
+    fn parse_struct_lit_with_args(
+        &mut self,
+        path: Vec<String>,
+        type_args: Vec<Type>,
+        path_start_span: Span,
+    ) -> Result<Expr, ParseError> {
         self.expect(&TokenKind::LBrace, "`{`")?;
         // **M07.4**: struct-literal field VALUES are arbitrary expressions
         // and not in cond-position — re-enable struct literals (in case
@@ -834,6 +930,7 @@ impl Parser {
         let rbrace = self.expect(&TokenKind::RBrace, "`}`")?;
         Ok(Expr::StructLit {
             path,
+            type_args,
             fields,
             span: path_start_span.merge(rbrace.span),
         })

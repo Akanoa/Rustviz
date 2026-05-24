@@ -34,10 +34,25 @@ pub enum Item {
 pub struct StructDecl {
     /// Type name (e.g. `"Point"`).
     pub name: String,
+    /// **M07.5**: type parameters (`<T>`). Empty for non-generic structs.
+    pub type_params: Vec<TypeParam>,
     /// Fields in declaration order. At least one — order drives byte layout
     /// AND drop order.
     pub fields: Vec<StructField>,
     /// Span from `struct` keyword through closing `}`.
+    pub span: Span,
+}
+
+/// **M07.5**: type parameter declared on a fn or struct.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeParam {
+    /// Type parameter name (e.g. `"T"`).
+    pub name: String,
+    /// **M07.5**: bound trait name if specified (`T: Foo` → `Some("Foo")`).
+    /// Parser-accepted for forward-compat; typeck rejects with an
+    /// M07.6-pointer error.
+    pub bound: Option<String>,
+    /// Span covering the name.
     pub span: Span,
 }
 
@@ -69,6 +84,8 @@ pub struct ImplBlock {
 pub struct FnDecl {
     /// Function name.
     pub name: String,
+    /// **M07.5**: type parameters (`<T>`). Empty for non-generic fns.
+    pub type_params: Vec<TypeParam>,
     /// Parameter list (may be empty).
     pub params: Vec<Param>,
     /// Optional return type annotation (after `->`).
@@ -110,10 +127,15 @@ pub enum ParamKind {
 /// A type annotation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Type {
-    /// Path-like type (e.g. `i32`, `std::option::Option`).
+    /// Path-like type (e.g. `i32`, `std::option::Option`, `Wrapper<i32>`).
     Path {
         /// Path segments split on `::`.
         segments: Vec<String>,
+        /// **M07.5**: type-args list for `Wrapper<i32>` annotations. Empty
+        /// for plain `i32`/`bool` etc. M07 generic built-ins (Box<T>, Vec<T>)
+        /// continue to use `Type::Generic`; M07.5+ uses this field for
+        /// user-defined generic types.
+        type_args: Vec<Type>,
         /// Span covering the path.
         span: Span,
     },
@@ -304,6 +326,9 @@ pub enum Expr {
     Path {
         /// Path segments (≥ 2).
         segments: Vec<String>,
+        /// **M07.5**: turbofish type-args (`id::<bool>`, `Wrapper::<i32>`).
+        /// Empty for non-turbofish paths (e.g. `Vec::new`).
+        type_args: Vec<Type>,
         /// Span covering the path.
         span: Span,
     },
@@ -353,6 +378,9 @@ pub enum Expr {
     StructLit {
         /// Path segments naming the struct type. `["Point"]` in M07.4.
         path: Vec<String>,
+        /// **M07.5**: turbofish type-args (`Wrapper::<i32> { v: 5 }`).
+        /// Empty for the inferred case (`Wrapper { v: 5 }`).
+        type_args: Vec<Type>,
         /// Field initializers in source order.
         fields: Vec<StructLitField>,
         /// Span from path start through closing `}`.
