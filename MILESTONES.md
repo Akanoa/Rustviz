@@ -17,7 +17,9 @@ M01 ──► M02 ──► M03 ──► M04 ──► M05 ──► M06 ──
 M03 ──► M03.1     # additive protocol revision; M04+ consume it once shipped
 M07 ──► M07.1 ──► M07.2  # slices, then &str + static memory
             └──► M07.3   # arrays (sibling of M07.2; both depend only on M07.1)
-            └──► M07.4   # structs + impl/methods (depends on M07.3 inline-cell pattern)
+            └──► M07.4 ──► M07.5 ──► M07.6
+                            # structs/impl → generics → traits
+                            # M07.5 unlocks `T:` payoff; M07.6 layers static dispatch on top
 ```
 
 Acyclic. The drawn order is one valid topological sort. Edges from M03 to M05–M08 are real direct dependencies (each later milestone fills payloads in the event enum M03 defines), not just transitive. **M03.1** is a *revision* milestone — it patches M03's event protocol after M03 closed, based on pedagogical issues uncovered during M04's manual QA. Revisions don't sit in the main chain; they hang off the milestone they patch and improve downstream milestones' behavior once shipped.
@@ -576,7 +578,7 @@ Acyclic. The drawn order is one valid topological sort. Edges from M03 to M05–
 ### M07.4 — Structs + impl blocks (named-field composite types with methods)
 
 - **Kind**: feature (revision-style — fills a Level-3 gap by introducing user-defined composite types, completing the in-the-language tools learners need to model their own data)
-- **Status**: planned
+- **Status**: shipped (commit `eabacb5`)
 - **Complexity**: XL (modules: 5, bullets: 9, boundaries: 3)
 - **Depends on**: M07.3
 - **Authority**: CLAUDE.md › Pedagogical goal › "Give a newcomer concrete intuition for Rust's memory mechanics: moves, borrows, lifetimes, drops, heap allocations" — structs are the primary tool a learner uses to MODEL data once they've understood primitives + sequences. Without structs, every example is a synthetic toy. CLAUDE.md › Supported Rust subset doesn't explicitly enumerate `struct`, but the broader pedagogical goal of "make Rust's memory mechanics tangible" requires the type system's core composite-type primitive.
@@ -628,6 +630,106 @@ Acyclic. The drawn order is one valid topological sort. Edges from M03 to M05–
 **Demo.** Browser. `m07_4_struct_basic.rs` (`struct Point { x: i32, y: i32 } let p = Point { x: 1, y: 2 }; let a = p.x;`): stack slot shows `p : Point` with two byte-cell strips. `m07_4_field_borrow.rs`: `&p.x` produces a slot-target arrow with `.x` field annotation. `m07_4_method.rs`: defines `impl Point { fn x(&self) -> i32 { self.x } }` and calls `p.x()` — dispatches via the impl registry. `m07_4_associated_fn.rs`: `Point::new(1, 2)` constructs the struct via associated function call.
 
 **Notes.** Sized XL by design — adds two new top-level Items (`Struct` and `Impl`), one new `Ty::Struct` variant carrying field schema, one new `Value::Struct` variant carrying field values, and the impl-block dispatch registry. Plan-phase will likely identify a clean US split (struct decl + literal + field access as US1/P1; field borrow as US2/P1; impl/methods as US3/P1; associated functions as US4/P2). 8th invocation of the closed-enum-with-revisions rule (additive Ty::Struct + Value::Struct + possibly Value::Ref field extension). Considered splitting into M07.4 (basic structs) + M07.5 (impl/methods) — maintainer chose to bundle for cohesive pedagogy, accepting larger scope. If implementation slips XL → XXL during execution, plan-phase splits in place per the M06/M06a/M06b precedent.
+
+---
+
+### M07.5 — Generics (`fn foo<T>(...)`, `struct Wrapper<T>`, monomorphization viz)
+
+- **Kind**: feature (revision-style — adds type parameters to the function/struct surface introduced in M07.4, the foundation that M07.6 trait bounds build on)
+- **Status**: planned
+- **Complexity**: XL (modules: 5+, bullets: 8, boundaries: 2)
+- **Depends on**: M07.4
+- **Authority**: Rust language reference for generic parameters; CLAUDE.md › Pedagogical goal extension — without generics, structs/fns can't express "container that holds any T" (`Vec<T>` is hardcoded as a built-in; `Wrapper<T>` would be the first user-defined generic).
+
+**Goal.** Introduce type parameters end to end: `fn id<T>(x: T) -> T { x }`, `struct Wrapper<T> { v: T }`, and `let w = Wrapper::<i32> { v: 5 };` (turbofish for explicit param). Pedagogical headline: **monomorphization** — each concrete `T` substitution creates a distinct instantiation visible in the trace. `id::<i32>(5)` and `id::<bool>(true)` produce two distinct FrameEnter events with the substituted type names (`id::<i32>` and `id::<bool>`), making "generics are zero-cost via duplication at compile time" tangible.
+
+**In scope.**
+- **Generic-parameter syntax** on fn decls (`fn id<T>(x: T) -> T`) and struct decls (`struct Wrapper<T> { v: T }`) — single-letter type params, no bounds yet (those land in M07.6).
+- **Type parameter AST node**: extend `FnDecl` and `StructDecl` with `type_params: Vec<TypeParam { name: String, span: Span }>`.
+- **Type-variable representation in typeck**: new `Ty::Var(TyVarId)` (or `Ty::Param(String)`) for substitution during instantiation.
+- **Generic-fn typecheck**: when a fn has type params, body typecheck uses fresh type variables; call site infers + substitutes (simple unification — no full HM, just direct-match).
+- **Turbofish call** `id::<i32>(5)` for explicit type annotation; bare `id(5)` infers from arg types.
+- **Generic struct literal**: `Wrapper::<i32> { v: 5 }` or `Wrapper { v: 5 }` (inferred).
+- **Monomorphization trace**: each call-site's frame name reflects the substituted types — `id::<i32>` vs `id::<bool>` — drives the pedagogy "the same source fn produces distinct frames per substitution".
+- **Restrictions** preserving manageable scope: single-letter type params (T, U, V…); one type param per fn/struct (no `<T, U>`); no bounds (`T: Foo` deferred to M07.6); no higher-kinded; no lifetimes-as-generics (lifetimes elided as before); no const generics.
+
+**Out of scope.**
+- **Trait bounds** (`T: Foo`) — deferred to M07.6.
+- **Multiple type params** (`fn pair<T, U>(...)`) — deferred. Single-T is enough for the headline pedagogy.
+- **Where clauses** — deferred.
+- **Lifetime parameters** as explicit generics — deferred (existing scope-level lifetime handling stays).
+- **Const generics** (`Wrapper<T, const N: usize>`) — deferred.
+- **GATs / higher-kinded types** — never.
+- **Default type params** — deferred.
+
+**Entry criteria.**
+- M07.4 closed (struct + impl + method dispatch infrastructure that generic impls layer onto).
+
+**Exit criteria.**
+- `fn id<T>(x: T) -> T { x }` typechecks; `let a = id(5); let b = id(true);` both work; the trace shows two distinct frames `id::<i32>` and `id::<bool>`.
+- `struct Wrapper<T> { v: T } let w = Wrapper { v: 5 };` typechecks; w's slot shows `Wrapper<i32>` with the inner `v: i32` field rendering identically to a non-generic struct.
+- Turbofish `id::<bool>(false)` works.
+- Mismatched type arg (`id::<bool>(5)`) → typeck error with both types named.
+- ≥ 3 new `m07_5_*.rs` reference programs ship: identity fn, generic wrapper struct, monomorphization-shows-distinct-frames.
+- All M01–M07.4 tests pass byte-identical.
+- WASM bundle growth ≤ +20% vs M07.4 baseline.
+
+**Demo.** Browser. `m07_5_id_fn.rs`: `id(5); id(true);` — observe two distinct `id::<i32>` and `id::<bool>` frames. `m07_5_generic_struct.rs`: `Wrapper { v: 5 }` renders as `Wrapper<i32>` in the slot's type column. `m07_5_turbofish.rs`: `id::<bool>(false)` with explicit type arg.
+
+**Notes.** Sized XL. 9th invocation of the closed-enum-with-revisions rule (additive `Ty::Var(_)` or `Ty::Param(_)` for substitution). The headline pedagogy isn't the syntax but the **monomorphization visibility** — distinct frames per substitution makes the cost model tangible. M07.5 doesn't enable polymorphism on its own (no `T: Trait` bounds); the payoff lands in M07.6 when bounds become expressible.
+
+---
+
+### M07.6 — Traits (declarations, impls, static dispatch via bounds)
+
+- **Kind**: feature (revision-style — adds polymorphism to the user-defined-types surface; turns M07.5's `T` into a useful constraint mechanism via `T: Trait` bounds)
+- **Status**: planned
+- **Complexity**: XL (modules: 5+, bullets: 10, boundaries: 3)
+- **Depends on**: M07.5 (generics — `T: Trait` bound is the headline payoff)
+- **Authority**: Rust language reference for trait declarations + inherent impls + trait bounds; CLAUDE.md › Pedagogical goal — traits ARE Rust's polymorphism mechanism; without them the language feels half-built after M07.4 introduces user types.
+
+**Goal.** Introduce trait declarations + trait impls + trait-bound generics. Headline scenario: `trait Show { fn show(&self) -> String; } impl Show for Point { fn show(&self) -> String { ... } } fn print<T: Show>(x: T) { ... }`. Method dispatch extended with a third layer (builtins → inherent impls → trait impls). Static dispatch only — `&dyn Trait` and vtables deferred.
+
+**In scope.**
+- **Trait declaration**: `trait Foo { fn bar(&self) -> i32; fn baz(&self) -> i32 { self.bar() + 1 } }` as a new `Item::Trait { name, items, span }`. Items are fn signatures (no body — required method) or fn decls (with body — default method).
+- **Trait impl block**: `impl Foo for Point { fn bar(&self) -> i32 { self.x } }` as `Item::Impl { trait_name: Option<String>, ty_name, items, span }` (extends M07.4's `Item::Impl` with optional trait_name).
+- **TraitRegistry + TraitImplRegistry** at typeck: trait_name → required+default methods; (trait_name, struct_name) → method overrides.
+- **Method dispatch — third layer**: extends M07.4's fall-through (builtins → inherent → trait impls). For `p.bar()` where `p: Point`: try Point's inherent impl first; if missing, search trait impls in scope; pick the matching one. Ambiguity (two traits define `bar`) → error with both candidates.
+- **Default methods**: when a trait provides a default body and the impl doesn't override, dispatch resolves to the default.
+- **Trait bounds on generics**: `fn print<T: Show>(x: T) { x.show(); }` — the body can call `x.show()` because the bound proves it. Call site checks the arg's type implements Show.
+- **Multiple bounds** via `+`: `fn print<T: Show + Clone>(x: T)` — both traits available in the body.
+- **Restrictions**: static dispatch only (no `&dyn Foo`); single-trait-per-bound chain (no nested generics like `T: Foo<Bar>`); no associated types / consts on traits; no supertraits; no blanket impls; no derive macros for traits.
+
+**Out of scope.**
+- **Trait objects `&dyn Foo`** — needs vtable machinery + heap-or-table representation; deferred to a future "dynamic dispatch" milestone if pedagogically valuable.
+- **Associated types** (`trait Iter { type Item; fn next(&mut self) -> Option<Self::Item>; }`) — deferred.
+- **Associated consts** on traits — deferred.
+- **Supertraits** (`trait Foo: Bar`) — deferred.
+- **Blanket impls** (`impl<T: Foo> Bar for T`) — deferred.
+- **Derive macros** (`#[derive(Debug, Clone)]`) — deferred (would need built-in implementations for the std traits).
+- **Trait inheritance / multiple inheritance edge cases** — out of scope by virtue of the no-supertrait restriction.
+- **Auto-traits** (`Send`, `Sync`) — deferred to M08 when threads land.
+- **Where clauses** on traits — deferred.
+- **Trait method orphan rules** — out of scope (M07.6 has only one file; orphan rules require multi-file/crate awareness).
+
+**Entry criteria.**
+- M07.5 closed (generics + type params + monomorphization machinery).
+- M07.4 closed (inherent impl dispatch infrastructure that trait dispatch layers onto).
+
+**Exit criteria.**
+- `trait Show { fn show(&self) -> String; }` parses; `impl Show for Point { fn show(&self) -> String { ... } }` typechecks; `let s = p.show();` dispatches via the trait impl.
+- Default methods work: `trait Counter { fn count(&self) -> i32; fn double(&self) -> i32 { self.count() * 2 } }`; impl provides `count` only; `p.double()` dispatches to the default.
+- `fn print<T: Show>(x: T)` typechecks; body can call `x.show()`; call site rejects types that don't impl Show.
+- Multi-bound `fn show_n_clone<T: Show + Clone>(x: T)` works.
+- Dispatch order verified: inherent impl wins when both inherent + trait method share a name.
+- Missing required method in impl → typeck error naming the unimplemented method.
+- ≥ 4 new `m07_6_*.rs` reference programs: trait decl + impl, default method, generic bound, multi-bound.
+- All M01–M07.5 tests pass byte-identical.
+- WASM bundle growth ≤ +25% vs M07.5 baseline.
+
+**Demo.** Browser. `m07_6_trait_basic.rs`: `trait Show { fn show(&self) -> String; } impl Show for Point { ... } let s = p.show();` — dispatch resolves to the trait impl; frame opens for `Point::<Show>::show` (or similar mangled name). `m07_6_default_method.rs`: trait with default body; impl skips the override; the trait's default method body runs. `m07_6_generic_bound.rs`: `fn print<T: Show>(x: T) { let s = x.show(); }` — call site with a type implementing Show works; with one that doesn't, typeck error. `m07_6_multi_bound.rs`: `T: Show + Clone`.
+
+**Notes.** Sized XL. 10th invocation of the closed-enum-with-revisions rule (additive `Item::Trait`; extends `Item::Impl` with `trait_name: Option<String>`). The headline pedagogy is the **bound payoff** — `fn print<T: Show>` shows why generics + traits together unlock polymorphism (whereas either alone is half-built). Considered alternatives: combining generics + traits into one mega-milestone (rejected — would slip XL to XXL+); landing traits before generics (rejected — without bounds, traits feel like syntactic organization without a punch). The two-milestone sequence (M07.5 → M07.6) lets each ship a clean pedagogical headline.
 
 ---
 
