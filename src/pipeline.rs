@@ -747,6 +747,24 @@ mod tests {
         assert!(has_oob, "expected RuntimeError for OOB array slice");
     }
 
+    /// Element-type inference: an array literal's type is driven by the
+    /// first explicitly-typed element. Untyped literals follow via
+    /// literal-narrowing. `[10, 20, 30_u64]` should infer `[u64; 3]`,
+    /// not error with "i32 != u64".
+    #[test]
+    fn run_pipeline_array_lit_type_inference() {
+        let source = "fn main() { let t = [10, 20, 30_u64]; }";
+        let events = run_pipeline(source).expect("array with suffix-driven inference compiles");
+        // SlotWrite of t with Value::Array of 3 U64 elements.
+        let ok = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite {
+                value: crate::Value::Array { elements, elem_ty: crate::typeck::Ty::Int(crate::typeck::IntKind::U64) },
+                ..
+            } if elements.len() == 3
+        ));
+        assert!(ok, "expected Value::Array of 3 U64 elements (anchor = the suffixed literal)");
+    }
+
     /// **Headline pedagogical assertion** for M07.3: array-only programs
     /// emit zero heap events. The heap panel stays empty.
     #[test]

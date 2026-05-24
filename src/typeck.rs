@@ -919,25 +919,56 @@ impl<'a> Typechecker<'a> {
                 span,
             });
         }
-        let first_ty = self.typecheck_expr(&elements[0])?;
-        for el in &elements[1..] {
-            let el_ty = self.typecheck_expr(el)?;
-            // Try literal-narrowing coercion to match the first element's type.
+        // Typecheck all elements once, collecting their types (and recording
+        // their defaulted-or-explicit type on the spans). Untyped literals
+        // get defaulted (i32 / f64) at this stage.
+        let element_types: Vec<Ty> = elements
+            .iter()
+            .map(|el| self.typecheck_expr(el))
+            .collect::<Result<_, _>>()?;
+        // **Anchor selection**: an array literal's type is driven by the
+        // first explicitly-typed element (a suffixed integer/float
+        // literal, or any non-literal expression that brings its own
+        // type). Untyped literals follow — they coerce to the anchor via
+        // `try_coerce_to`. This mirrors Rust's actual inference:
+        // `[10, 20, 30_u64]` infers `[u64; 3]` because `30_u64` is the
+        // type-source; the `10` and `20` literal-narrow to u64. Without
+        // this lookup, we'd anchor on `10`'s defaulted i32 and reject
+        // the explicit u64 element with a confusing type-mismatch error.
+        let is_explicit = |el: &ast::Expr| -> bool {
+            match el {
+                ast::Expr::LitInt(_, suffix, _) => suffix.is_some(),
+                ast::Expr::LitFloat(_, suffix, _) => suffix.is_some(),
+                ast::Expr::LitBool(_, _) => true, // bool has no defaulted form
+                _ => true, // any non-literal expression has a concrete type
+            }
+        };
+        let anchor_idx = elements
+            .iter()
+            .position(is_explicit)
+            .unwrap_or(0);
+        let anchor_ty = element_types[anchor_idx].clone();
+        // Coerce + verify each remaining element against the anchor.
+        for (i, el) in elements.iter().enumerate() {
+            if i == anchor_idx {
+                continue;
+            }
+            let el_ty = element_types[i].clone();
             let coerced = self
-                .try_coerce_to(el, el_ty.clone(), first_ty.clone())
+                .try_coerce_to(el, el_ty.clone(), anchor_ty.clone())
                 .unwrap_or(el_ty);
-            if coerced != first_ty {
+            if coerced != anchor_ty {
                 return Err(ParseError {
                     message: format!(
                         "array elements must all have the same type, found `{}` (expected `{}`)",
                         coerced.name(),
-                        first_ty.name(),
+                        anchor_ty.name(),
                     ),
                     span: el.span(),
                 });
             }
         }
-        Ok(Ty::Array(Box::new(first_ty), elements.len() as u64))
+        Ok(Ty::Array(Box::new(anchor_ty), elements.len() as u64))
     }
 
     /// **M07.1**: typecheck a slice borrow `&v[range]` (or rejected `&mut v[range]`).
