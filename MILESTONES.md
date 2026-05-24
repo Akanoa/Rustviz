@@ -636,7 +636,7 @@ Acyclic. The drawn order is one valid topological sort. Edges from M03 to M05–
 ### M07.5 — Generics (`fn foo<T>(...)`, `struct Wrapper<T>`, monomorphization viz)
 
 - **Kind**: feature (revision-style — adds type parameters to the function/struct surface introduced in M07.4, the foundation that M07.6 trait bounds build on)
-- **Status**: planned
+- **Status**: shipped (commit `983995a`)
 - **Complexity**: XL (modules: 5+, bullets: 8, boundaries: 2)
 - **Depends on**: M07.4
 - **Authority**: Rust language reference for generic parameters; CLAUDE.md › Pedagogical goal extension — without generics, structs/fns can't express "container that holds any T" (`Vec<T>` is hardcoded as a built-in; `Wrapper<T>` would be the first user-defined generic).
