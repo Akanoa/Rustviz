@@ -1846,4 +1846,243 @@ mod tests {
             err.message
         );
     }
+
+    // ─── M07.7 / US1: basic `&dyn Trait` borrow + method dispatch ─────────
+
+    /// `let d: &dyn Show = &p; let s = d.show();` — vtable allocated once,
+    /// d slotted with Value::DynRef, dispatch produces a `<Point as Show>::show`
+    /// frame, s = 1_i32.
+    #[test]
+    fn run_pipeline_dyn_basic() {
+        let source = "struct Point { x: i32, y: i32 }\ntrait Show { fn show(&self) -> i32; }\nimpl Show for Point { fn show(&self) -> i32 { self.x } }\nfn main() { let p = Point { x: 1, y: 2 }; let d: &dyn Show = &p; let s = d.show(); }\n";
+        let events = run_pipeline(source).expect("dyn basic compiles");
+        let vtable_alloc = events.iter().filter(|e| matches!(e,
+            crate::MemEvent::VtableAlloc { trait_name, type_name, .. }
+                if trait_name == "Show" && type_name == "Point"
+        )).count();
+        assert_eq!(vtable_alloc, 1, "expected exactly one VtableAlloc for (Show, Point)");
+        let d_write = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite {
+                value: crate::Value::DynRef { trait_name, .. },
+                ..
+            } if trait_name == "Show"
+        ));
+        assert!(d_write, "expected SlotWrite of Value::DynRef with trait_name=Show");
+        let frame = events.iter().any(|e| matches!(e,
+            crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "<Point as Show>::show"
+        ));
+        assert!(frame, "expected FrameEnter `<Point as Show>::show`");
+        let s_write = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite {
+                value: crate::Value::Int { kind: crate::typeck::IntKind::I32, bits: 1 },
+                ..
+            }
+        ));
+        assert!(s_write, "expected s = 1_i32");
+    }
+
+    /// Coercion error: `&i32 → &dyn Show` rejected because i32: Show is not implemented.
+    #[test]
+    fn run_pipeline_dyn_coercion_error() {
+        let source = "trait Show { fn show(&self) -> i32; }\nfn main() { let n = 5_i32; let d: &dyn Show = &n; let _ = d.show(); }\n";
+        let err = run_pipeline(source).expect_err("&i32 → &dyn Show should be rejected");
+        assert_eq!(err.stage, CompileStage::Typeck);
+        assert!(
+            err.message.contains("i32") && err.message.contains("Show"),
+            "expected coercion-error mentioning i32 and Show: got `{}`",
+            err.message
+        );
+    }
+
+    /// Inherent method called through `&dyn Trait` rejected — trait objects
+    /// only expose trait methods.
+    #[test]
+    fn run_pipeline_dyn_inherent_rejected() {
+        let source = "struct Point { x: i32, y: i32 }\ntrait Show { fn show(&self) -> i32; }\nimpl Point { fn extra(&self) -> i32 { 42 } }\nimpl Show for Point { fn show(&self) -> i32 { self.x } }\nfn main() { let p = Point { x: 1, y: 2 }; let d: &dyn Show = &p; let _ = d.extra(); }\n";
+        let err = run_pipeline(source).expect_err("inherent-via-dyn should be rejected");
+        assert_eq!(err.stage, CompileStage::Typeck);
+        assert!(
+            err.message.contains("extra") && err.message.contains("Show"),
+            "expected inherent-via-dyn error mentioning method and trait: got `{}`",
+            err.message
+        );
+    }
+
+    // ─── M07.7 / US2: `&dyn Trait` parameter + implicit coercion ─────────
+
+    /// `fn print(x: &dyn Show) -> i32 { x.show() } let r = print(&p);` —
+    /// ONE `print` frame (no `print::<Point>` mangling), nested
+    /// `<Point as Show>::show` frame via vtable dispatch, r = 1_i32.
+    #[test]
+    fn run_pipeline_dyn_param() {
+        let source = "struct Point { x: i32, y: i32 }\ntrait Show { fn show(&self) -> i32; }\nimpl Show for Point { fn show(&self) -> i32 { self.x } }\nfn print(x: &dyn Show) -> i32 { x.show() }\nfn main() { let p = Point { x: 1, y: 2 }; let r = print(&p); }\n";
+        let events = run_pipeline(source).expect("dyn param compiles");
+        let outer = events.iter().any(|e| matches!(e,
+            crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "print"
+        ));
+        assert!(outer, "expected FrameEnter `print` (no monomorphization)");
+        // No mangled per-type frame should exist.
+        let mangled = events.iter().any(|e| matches!(e,
+            crate::MemEvent::FrameEnter { fn_name, .. } if fn_name.starts_with("print::<")
+        ));
+        assert!(!mangled, "should NOT see `print::<Point>` — dyn is one-frame");
+        let inner = events.iter().any(|e| matches!(e,
+            crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "<Point as Show>::show"
+        ));
+        assert!(inner, "expected nested FrameEnter `<Point as Show>::show`");
+        let r_write = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite {
+                value: crate::Value::Int { kind: crate::typeck::IntKind::I32, bits: 1 },
+                ..
+            }
+        ));
+        assert!(r_write, "expected r = 1_i32");
+    }
+
+    /// Two different concrete types passed to the SAME `print(x: &dyn Show)`
+    /// — both calls hit ONE `print` frame; each inner dispatch resolves to
+    /// the appropriate type's vtable.
+    #[test]
+    fn run_pipeline_dyn_param_two_types() {
+        let source = "struct A { v: i32 }\nstruct B { v: i32 }\ntrait Show { fn show(&self) -> i32; }\nimpl Show for A { fn show(&self) -> i32 { self.v } }\nimpl Show for B { fn show(&self) -> i32 { self.v + 100 } }\nfn print(x: &dyn Show) -> i32 { x.show() }\nfn main() { let a = A { v: 1 }; let b = B { v: 2 }; let r1 = print(&a); let r2 = print(&b); }\n";
+        let events = run_pipeline(source).expect("dyn param two types compiles");
+        // TWO `print` frames (one per call), neither mangled.
+        let print_frames = events.iter().filter(|e| matches!(e,
+            crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "print"
+        )).count();
+        assert_eq!(print_frames, 2, "expected exactly two `print` frames");
+        let a_dispatch = events.iter().any(|e| matches!(e,
+            crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "<A as Show>::show"
+        ));
+        let b_dispatch = events.iter().any(|e| matches!(e,
+            crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "<B as Show>::show"
+        ));
+        assert!(a_dispatch, "expected inner `<A as Show>::show` dispatch");
+        assert!(b_dispatch, "expected inner `<B as Show>::show` dispatch");
+    }
+
+    /// Multiple `&dyn Show` borrows of the same Point share one vtable —
+    /// VtableAlloc fires exactly once for the `(Show, Point)` pair.
+    #[test]
+    fn run_pipeline_dyn_vtable_interned() {
+        let source = "struct Point { x: i32, y: i32 }\ntrait Show { fn show(&self) -> i32; }\nimpl Show for Point { fn show(&self) -> i32 { self.x } }\nfn main() { let p = Point { x: 1, y: 2 }; let d1: &dyn Show = &p; let d2: &dyn Show = &p; let s1 = d1.show(); let s2 = d2.show(); }\n";
+        let events = run_pipeline(source).expect("vtable interning compiles");
+        let alloc_count = events.iter().filter(|e| matches!(e,
+            crate::MemEvent::VtableAlloc { trait_name, type_name, .. }
+                if trait_name == "Show" && type_name == "Point"
+        )).count();
+        assert_eq!(
+            alloc_count, 1,
+            "expected exactly ONE VtableAlloc for (Show, Point) despite two DynRef constructions"
+        );
+    }
+
+    // ─── M07.7 / US3: `Box<dyn Trait>` ────────────────────────────────────
+
+    /// `let b: Box<dyn Show> = Box::new(p); let s = b.show();` — heap alloc,
+    /// vtable alloc, Value::BoxDyn binding, dispatch through vtable.
+    #[test]
+    fn run_pipeline_box_dyn() {
+        let source = "struct Point { x: i32, y: i32 }\ntrait Show { fn show(&self) -> i32; }\nimpl Show for Point { fn show(&self) -> i32 { self.x } }\nfn main() { let p = Point { x: 1, y: 2 }; let b: Box<dyn Show> = Box::new(p); let s = b.show(); }\n";
+        let events = run_pipeline(source).expect("box dyn compiles");
+        let heap_alloc = events.iter().any(|e| matches!(e, crate::MemEvent::HeapAlloc { .. }));
+        assert!(heap_alloc, "expected HeapAlloc for Box::new");
+        let vtable_alloc = events.iter().any(|e| matches!(e,
+            crate::MemEvent::VtableAlloc { trait_name, type_name, .. }
+                if trait_name == "Show" && type_name == "Point"
+        ));
+        assert!(vtable_alloc, "expected VtableAlloc for (Show, Point)");
+        let b_write = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite {
+                value: crate::Value::BoxDyn { trait_name, .. },
+                ..
+            } if trait_name == "Show"
+        ));
+        assert!(b_write, "expected SlotWrite of Value::BoxDyn with trait_name=Show");
+        let dispatch = events.iter().any(|e| matches!(e,
+            crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "<Point as Show>::show"
+        ));
+        assert!(dispatch, "expected FrameEnter `<Point as Show>::show`");
+        let s_write = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite {
+                value: crate::Value::Int { kind: crate::typeck::IntKind::I32, bits: 1 },
+                ..
+            }
+        ));
+        assert!(s_write, "expected s = 1_i32");
+        let heap_free = events.iter().any(|e| matches!(e, crate::MemEvent::HeapFree { .. }));
+        assert!(heap_free, "expected HeapFree at b's scope exit (Box dropped)");
+    }
+
+    // ─── M07.7 / US4: static vs dyn (the headline contrast) ───────────────
+
+    /// `fn s<T: Show>(x: T)` (static) vs `fn d(x: &dyn Show)` (dynamic) —
+    /// outer frames distinguish dispatch style; inner frames identical.
+    #[test]
+    fn run_pipeline_static_vs_dyn() {
+        let source = "struct Point { x: i32, y: i32 }\ntrait Show { fn show(&self) -> i32; }\nimpl Show for Point { fn show(&self) -> i32 { self.x } }\nfn s<T: Show>(x: T) -> i32 { x.show() }\nfn d(x: &dyn Show) -> i32 { x.show() }\nfn main() { let p = Point { x: 1, y: 2 }; let a = s(p); let b = d(&p); }\n";
+        let events = run_pipeline(source).expect("static vs dyn compiles");
+        // Static dispatch: mangled `s::<Point>` frame.
+        let static_frame = events.iter().any(|e| matches!(e,
+            crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "s::<Point>"
+        ));
+        assert!(static_frame, "expected outer FrameEnter `s::<Point>` (monomorphized)");
+        // Dynamic dispatch: bare `d` frame (no mangling).
+        let dyn_frame = events.iter().any(|e| matches!(e,
+            crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "d"
+        ));
+        assert!(dyn_frame, "expected outer FrameEnter `d` (one-frame dyn)");
+        let dyn_mangled = events.iter().any(|e| matches!(e,
+            crate::MemEvent::FrameEnter { fn_name, .. } if fn_name.starts_with("d::<")
+        ));
+        assert!(!dyn_mangled, "should NOT see `d::<Point>` — dyn is one-frame");
+        // Both call paths land in the same UFCS-style inner method frame.
+        let inner_frames = events.iter().filter(|e| matches!(e,
+            crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "<Point as Show>::show"
+        )).count();
+        assert_eq!(inner_frames, 2, "expected two `<Point as Show>::show` dispatches");
+    }
+
+    // ─── M07.7 / cross-cutting: default method through dyn ────────────────
+
+    /// Mutability: `&T → &mut dyn Trait` rejected (shared-to-mut upgrade
+    /// is not allowed). Sibling rejection to `dyn_coercion_error`.
+    #[test]
+    fn run_pipeline_dyn_mut_coercion_rejected() {
+        let source = "struct Point { x: i32, y: i32 }\ntrait Show { fn show(&self) -> i32; }\nimpl Show for Point { fn show(&self) -> i32 { self.x } }\nfn main() { let p = Point { x: 1, y: 2 }; let d: &mut dyn Show = &p; let _ = d.show(); }\n";
+        let err = run_pipeline(source).expect_err("&T → &mut dyn should be rejected");
+        assert_eq!(err.stage, CompileStage::Typeck);
+        // Error message can match either the explicit-cast wording or the
+        // general type-mismatch fallback — both convey the same rejection.
+        assert!(
+            err.message.contains("&mut dyn") || err.message.contains("expected"),
+            "expected mutability-mismatch error: got `{}`",
+            err.message
+        );
+    }
+
+    /// Default method dispatched through `&dyn Trait` — impl provides only
+    /// `count`; calling `d.double()` on `d: &dyn Counter` routes through the
+    /// vtable to the trait's default body, whose `self.count()` re-dispatches
+    /// to the impl override. v = 2 * 1 = 2.
+    #[test]
+    fn run_pipeline_dyn_default_method() {
+        let source = "struct Point { x: i32, y: i32 }\ntrait Counter { fn count(&self) -> i32; fn double(&self) -> i32 { self.count() * 2 } }\nimpl Counter for Point { fn count(&self) -> i32 { self.x } }\nfn main() { let p = Point { x: 1, y: 2 }; let d: &dyn Counter = &p; let v = d.double(); }\n";
+        let events = run_pipeline(source).expect("default method through dyn compiles");
+        let outer = events.iter().any(|e| matches!(e,
+            crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "<Point as Counter>::double"
+        ));
+        let inner = events.iter().any(|e| matches!(e,
+            crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "<Point as Counter>::count"
+        ));
+        assert!(outer, "expected outer FrameEnter `<Point as Counter>::double` (default body via dyn)");
+        assert!(inner, "expected nested FrameEnter `<Point as Counter>::count` (re-dispatch through impl)");
+        let v_write = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite {
+                value: crate::Value::Int { kind: crate::typeck::IntKind::I32, bits: 2 },
+                ..
+            }
+        ));
+        assert!(v_write, "expected v = 2_i32 (1 * 2)");
+    }
 }

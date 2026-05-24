@@ -52,6 +52,10 @@ pub enum TokenKind {
     Trait,
     /// **M07.6**: `for` keyword (`impl Trait for Type` syntax).
     For,
+    /// **M07.7**: `dyn` keyword (`&dyn Trait`, `Box<dyn Trait>`).
+    Dyn,
+    /// **M07.7**: `as` keyword (`&p as &dyn Show`).
+    As,
 
     /// `+`
     Plus,
@@ -149,6 +153,8 @@ impl TokenKind {
             Self::SelfKw => "`self`",
             Self::Trait => "`trait`",
             Self::For => "`for`",
+            Self::Dyn => "`dyn`",
+            Self::As => "`as`",
             Self::Plus => "`+`",
             Self::Minus => "`-`",
             Self::Star => "`*`",

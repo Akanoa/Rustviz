@@ -428,6 +428,18 @@ impl Parser {
                 span: lparen.span.merge(rparen.span),
             });
         }
+        // **M07.7**: bare `dyn TraitName` — typeck rejects unless wrapped in
+        // `&` / `&mut` (via the Ref arm below) or `Box<_>` (via the Generic
+        // arm). The wrapping is the caller's responsibility.
+        if self.at(&TokenKind::Dyn) {
+            let kw = self.bump();
+            let name_span = self.peek().span;
+            let trait_name = self.expect_ident("trait name after `dyn`")?;
+            return Ok(Type::DynTrait {
+                trait_name,
+                span: kw.span.merge(name_span),
+            });
+        }
         // **M07.3**: array type annotation `[T; N]`. Distinct from `&[T]`
         // (slice — that's caught by the `&`-prefix path below). The size
         // must be a non-negative integer literal (no const expressions).
@@ -661,6 +673,22 @@ impl Parser {
                 lhs = Expr::Call {
                     callee: Box::new(lhs),
                     args,
+                    span,
+                };
+                continue;
+            }
+            // **M07.7**: postfix `as Type` cast. Binds tighter than binary
+            // ops, looser than `.`/`[`/`(` postfix (which is implicit since
+            // those continue inside this loop AT the top). In M07.7 the only
+            // valid target is `&dyn Trait`; other casts typeck-reject.
+            if self.at(&TokenKind::As) {
+                self.bump(); // `as`
+                let target_ty = self.parse_type()?;
+                let target_ty_span = type_span(&target_ty);
+                let span = lhs.span().merge(target_ty_span);
+                lhs = Expr::Cast {
+                    inner: Box::new(lhs),
+                    target_ty,
                     span,
                 };
                 continue;
@@ -1058,6 +1086,7 @@ fn type_span(ty: &Type) -> Span {
         | Type::Ref { span, .. }
         | Type::Generic { span, .. }
         | Type::Slice { span, .. }
-        | Type::Array { span, .. } => *span,
+        | Type::Array { span, .. }
+        | Type::DynTrait { span, .. } => *span,
     }
 }

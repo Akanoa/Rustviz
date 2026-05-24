@@ -73,6 +73,17 @@ struct Evaluator<'a> {
     /// → fall through to Tr's default method body for any non-overridden
     /// method.
     trait_impl_present: std::collections::HashSet<(String, String)>,
+    /// **M07.7**: trait name → ordered list of methods (required + default
+    /// in declaration order). Built once at construction from the program's
+    /// trait decls; consulted by `intern_vtable` to populate the
+    /// `VtableAlloc.methods` field.
+    trait_methods: HashMap<String, Vec<String>>,
+    /// **M07.7**: content-deduplicated vtable addressing. Key is
+    /// `(trait_name, type_name)`; value is the interned VtableAddr.
+    /// Analog of M07.2's `static_region.by_content`.
+    vtable_addrs: HashMap<(String, String), crate::event::VtableAddr>,
+    /// **M07.7**: monotonic counter for vtable addresses.
+    next_vtable_addr: u32,
     /// Call stack — innermost frame last.
     frames: Vec<Frame>,
     next_slot_id: u32,
@@ -198,6 +209,9 @@ fn apply_subst_ty(ty: &Ty, subst: &std::collections::HashMap<String, Ty>) -> Ty 
         Ty::Slice(inner) => Ty::Slice(Box::new(apply_subst_ty(inner, subst))),
         Ty::Array(inner, n) => Ty::Array(Box::new(apply_subst_ty(inner, subst)), *n),
         Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Unit | Ty::String | Ty::Str => ty.clone(),
+        // M07.7: trait-object types — `trait_name` is a String, no inner
+        // type to substitute. Return as-is.
+        Ty::DynRef { .. } | Ty::BoxDyn { .. } => ty.clone(),
     }
 }
 
@@ -232,6 +246,10 @@ fn ty_size_bytes(ty: &Ty) -> u32 {
         // M07.5: type parameter — unreachable at eval time (typeck
         // substitutes before any sizing query). Defensive: 0.
         Ty::Param(_) => 0,
+        // M07.7: trait-object fat pointers — 16 bytes on 64-bit (data ptr +
+        // vtable ptr). Box<dyn> stack-side is also 16 bytes (the Box wrapper
+        // IS the fat pointer for dyn).
+        Ty::DynRef { .. } | Ty::BoxDyn { .. } => 16,
     }
 }
 
@@ -264,6 +282,8 @@ fn value_size_bytes(v: &Value) -> u32 {
         Value::Struct { fields, .. } => {
             fields.iter().map(|(_, v)| value_size_bytes(v)).sum()
         }
+        // M07.7: trait-object fat pointers — 16 bytes (data ptr + vtable ptr).
+        Value::DynRef { .. } | Value::BoxDyn { .. } => 16,
     }
 }
 
@@ -396,6 +416,23 @@ impl<'a> Evaluator<'a> {
                 }
             }
         }
+        // **M07.7**: build the per-trait method list (required + default in
+        // declaration order) for VtableAlloc's `methods` field. Walks the
+        // program's trait decls a second time so the order matches the
+        // source (eval-side single source of truth).
+        let mut trait_methods: HashMap<String, Vec<String>> = HashMap::new();
+        for item in &program.items {
+            if let ast::Item::Trait(decl) = item {
+                let mut names: Vec<String> = Vec::with_capacity(decl.items.len());
+                for ti in &decl.items {
+                    match ti {
+                        ast::TraitItem::Required { name, .. } => names.push(name.clone()),
+                        ast::TraitItem::Default { decl: fn_decl } => names.push(fn_decl.name.clone()),
+                    }
+                }
+                trait_methods.insert(decl.name.clone(), names);
+            }
+        }
         Ok(Self {
             resolution,
             types,
@@ -405,6 +442,9 @@ impl<'a> Evaluator<'a> {
             trait_default_bodies,
             trait_impl_bodies,
             trait_impl_present,
+            trait_methods,
+            vtable_addrs: HashMap::new(),
+            next_vtable_addr: 0,
             frames: Vec::new(),
             next_slot_id: 0,
             next_frame_id: 0,
@@ -490,6 +530,65 @@ impl<'a> Evaluator<'a> {
             .get(&addr)
             .map(|b| b.bytes.as_str())
             .expect("static block must exist for any Pointee::Static value")
+    }
+
+    /// **M07.7**: intern a `(trait_name, type_name)` pair into the VTABLES
+    /// region. Content-deduplicated: identical pairs share one VtableAddr.
+    /// Emits `MemEvent::VtableAlloc` only on first occurrence (mirrors
+    /// `intern_static`). The methods list is built from the program's
+    /// trait registry (declaration order).
+    fn intern_vtable(
+        &mut self,
+        trait_name: &str,
+        type_name: &str,
+        span: Span,
+    ) -> crate::event::VtableAddr {
+        let key = (trait_name.to_owned(), type_name.to_owned());
+        if let Some(addr) = self.vtable_addrs.get(&key) {
+            return *addr;
+        }
+        let addr = crate::event::VtableAddr(self.next_vtable_addr);
+        self.next_vtable_addr += 1;
+        let methods = self
+            .trait_methods
+            .get(trait_name)
+            .cloned()
+            .unwrap_or_default();
+        self.vtable_addrs.insert(key, addr);
+        self.events.push(MemEvent::VtableAlloc {
+            addr,
+            trait_name: trait_name.to_owned(),
+            type_name: type_name.to_owned(),
+            methods,
+            span,
+        });
+        addr
+    }
+
+    /// **M07.7**: resolve a `Pointee` target to the concrete type name of
+    /// the underlying value. Used for vtable interning + dispatch — when
+    /// we cast `&p as &dyn Show`, we need the concrete type of p.
+    fn pointee_concrete_type_name(&self, target: crate::event::Pointee) -> Option<String> {
+        match target {
+            crate::event::Pointee::Slot(slot_id) => match self.lookup_slot_value(slot_id) {
+                Some(Value::Struct { name, .. }) => Some(name),
+                Some(Value::Int { kind, .. }) => Some(kind.name().to_owned()),
+                Some(Value::Float { kind, .. }) => Some(kind.name().to_owned()),
+                Some(Value::Bool(_)) => Some("bool".to_owned()),
+                _ => None,
+            },
+            crate::event::Pointee::Heap(addr) => match self.heap.objects.get(&addr) {
+                Some(HeapObject::Box(v)) => match v {
+                    Value::Struct { name, .. } => Some(name.clone()),
+                    Value::Int { kind, .. } => Some(kind.name().to_owned()),
+                    Value::Float { kind, .. } => Some(kind.name().to_owned()),
+                    Value::Bool(_) => Some("bool".to_owned()),
+                    _ => None,
+                },
+                _ => None,
+            },
+            crate::event::Pointee::Static(_) => None,
+        }
     }
 
 
@@ -838,6 +937,42 @@ impl<'a> Evaluator<'a> {
                 .lookup_var_ty(binding_id)
                 .expect("param has BindingType::Var(_) after typeck");
             let ty = apply_subst_ty(&ty, &call_subst);
+            // **M07.7**: implicit `&T → &dyn Trait` coercion at fn-arg site.
+            // When the param type is `Ty::DynRef { trait_name, .. }` and the
+            // arg is `Value::Ref { target, mutable, .. }`, intern the vtable
+            // for the target's concrete type AND construct a Value::DynRef
+            // inline. Same for `Ty::BoxDyn` + `Value::Box` (Box<T> → Box<dyn>).
+            let value = match (&ty, &value) {
+                (Ty::DynRef { trait_name, mutable }, Value::Ref { borrow_id, target, .. }) => {
+                    if let Some(type_name) = self.pointee_concrete_type_name(*target) {
+                        let vtable = self.intern_vtable(trait_name, &type_name, decl_span);
+                        Value::DynRef {
+                            borrow_id: *borrow_id,
+                            target: *target,
+                            vtable,
+                            mutable: *mutable,
+                            trait_name: trait_name.clone(),
+                        }
+                    } else {
+                        value
+                    }
+                }
+                (Ty::BoxDyn { trait_name }, Value::Box { addr }) => {
+                    if let Some(type_name) =
+                        self.pointee_concrete_type_name(crate::event::Pointee::Heap(*addr))
+                    {
+                        let vtable = self.intern_vtable(trait_name, &type_name, decl_span);
+                        Value::BoxDyn {
+                            addr: *addr,
+                            vtable,
+                            trait_name: trait_name.clone(),
+                        }
+                    } else {
+                        value
+                    }
+                }
+                _ => value,
+            };
             self.events.push(MemEvent::SlotAlloc {
                 slot_id,
                 name: name.clone(),
@@ -969,6 +1104,10 @@ impl<'a> Evaluator<'a> {
             // Detect heap-owning current value (the slot's current Value).
             let heap_addr = match &local.value {
                 Value::Box { addr } | Value::Vec { addr } | Value::String { addr } => Some(*addr),
+                // **M07.7**: `Box<dyn Trait>` is heap-owning too. Vtable
+                // persists (analog of M07.2 static memory); only the data
+                // allocation gets freed at drop.
+                Value::BoxDyn { addr, .. } => Some(*addr),
                 _ => None,
             };
             if let Some(addr) = heap_addr {
@@ -979,6 +1118,7 @@ impl<'a> Evaluator<'a> {
                     Value::Box { .. } => "Box",
                     Value::Vec { .. } => "Vec",
                     Value::String { .. } => "String",
+                    Value::BoxDyn { .. } => "Box<dyn>",
                     _ => unreachable!(),
                 };
                 self.events.push(MemEvent::Note {
@@ -1095,6 +1235,40 @@ impl<'a> Evaluator<'a> {
                 let ty = self
                     .lookup_var_ty(binding_id)
                     .expect("let binding has Var type after typeck");
+                // **M07.7**: implicit `&T → &dyn Trait` / `Box<T> → Box<dyn>`
+                // coercion at let-init site when the annotation type forces
+                // dyn but the init expression returned a regular ref/box.
+                let value = match (&ty, &value) {
+                    (Ty::DynRef { trait_name, mutable }, Value::Ref { borrow_id, target, .. }) => {
+                        if let Some(type_name) = self.pointee_concrete_type_name(*target) {
+                            let vtable = self.intern_vtable(trait_name, &type_name, let_stmt.span);
+                            Value::DynRef {
+                                borrow_id: *borrow_id,
+                                target: *target,
+                                vtable,
+                                mutable: *mutable,
+                                trait_name: trait_name.clone(),
+                            }
+                        } else {
+                            value
+                        }
+                    }
+                    (Ty::BoxDyn { trait_name }, Value::Box { addr }) => {
+                        if let Some(type_name) =
+                            self.pointee_concrete_type_name(crate::event::Pointee::Heap(*addr))
+                        {
+                            let vtable = self.intern_vtable(trait_name, &type_name, let_stmt.span);
+                            Value::BoxDyn {
+                                addr: *addr,
+                                vtable,
+                                trait_name: trait_name.clone(),
+                            }
+                        } else {
+                            value
+                        }
+                    }
+                    _ => value,
+                };
                 self.events.push(MemEvent::SlotAlloc {
                     slot_id,
                     name: let_stmt.name.clone(),
@@ -1667,6 +1841,41 @@ impl<'a> Evaluator<'a> {
                     fields: evaled_fields,
                 }
             }
+            // **M07.7**: `inner as &dyn Trait` cast — eval inner to get
+            // its Value::Ref, intern the vtable for the target's concrete
+            // type, build Value::DynRef. typeck has already verified the
+            // cast's validity (`T: Trait`).
+            ast::Expr::Cast { inner, target_ty, span } => {
+                let v = self.eval_expr(inner);
+                if self.halted { return Value::Unit; }
+                // Look up the target type from typeck.
+                let target_ty_resolved = self.types.expr_types.get(span).cloned();
+                let (trait_name, mutable) = match target_ty_resolved {
+                    Some(Ty::DynRef { trait_name, mutable }) => (trait_name, mutable),
+                    _ => {
+                        // Defensive: typeck rejected other casts; we shouldn't get here.
+                        let _ = target_ty;
+                        return Value::Unit;
+                    }
+                };
+                match v {
+                    Value::Ref { borrow_id, target, mutable: ref_mut, .. } => {
+                        let _ = ref_mut; // typeck-validated against target mut.
+                        let type_name = self
+                            .pointee_concrete_type_name(target)
+                            .expect("typeck verified concrete type for cast inner");
+                        let vtable = self.intern_vtable(&trait_name, &type_name, *span);
+                        Value::DynRef {
+                            borrow_id,
+                            target,
+                            vtable,
+                            mutable,
+                            trait_name,
+                        }
+                    }
+                    _ => panic!("typeck should reject cast on non-Ref inner"),
+                }
+            }
             // **M07.4**: field access — copy the named field out of the
             // struct value. Auto-derefs through `Value::Ref` to a slot
             // holding a struct (the `self.x` shape inside `&self` methods).
@@ -1697,6 +1906,27 @@ impl<'a> Evaluator<'a> {
                                 .find_map(|(n, v)| if n == *name { Some(v) } else { None })
                                 .expect("typeck verified field exists"),
                             _ => panic!("typeck should reject field access through non-struct ref"),
+                        }
+                    }
+                    // **M07.7**: field access through a Value::Ref pointing at
+                    // a heap Box. This is the `self.x` shape inside a method
+                    // body dispatched via Box<dyn Trait> — self is a fresh
+                    // borrow whose target is the underlying heap address;
+                    // the heap holds the Box's struct value.
+                    Value::Ref {
+                        target: crate::event::Pointee::Heap(addr),
+                        ..
+                    } => {
+                        let v = match self.heap.objects.get(&addr) {
+                            Some(HeapObject::Box(v)) => v.clone(),
+                            _ => panic!("Box's heap object missing for dyn-Box field access"),
+                        };
+                        match v {
+                            Value::Struct { fields, .. } => fields
+                                .into_iter()
+                                .find_map(|(n, v)| if n == *name { Some(v) } else { None })
+                                .expect("typeck verified field exists"),
+                            _ => panic!("typeck should reject field access through non-struct heap ref"),
                         }
                     }
                     _ => panic!("typeck should reject field access on non-struct receiver"),
@@ -1943,9 +2173,24 @@ impl<'a> Evaluator<'a> {
             //   - SelfMut:    Value::Ref { target: Pointee::Slot(p), mutable: true, .. }
             //   - SelfOwned:  the receiver's value, moved.
             _ => {
-                let struct_name = match &recv {
-                    Value::Struct { name, .. } => Some(name.clone()),
-                    Value::Ref { target: crate::event::Pointee::Slot(slot_id), .. } => {
+                // **M07.7**: trait-object receivers dispatch through the
+                // vtable. Resolve the concrete type from the receiver's
+                // data ptr; force the dispatch into the trait-method path
+                // (no inherent fall-back — trait objects only expose trait
+                // methods).
+                let dyn_dispatch: Option<(String, String)> = match &recv {
+                    Value::DynRef { target, trait_name, .. } => self
+                        .pointee_concrete_type_name(*target)
+                        .map(|tn| (trait_name.clone(), tn)),
+                    Value::BoxDyn { addr, trait_name, .. } => self
+                        .pointee_concrete_type_name(crate::event::Pointee::Heap(*addr))
+                        .map(|tn| (trait_name.clone(), tn)),
+                    _ => None,
+                };
+                let struct_name = match (&dyn_dispatch, &recv) {
+                    (Some((_, type_name)), _) => Some(type_name.clone()),
+                    (None, Value::Struct { name, .. }) => Some(name.clone()),
+                    (None, Value::Ref { target: crate::event::Pointee::Slot(slot_id), .. }) => {
                         match self.lookup_slot_value(*slot_id) {
                             Some(Value::Struct { name, .. }) => Some(name),
                             _ => None,
@@ -1956,46 +2201,66 @@ impl<'a> Evaluator<'a> {
                 let Some(struct_name) = struct_name else {
                     panic!("typeck should reject method call on non-struct receiver");
                 };
-                // **M07.6**: three-layer dispatch.
+                // **M07.6**: three-layer dispatch (with M07.7 fourth-layer
+                // overlay).
                 //   1. Inherent (M07.4) — `methods[(struct, name)]`.
                 //   2. Trait impl override — `trait_impl_bodies[(trait, struct, name)]`.
                 //   3. Trait default — `trait_default_bodies[(trait, name)]` where
                 //      `(trait, struct) ∈ trait_impl_present`.
+                //   4. Trait-object dispatch (M07.7) — forces lookup into
+                //      the receiver's `trait_name` only; skips inherent.
                 // For each layer, also record which trait (for mangled name).
-                let (method_decl, trait_label): (&ast::FnDecl, Option<String>) =
+                let (method_decl, trait_label): (&ast::FnDecl, Option<String>) = if let Some((dyn_trait, dyn_type)) = &dyn_dispatch {
+                    // Force the dispatch through the trait. Impl override
+                    // first, then trait default.
                     if let Some(decl) = self
-                        .methods
-                        .get(&(struct_name.clone(), name.to_owned()))
+                        .trait_impl_bodies
+                        .get(&(dyn_trait.clone(), dyn_type.clone(), name.to_owned()))
                         .copied()
                     {
-                        (decl, None) // inherent — no `<as Trait>` in name.
+                        (decl, Some(dyn_trait.clone()))
+                    } else if let Some(decl) = self
+                        .trait_default_bodies
+                        .get(&(dyn_trait.clone(), name.to_owned()))
+                        .copied()
+                    {
+                        (decl, Some(dyn_trait.clone()))
                     } else {
-                        // Scan trait_impl_bodies first (impl overrides).
-                        let override_hit: Option<(String, &ast::FnDecl)> = self
-                            .trait_impl_bodies
+                        panic!("typeck verified trait-object method exists for ({dyn_trait}, {dyn_type}, {name})");
+                    }
+                } else if let Some(decl) = self
+                    .methods
+                    .get(&(struct_name.clone(), name.to_owned()))
+                    .copied()
+                {
+                    (decl, None) // inherent — no `<as Trait>` in name.
+                } else {
+                    // Scan trait_impl_bodies first (impl overrides).
+                    let override_hit: Option<(String, &ast::FnDecl)> = self
+                        .trait_impl_bodies
+                        .iter()
+                        .find(|((_, ty, mn), _)| ty == &struct_name && mn == name)
+                        .map(|((tn, _, _), d)| (tn.clone(), *d));
+                    if let Some((tn, decl)) = override_hit {
+                        (decl, Some(tn))
+                    } else {
+                        // Fall through to trait defaults.
+                        let default_hit: Option<(String, &ast::FnDecl)> = self
+                            .trait_default_bodies
                             .iter()
-                            .find(|((_, ty, mn), _)| ty == &struct_name && mn == name)
-                            .map(|((tn, _, _), d)| (tn.clone(), *d));
-                        if let Some((tn, decl)) = override_hit {
-                            (decl, Some(tn))
-                        } else {
-                            // Fall through to trait defaults.
-                            let default_hit: Option<(String, &ast::FnDecl)> = self
-                                .trait_default_bodies
-                                .iter()
-                                .find(|((tn, mn), _)| {
-                                    mn == name
-                                        && self
-                                            .trait_impl_present
-                                            .contains(&(tn.clone(), struct_name.clone()))
-                                })
-                                .map(|((tn, _), d)| (tn.clone(), *d));
-                            match default_hit {
-                                Some((tn, decl)) => (decl, Some(tn)),
-                                None => panic!("typeck verified method exists"),
-                            }
+                            .find(|((tn, mn), _)| {
+                                mn == name
+                                    && self
+                                        .trait_impl_present
+                                        .contains(&(tn.clone(), struct_name.clone()))
+                            })
+                            .map(|((tn, _), d)| (tn.clone(), *d));
+                        match default_hit {
+                            Some((tn, decl)) => (decl, Some(tn)),
+                            None => panic!("typeck verified method exists"),
                         }
-                    };
+                    }
+                };
                 // Determine self-receiver kind from the method's first param.
                 let self_kind = method_decl
                     .params
@@ -2055,6 +2320,31 @@ impl<'a> Evaluator<'a> {
                                 Value::Ref {
                                     borrow_id,
                                     target: crate::event::Pointee::Slot(recv_slot),
+                                    mutable,
+                                    field_path: Vec::new(),
+                                }
+                            }
+                            // **M07.7**: trait-object receivers dispatch via
+                            // the vtable; the impl's self-receiver gets a
+                            // fresh borrow targeting the dyn-ref's data ptr.
+                            // Fresh borrow_id per call site (per M07.6 lesson).
+                            Value::DynRef { target, mutable, .. } => {
+                                let borrow_id = self.alloc_borrow_id();
+                                Value::Ref {
+                                    borrow_id,
+                                    target: *target,
+                                    mutable: *mutable,
+                                    field_path: Vec::new(),
+                                }
+                            }
+                            // **M07.7**: Box<dyn Trait> receivers — self
+                            // is a fresh borrow of the heap data ptr.
+                            Value::BoxDyn { addr, .. } => {
+                                let mutable = matches!(self_kind, ast::ParamKind::SelfMut);
+                                let borrow_id = self.alloc_borrow_id();
+                                Value::Ref {
+                                    borrow_id,
+                                    target: crate::event::Pointee::Heap(*addr),
                                     mutable,
                                     field_path: Vec::new(),
                                 }
@@ -2815,6 +3105,11 @@ fn render_value_for_note(value: &Value) -> String {
                 .collect();
             format!("{name} {{ {} }}", body.join(", "))
         }
+        // M07.7: trait-object fat pointers — abstract render for notes.
+        Value::DynRef { trait_name, mutable, .. } => {
+            if *mutable { format!("&mut dyn {trait_name}") } else { format!("&dyn {trait_name}") }
+        }
+        Value::BoxDyn { trait_name, .. } => format!("Box<dyn {trait_name}>"),
     }
 }
 

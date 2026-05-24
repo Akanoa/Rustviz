@@ -315,6 +315,10 @@ impl Resolver {
             // **M07.4**: field access — recurse on receiver only; field name
             // is a symbol-lookup deferred to typeck (it's not a binding).
             ast::Expr::FieldAccess { receiver, .. } => self.resolve_expr(receiver)?,
+            // **M07.7**: cast — recurse on the inner expression. The target
+            // type carries a trait name that resolves at typeck time (not a
+            // value-level binding).
+            ast::Expr::Cast { inner, .. } => self.resolve_expr(inner)?,
             ast::Expr::Binary { lhs, rhs, .. } => {
                 self.resolve_expr(lhs)?;
                 self.resolve_expr(rhs)?;

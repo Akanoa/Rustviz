@@ -227,6 +227,24 @@ pub enum Ty {
     /// at eval time (typeck substitutes before any binding_types entry is
     /// recorded that eval consults).
     Param(String),
+    /// **M07.7**: borrow form of a trait object — `&dyn Trait` or
+    /// `&mut dyn Trait`. The `&` wrap is collapsed into this variant so
+    /// dispatch logic doesn't need to unwrap `Ty::Ref { Ty::DynTrait, .. }`
+    /// at every check. Nominal equality by `(trait_name, mutable)`.
+    DynRef {
+        /// Trait the borrow exposes (e.g. `"Show"`).
+        trait_name: String,
+        /// `true` for `&mut dyn`, `false` for `&dyn`.
+        mutable: bool,
+    },
+    /// **M07.7**: heap-owning form of a trait object — `Box<dyn Trait>`.
+    /// The Box stores both the data ptr (heap addr) AND the vtable ptr —
+    /// fat-pointer heap allocation. Separate from `Ty::Box(_)` for clarity
+    /// (regular Box vs Box-of-dyn have distinct runtime shapes).
+    BoxDyn {
+        /// Trait the Box exposes.
+        trait_name: String,
+    },
 }
 
 impl Ty {
@@ -267,6 +285,15 @@ impl Ty {
             }
             // M07.5: type parameter — bare name (`T`).
             Self::Param(name) => name.clone(),
+            // M07.7: trait-object borrow and Box forms.
+            Self::DynRef { trait_name, mutable } => {
+                if *mutable {
+                    format!("&mut dyn {trait_name}")
+                } else {
+                    format!("&dyn {trait_name}")
+                }
+            }
+            Self::BoxDyn { trait_name } => format!("Box<dyn {trait_name}>"),
         }
     }
 
@@ -295,6 +322,12 @@ impl Ty {
             // Safe default: false. At call sites the substituted concrete
             // type's own is_copy() answer applies.
             Self::Param(_) => false,
+            // M07.7: `&dyn` is Copy (shared refs are Copy, including dyn).
+            // `&mut dyn` is not (matches Rust's `&mut` non-Copy rule).
+            // `Box<dyn>` is not (heap-owning).
+            Self::DynRef { mutable: false, .. } => true,
+            Self::DynRef { mutable: true, .. } => false,
+            Self::BoxDyn { .. } => false,
         }
     }
 }
@@ -782,6 +815,9 @@ impl<'a> Typechecker<'a> {
             Ty::Array(inner, n) => Ty::Array(Box::new(self.apply_subst_with(inner, sub)), *n),
             // Primitives — no substitution structure.
             Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Unit | Ty::String | Ty::Str => ty.clone(),
+            // M07.7: trait-object types — trait_name is a String, no inner
+            // type to substitute.
+            Ty::DynRef { .. } | Ty::BoxDyn { .. } => ty.clone(),
         }
     }
 
@@ -790,7 +826,47 @@ impl<'a> Typechecker<'a> {
     /// param types like `p: Point` resolve to `Ty::Struct(...)` instead
     /// of "unknown type `Point`". Falls back to the standard `ty_from_ast`
     /// for everything else.
+    /// **M07.7**: collapses `Type::Ref { Type::DynTrait, mutable }` to
+    /// `Ty::DynRef { trait_name, mutable }` and `Type::Generic { "Box",
+    /// [Type::DynTrait] }` to `Ty::BoxDyn { trait_name }`. Verifies the
+    /// trait exists in the registry; rejects unknown traits with a clear
+    /// error.
     fn ty_from_ast_resolving_structs(&self, t: &ast::Type) -> Result<Ty, ParseError> {
+        // **M07.7**: `&dyn Trait` / `&mut dyn Trait` — collapse Ref+DynTrait
+        // into a single Ty::DynRef variant. Verify the trait is registered.
+        if let ast::Type::Ref { inner, mutable, span } = t {
+            if let ast::Type::DynTrait { trait_name, .. } = inner.as_ref() {
+                if !self.traits.schemas.contains_key(trait_name) {
+                    return Err(ParseError {
+                        message: format!("unknown trait `{trait_name}` in `&dyn` type"),
+                        span: *span,
+                    });
+                }
+                return Ok(Ty::DynRef {
+                    trait_name: trait_name.clone(),
+                    mutable: *mutable,
+                });
+            }
+        }
+        // **M07.7**: `Box<dyn Trait>` — collapse Generic("Box", [DynTrait])
+        // into Ty::BoxDyn.
+        if let ast::Type::Generic { segments, args, span } = t {
+            if segments.len() == 1 && segments[0] == "Box" && args.len() == 1 {
+                if let ast::Type::DynTrait { trait_name, .. } = &args[0] {
+                    if !self.traits.schemas.contains_key(trait_name) {
+                        return Err(ParseError {
+                            message: format!(
+                                "unknown trait `{trait_name}` in `Box<dyn>` type"
+                            ),
+                            span: *span,
+                        });
+                    }
+                    return Ok(Ty::BoxDyn {
+                        trait_name: trait_name.clone(),
+                    });
+                }
+            }
+        }
         if let ast::Type::Path { segments, type_args, .. } = t {
             if segments.len() == 1 {
                 if let Some(fields) = self.structs.schemas.get(&segments[0]) {
@@ -1833,7 +1909,81 @@ impl<'a> Typechecker<'a> {
             ast::Expr::FieldAccess { receiver, name, span } => {
                 self.typecheck_field_access(receiver, name, *span)
             }
+            // **M07.7**: cast expression `inner as TargetTy`. In M07.7 only
+            // `&T as &dyn Trait` (and `&mut T as &dyn Trait` shared-downgrade)
+            // is supported. Verifies T impls Trait via TraitImplRegistry.
+            ast::Expr::Cast { inner, target_ty, span } => {
+                self.typecheck_cast(inner, target_ty, *span)
+            }
         }
+    }
+
+    /// **M07.7**: typecheck a `&T as &dyn Trait` coercion cast. Verifies:
+    /// - the target type is `Ty::DynRef { trait_name, .. }` (other casts
+    ///   reject — M07.7 only supports trait-object coercion);
+    /// - the inner expression types to `Ty::Ref { Ty::Struct(name), .. }`
+    ///   (or another concrete-typed borrow);
+    /// - `(trait_name, name)` exists in `trait_impls.impls`;
+    /// - mutability: `&T → &mut dyn Trait` rejected; `&mut T → &dyn Trait`
+    ///   accepted (mut-to-shared downgrade is fine).
+    fn typecheck_cast(
+        &mut self,
+        inner: &ast::Expr,
+        target_ty: &ast::Type,
+        span: Span,
+    ) -> Result<Ty, ParseError> {
+        let target = self.ty_from_ast_resolving_structs(target_ty)?;
+        let (trait_name, target_mut) = match &target {
+            Ty::DynRef { trait_name, mutable } => (trait_name.clone(), *mutable),
+            other => {
+                return Err(ParseError {
+                    message: format!(
+                        "M07.7 supports only trait-object coercion casts; casting to `{}` is out of scope",
+                        other.name()
+                    ),
+                    span,
+                });
+            }
+        };
+        let inner_ty = self.typecheck_expr(inner)?;
+        let (inner_mut, target_concrete_name) = match &inner_ty {
+            Ty::Ref { inner: ref_inner, mutable } => {
+                let concrete_name = match ref_inner.as_ref() {
+                    Ty::Struct { name, .. } => name.clone(),
+                    other => other.name(),
+                };
+                (*mutable, concrete_name)
+            }
+            other => {
+                return Err(ParseError {
+                    message: format!(
+                        "expected a reference to coerce to `&dyn {trait_name}`, found `{}`",
+                        other.name()
+                    ),
+                    span: inner.span(),
+                });
+            }
+        };
+        // Mutability rule: source must satisfy target's mutability.
+        // `&T → &mut dyn Trait` rejected; `&mut T → &dyn Trait` accepted.
+        if target_mut && !inner_mut {
+            return Err(ParseError {
+                message: format!(
+                    "cannot coerce `&{target_concrete_name}` (shared) to `&mut dyn {trait_name}`"
+                ),
+                span,
+            });
+        }
+        let key = (trait_name.clone(), target_concrete_name.clone());
+        if !self.trait_impls.impls.contains_key(&key) {
+            return Err(ParseError {
+                message: format!(
+                    "the type `{target_concrete_name}` cannot be coerced to `&dyn {trait_name}` because it does not implement `{trait_name}`"
+                ),
+                span,
+            });
+        }
+        Ok(target)
     }
 
     /// **M07.4**: typecheck `Path { f1: e1, ... }`. Verifies the path
@@ -2443,6 +2593,40 @@ impl<'a> Typechecker<'a> {
                 Ok(Ty::Unit)
             }
             _ => {
+                // **M07.7**: trait-object dispatch (fourth layer). When the
+                // receiver is `Ty::DynRef { trait_name, .. }` or
+                // `Ty::BoxDyn { trait_name }`, ONLY look up methods declared
+                // by `trait_name` (required + default). Inherent methods are
+                // unreachable through dyn — reject with a clear error.
+                let dyn_trait: Option<String> = match receiver_ty {
+                    Ty::DynRef { trait_name, .. } => Some(trait_name.clone()),
+                    Ty::BoxDyn { trait_name } => Some(trait_name.clone()),
+                    _ => None,
+                };
+                if let Some(trait_name) = dyn_trait {
+                    let schema = self.traits.schemas.get(&trait_name).cloned().ok_or_else(|| {
+                        ParseError {
+                            message: format!("trait `{trait_name}` not in registry (M07.7 invariant)"),
+                            span,
+                        }
+                    })?;
+                    let sig = schema
+                        .required_methods
+                        .get(name)
+                        .or_else(|| schema.default_methods.get(name))
+                        .cloned();
+                    match sig {
+                        Some(sig) => return self.typecheck_method_args(name, args, &sig, span),
+                        None => {
+                            return Err(ParseError {
+                                message: format!(
+                                    "method `{name}` is not in trait `{trait_name}` (trait objects can only call trait methods)"
+                                ),
+                                span,
+                            });
+                        }
+                    }
+                }
                 // **M07.4**: fall through to user-defined methods. Hardcoded
                 // built-ins above always win (R-018 tie-breaker). Auto-deref:
                 // `&T` / `&mut T` receivers dispatch as the underlying T.
@@ -3139,9 +3323,56 @@ impl<'a> Typechecker<'a> {
     /// and `Expr::Unary { Neg, LitInt }` → `Ty::Int(k)` when signed `k` fits
     /// the negated literal. Returns `Some(target)` on successful coercion
     /// (and updates the recorded expression type), `None` otherwise.
+    /// **M07.7**: also handles implicit `&T → &dyn Trait` coercion at
+    /// fn-arg / let-init sites when `T: Trait`.
     fn try_coerce_to(&mut self, expr: &ast::Expr, current: Ty, target: Ty) -> Option<Ty> {
         if current == target {
             return Some(target);
+        }
+        // **M07.7**: implicit trait-object coercion. When the target is
+        // `Ty::DynRef { trait_name, mutable }` and the source is
+        // `Ty::Ref { Ty::Struct(name), source_mut }` where Struct impls Trait
+        // AND mutability is compatible (mut source → mut/shared target;
+        // shared source → shared target only), accept the coercion. The
+        // eval-side construction of Value::DynRef happens at the binding
+        // site (fn-arg or let-init).
+        if let Ty::DynRef { trait_name, mutable: target_mut } = &target {
+            if let Ty::Ref { inner, mutable: source_mut } = &current {
+                let target_concrete_name = match inner.as_ref() {
+                    Ty::Struct { name, .. } => name.clone(),
+                    other => other.name(),
+                };
+                let mutability_ok = match (*target_mut, *source_mut) {
+                    (true, true) => true,   // &mut T → &mut dyn Trait
+                    (false, _) => true,     // &T or &mut T → &dyn Trait (downgrade)
+                    (true, false) => false, // &T → &mut dyn Trait rejected
+                };
+                if mutability_ok {
+                    let key = (trait_name.clone(), target_concrete_name);
+                    if self.trait_impls.impls.contains_key(&key) {
+                        let span = expr.span();
+                        self.types.expr_types.insert(span, target.clone());
+                        return Some(target);
+                    }
+                }
+            }
+        }
+        // **M07.7**: implicit `Box<T>` → `Box<dyn Trait>` coercion. Symmetric
+        // to the DynRef case above — needed for `let b: Box<dyn Show> =
+        // Box::new(p);` to typecheck.
+        if let Ty::BoxDyn { trait_name } = &target {
+            if let Ty::Box(inner) = &current {
+                let target_concrete_name = match inner.as_ref() {
+                    Ty::Struct { name, .. } => name.clone(),
+                    other => other.name(),
+                };
+                let key = (trait_name.clone(), target_concrete_name);
+                if self.trait_impls.impls.contains_key(&key) {
+                    let span = expr.span();
+                    self.types.expr_types.insert(span, target.clone());
+                    return Some(target);
+                }
+            }
         }
         // **M07**: `Vec::new()` typechecks to the sentinel `Ty::Vec(Box::new(Ty::Unit))`;
         // the surrounding let-annotation provides the real element type.
@@ -3251,6 +3482,9 @@ fn ty_contains_param(ty: &Ty) -> bool {
         Ty::Box(i) | Ty::Vec(i) | Ty::Slice(i) => ty_contains_param(i),
         Ty::Array(i, _) => ty_contains_param(i),
         Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Unit | Ty::String | Ty::Str => false,
+        // M07.7: trait-object types carry a trait_name (String), not an inner
+        // Ty. Never contain Ty::Param.
+        Ty::DynRef { .. } | Ty::BoxDyn { .. } => false,
     }
 }
 
@@ -3372,6 +3606,16 @@ fn ty_from_ast(t: &ast::Type) -> Result<Ty, ParseError> {
             let inner_ty = ty_from_ast(inner)?;
             Ok(Ty::Array(Box::new(inner_ty), *size))
         }
+        // **M07.7**: bare `dyn TraitName` outside a Ref/Box wrapper is
+        // unsized — reject. The wrapper `ty_from_ast_resolving_structs`
+        // handles the legal forms (`&dyn`, `&mut dyn`, `Box<dyn>`) before
+        // this free function ever sees a `Type::DynTrait`.
+        ast::Type::DynTrait { trait_name, span } => Err(ParseError {
+            message: format!(
+                "`dyn {trait_name}` is unsized — wrap in `&`, `&mut`, or `Box<_>`"
+            ),
+            span: *span,
+        }),
     }
 }
 

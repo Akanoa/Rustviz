@@ -63,6 +63,13 @@ pub struct StateSnapshot {
     /// stacks and heap panels.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub static_region: Vec<StaticView>,
+    /// **M07.7**: live vtables in the VTABLES panel. One per unique
+    /// `(trait, type)` pair, content-deduplicated. Never shrinks — vtables
+    /// persist for the trace's lifetime (analog of static memory).
+    /// JS renders these as boxes in a dedicated "VTABLES" panel between
+    /// the heap and static-memory panels.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vtables: Vec<VtableView>,
     /// **M07.2**: present when the most recent event is `BytesCopy` (fired
     /// by `String::from` / `push_str`). The UI renders a transient orange
     /// dashed arrow from the source region to the destination heap block
@@ -70,6 +77,14 @@ pub struct StateSnapshot {
     /// be invisible (bytes "magically" appearing in the heap) explicit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_copy: Option<CopyView>,
+    /// **M07.7**: present when the most recent event is a `FrameEnter` for
+    /// a trait-object dispatch (frame name matches `<Type as Trait>::method`
+    /// AND a slot in a caller frame holds a `Value::DynRef` / `Value::BoxDyn`
+    /// with a vtable for the matching `(Trait, Type)` pair). Drives a
+    /// transient two-step dispatch arrow at the call step:
+    /// data → receiver location, vtable → vtable box → new frame card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_dispatch: Option<DispatchView>,
     /// Cursor position (mirrors `Cursor::position`).
     pub position: usize,
     /// Total events in the trace.
@@ -92,6 +107,54 @@ pub struct CopyView {
     pub to: u32,
     /// Bytes copied.
     pub n_bytes: u32,
+}
+
+/// **M07.7**: one vtable in the VTABLES panel. Holds the trait + concrete
+/// type pair plus a per-method dispatch-target label. Persists for the
+/// trace's lifetime — vtables are never freed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VtableView {
+    /// VtableAddr.0 — identifier driving the data-vtable hover wiring.
+    pub addr: u32,
+    /// Trait the vtable implements (e.g. `"Show"`).
+    pub trait_name: String,
+    /// Concrete type the vtable is for (e.g. `"Point"`).
+    pub type_name: String,
+    /// One entry per method: `(name, dispatch_target_label)`.
+    /// Target label: `<TypeName as TraitName>::method` for overrides;
+    /// `<TraitName>::method (default)` for unoverridden defaults.
+    pub methods: Vec<(String, String)>,
+}
+
+/// **M07.7**: transient two-step dispatch indicator. Set on `StateSnapshot`
+/// when the most recent event is `MemEvent::FrameEnter` for a trait-object
+/// method dispatch (frame name in UFCS form AND a caller slot holds the
+/// matching DynRef/BoxDyn). The renderer draws two arrows from the slot's
+/// fat-pointer cells at this cursor step only.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DispatchView {
+    /// Source slot — the slot holding the DynRef/BoxDyn that initiated dispatch.
+    pub source_slot: u32,
+    /// Vtable addr — the box in the VTABLES panel involved in the dispatch.
+    pub vtable_addr: u32,
+    /// Newly-entered frame id — the target frame card.
+    pub target_frame: u32,
+    /// Resolved method name (the trait method that fired).
+    pub method: String,
+}
+
+/// **M07.7**: fat-pointer rendering data for a trait-object slot. Drives the
+/// two labeled cells (`data: → label` + `vtable: → label`) in the slot's
+/// value area. Mutually exclusive with `value`, `inline_cells`, `struct_view`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DynView {
+    /// Label for the data ptr — typically the binding name of the targeted
+    /// slot (e.g. `"p"`) or `"heap[N]"` for `Box<dyn Trait>`.
+    pub data_label: String,
+    /// Label for the vtable ptr — `<TypeName as TraitName>` form.
+    pub vtable_label: String,
+    /// Vtable addr for arrow targeting at hover / dispatch time.
+    pub vtable_addr: u32,
 }
 
 /// **M07.2**: one static-memory block. Holds raw bytes for a unique string
@@ -256,6 +319,12 @@ pub struct SlotRowView {
     /// both `value` (text fallback) and `inline_cells` (array rendering).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub struct_view: Option<StructView>,
+    /// **M07.7**: present when the slot holds a `Value::DynRef` or
+    /// `Value::BoxDyn`. The JS renders a two-cell fat-pointer view in the
+    /// slot's value area (data label + vtable label). Mutually exclusive
+    /// with `value` / `inline_cells` / `struct_view`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dyn_view: Option<DynView>,
 }
 
 /// **M07.4**: per-struct render data for the stack-slot visualization.
@@ -353,6 +422,12 @@ impl Cursor {
         // M07.2: transient copy arrow indicator. Set only on the BytesCopy
         // cursor step; cleared on next step.
         let pending_copy = last.and_then(copy_to_pending);
+        // M07.7: transient dispatch arrow indicator. Set only on a
+        // FrameEnter cursor step where the entered frame's name has the
+        // UFCS `<Type as Trait>::method` form AND a caller slot holds a
+        // matching DynRef/BoxDyn. Drives the two-step (data + vtable)
+        // arrow render.
+        let pending_dispatch = last.and_then(|ev| dispatch_to_pending(ev, &world));
         // M03.1: the currently-executing frame is the topmost active frame in
         // the stack. All other active frames are paused callers waiting for
         // their callee to return; grayed frames have already returned.
@@ -429,6 +504,8 @@ impl Cursor {
         // M07.2: clone the static region for the snapshot. Static blocks
         // persist; this is just a read-only view.
         let static_region = world.static_region.clone();
+        // M07.7: clone the vtables region (analog of static memory; persists).
+        let vtables = world.vtables.clone();
         StateSnapshot {
             frames: world
                 .frames
@@ -442,11 +519,64 @@ impl Cursor {
             arrows,
             heap,
             static_region,
+            vtables,
             pending_copy,
+            pending_dispatch,
             position: self.position,
             total: self.trace.len(),
         }
     }
+}
+
+/// **M07.7**: build the transient dispatch indicator. Triggered only when
+/// the most recent event is a `FrameEnter` whose `fn_name` is in the
+/// UFCS form `<TypeName as TraitName>::method`. Walks the caller frames
+/// for a slot whose `dyn_view` has a matching `<Type as Trait>` label —
+/// that's the slot that initiated dispatch.
+fn dispatch_to_pending(event: &MemEvent, world: &World) -> Option<DispatchView> {
+    let (frame_id, fn_name) = match event {
+        MemEvent::FrameEnter { frame_id, fn_name, .. } => (frame_id.0, fn_name.as_str()),
+        _ => return None,
+    };
+    // Parse the UFCS form: `<Type as Trait>::method`.
+    let (vtable_label, method) = parse_ufcs(fn_name)?;
+    // Search caller frames (skip the innermost active = the just-entered
+    // dispatch frame itself) for a slot whose dyn_view matches the label.
+    let candidates: Vec<&FrameInProgress> = world
+        .frames
+        .iter()
+        .filter(|f| f.active && f.frame_id != frame_id)
+        .collect();
+    // Scan from innermost outward so the most recent caller wins on
+    // overlapping vtables.
+    for frame in candidates.iter().rev() {
+        for slot in &frame.slots {
+            if let Some(dv) = &slot.dyn_view {
+                if dv.vtable_label == vtable_label {
+                    return Some(DispatchView {
+                        source_slot: slot.slot_id,
+                        vtable_addr: dv.vtable_addr,
+                        target_frame: frame_id,
+                        method: method.to_owned(),
+                    });
+                }
+            }
+        }
+    }
+    None
+}
+
+/// **M07.7**: parse a UFCS-style frame name `<Type as Trait>::method` into
+/// `(label "<Type as Trait>", method)`. Returns `None` for non-UFCS names.
+fn parse_ufcs(s: &str) -> Option<(String, &str)> {
+    if !s.starts_with('<') {
+        return None;
+    }
+    let close = s.find('>')?;
+    let after = &s[close + 1..];
+    let method = after.strip_prefix("::")?;
+    let label = s[..=close].to_owned();
+    Some((label, method))
 }
 
 // ─── Internal world model ──────────────────────────────────────────────────
@@ -468,6 +598,10 @@ struct World {
     /// deduplicated). Push on StaticAlloc; never remove (static memory
     /// persists for the trace's lifetime).
     static_region: Vec<StaticView>,
+    /// **M07.7**: live vtables (one per unique `(trait, type)` pair). Push
+    /// on VtableAlloc; never remove (vtables persist for the trace's
+    /// lifetime).
+    vtables: Vec<VtableView>,
 }
 
 struct ActiveBorrowState {
@@ -556,6 +690,9 @@ struct LiveSlot {
     /// the per-field labeled-row rendering. Mutually exclusive with `value`
     /// and `inline_cells`.
     struct_view: Option<StructView>,
+    /// **M07.7**: populated when the slot holds a `Value::DynRef` /
+    /// `Value::BoxDyn` — drives the fat-pointer two-cell rendering.
+    dyn_view: Option<DynView>,
 }
 
 fn apply_event(world: &mut World, event: &MemEvent) {
@@ -601,6 +738,7 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                     value: None,
                     inline_cells: None,
                     struct_view: None,
+                    dyn_view: None,
                 });
             }
         }
@@ -763,6 +901,10 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                 // M07.4: text value suppressed; the per-field StructView
                 // (built below) is the visualization.
                 String::new()
+            } else if matches!(value, Value::DynRef { .. } | Value::BoxDyn { .. }) {
+                // M07.7: text value suppressed; the DynView (built below)
+                // is the fat-pointer two-cell visualization.
+                String::new()
             } else {
                 rendered
             };
@@ -785,6 +927,91 @@ fn apply_event(world: &mut World, event: &MemEvent) {
             // **M07.4**: if Value::Struct, build the StructView from the
             // field values. Drives the per-field labeled-row rendering in
             // the JS (research R-016 Proposal A).
+            // **M07.7**: build the DynView for trait-object slots AND
+            // lazy-materialize the underlying data borrow (so the data-arrow
+            // renders pointing from this slot's `data` cell to the target).
+            // Mirror M07.4's lazy-materialization pattern for borrows that
+            // never fired a BorrowShared event (the `as` cast and implicit
+            // coercion paths skip the BorrowShared step — they reuse the
+            // inner Ref's borrow_id or allocate a fresh one in eval).
+            let dyn_view = match value {
+                Value::DynRef { borrow_id, target, vtable, mutable, trait_name } => {
+                    let data_label = match target {
+                        crate::event::Pointee::Slot(id) => {
+                            lookup_slot_name(&world.frames, id.0)
+                                .unwrap_or_else(|| format!("slot{}", id.0))
+                        }
+                        crate::event::Pointee::Heap(addr) => format!("heap[{}]", addr.0),
+                        crate::event::Pointee::Static(addr) => format!("static[{}]", addr.0),
+                    };
+                    // Find the vtable's (trait, type) labels in the world.
+                    let vtable_label = world
+                        .vtables
+                        .iter()
+                        .find(|v| v.addr == vtable.0)
+                        .map(|v| format!("<{} as {}>", v.type_name, v.trait_name))
+                        .unwrap_or_else(|| format!("<? as {trait_name}>"));
+                    // Lazy-materialize a borrow entry for the data ptr arrow
+                    // if one doesn't already exist for this borrow_id.
+                    // **M07.7**: data-ptr arrows for trait-object slots are
+                    // hover-only — the `data: → p` text inside the fat-pointer
+                    // cell already conveys the pointer; the always-on arrow
+                    // was just visual noise alongside the more-important
+                    // dispatch arrow. Matches [[feedback_arrow_viz_rules]]:
+                    // implicit / calling-convention borrows reveal on hover.
+                    if !world.borrows.iter().any(|b| b.borrow_id == borrow_id.0) {
+                        let t = match target {
+                            crate::event::Pointee::Slot(id) => BorrowTarget::Slot(id.0),
+                            crate::event::Pointee::Heap(addr) => BorrowTarget::Heap(addr.0),
+                            crate::event::Pointee::Static(addr) => BorrowTarget::Static(addr.0),
+                        };
+                        world.borrows.push(ActiveBorrowState {
+                            borrow_id: borrow_id.0,
+                            source_slot: Some(slot_id.0),
+                            target: t,
+                            mutable: *mutable,
+                            slice_len: None,
+                            slice_byte_offset: None,
+                            slice_byte_len: None,
+                            slice_elem_start: None,
+                            field_label: None,
+                            hover_only: true,
+                        });
+                    } else if let Some(b) = world.borrows.iter_mut().find(|b| b.borrow_id == borrow_id.0) {
+                        b.source_slot = Some(slot_id.0);
+                        // Upgrade an existing (e.g. created by an explicit
+                        // `&p` BorrowShared) entry to hover-only when it's
+                        // now bound to a fat-pointer slot.
+                        b.hover_only = true;
+                    }
+                    Some(DynView {
+                        data_label,
+                        vtable_label,
+                        vtable_addr: vtable.0,
+                    })
+                }
+                Value::BoxDyn { addr, vtable, trait_name } => {
+                    let data_label = format!("heap[{}]", addr.0);
+                    let vtable_label = world
+                        .vtables
+                        .iter()
+                        .find(|v| v.addr == vtable.0)
+                        .map(|v| format!("<{} as {}>", v.type_name, v.trait_name))
+                        .unwrap_or_else(|| format!("<? as {trait_name}>"));
+                    // Register an owning relationship for the data ptr arrow.
+                    world.owning.retain(|o| o.source_slot != slot_id.0);
+                    world.owning.push(OwningState {
+                        source_slot: slot_id.0,
+                        target_heap: addr.0,
+                    });
+                    Some(DynView {
+                        data_label,
+                        vtable_label,
+                        vtable_addr: vtable.0,
+                    })
+                }
+                _ => None,
+            };
             let struct_view = if let Value::Struct { name, fields } = value {
                 let field_views: Vec<StructFieldView> = fields
                     .iter()
@@ -818,6 +1045,7 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                     slot.value = Some(rendered);
                     slot.inline_cells = inline_cells;
                     slot.struct_view = struct_view;
+                    slot.dyn_view = dyn_view;
                     return;
                 }
             }
@@ -982,6 +1210,26 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                 display: format!("\"{bytes}\""),
             });
         }
+        // **M07.7**: vtable allocation (fires once per unique
+        // `(trait, type)` pair). Push to the vtables region; never remove.
+        // The per-method target labels render as `<TypeName as TraitName>::method`.
+        MemEvent::VtableAlloc { addr, trait_name, type_name, methods, .. } => {
+            let method_entries: Vec<(String, String)> = methods
+                .iter()
+                .map(|m| {
+                    (
+                        m.clone(),
+                        format!("<{type_name} as {trait_name}>::{m}"),
+                    )
+                })
+                .collect();
+            world.vtables.push(VtableView {
+                addr: addr.0,
+                trait_name: trait_name.clone(),
+                type_name: type_name.clone(),
+                methods: method_entries,
+            });
+        }
         // The remaining variants don't modify world state. `Note` surfaces via
         // `note_to_status`; `BytesCopy` surfaces via `pending_copy` on the
         // most-recent-event side path.
@@ -1015,6 +1263,7 @@ fn frame_to_view(frame: FrameInProgress, current_frame_id: Option<u32>) -> Frame
                 value: s.value,
                 inline_cells: s.inline_cells,
                 struct_view: s.struct_view,
+                dyn_view: s.dyn_view,
             })
             .collect(),
         active: frame.active,
@@ -1108,6 +1357,8 @@ fn value_size_bytes_ui(v: &Value) -> u32 {
         Value::Struct { fields, .. } => {
             fields.iter().map(|(_, v)| value_size_bytes_ui(v)).sum()
         }
+        // M07.7: trait-object fat pointers — 16 bytes (data ptr + vtable ptr).
+        Value::DynRef { .. } | Value::BoxDyn { .. } => 16,
     }
 }
 
@@ -1138,6 +1389,8 @@ fn ty_size_bytes_ui(ty: &Ty) -> u32 {
         // M07.5: type parameter — unreachable at eval/UI time (typeck
         // substitutes before any sizing query). Defensive: 0.
         Ty::Param(_) => 0,
+        // M07.7: trait-object types — 16 bytes (fat pointer).
+        Ty::DynRef { .. } | Ty::BoxDyn { .. } => 16,
     }
 }
 
@@ -1212,6 +1465,20 @@ fn render_value(value: &Value) -> String {
                 .collect();
             format!("{name} {{ {} }}", body.join(", "))
         }
+        // M07.7: trait-object fallback render — fat pointer label.
+        // Normal SlotWrite path uses dyn_view for the two-cell rendering.
+        Value::DynRef { target, mutable, trait_name, vtable, .. } => {
+            let target_str = match target {
+                crate::event::Pointee::Slot(id) => format!("slot{}", id.0),
+                crate::event::Pointee::Heap(addr) => format!("heap[{}]", addr.0),
+                crate::event::Pointee::Static(addr) => format!("static[{}]", addr.0),
+            };
+            let prefix = if *mutable { "&mut dyn" } else { "&dyn" };
+            format!("{prefix} {trait_name} {{ data: {target_str}, vtable: #{} }}", vtable.0)
+        }
+        Value::BoxDyn { addr, trait_name, vtable } => {
+            format!("Box<dyn {trait_name}> {{ data: heap[{}], vtable: #{} }}", addr.0, vtable.0)
+        }
     }
 }
 
@@ -1236,6 +1503,7 @@ fn event_span(event: &MemEvent) -> Span {
         | MemEvent::HeapFree { span, .. }
         | MemEvent::StaticAlloc { span, .. }
         | MemEvent::BytesCopy { span, .. }
+        | MemEvent::VtableAlloc { span, .. }
         | MemEvent::BorrowShared { span, .. }
         | MemEvent::BorrowMut { span, .. }
         | MemEvent::BorrowEnd { span, .. }

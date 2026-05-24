@@ -212,6 +212,28 @@ function render(state) {
         }
         valueEl.appendChild(svEl);
       }
+      // **M07.7**: trait-object slots render as a fat pointer with TWO
+      // labeled cells (`data: → label` and `vtable: → label`) inside the
+      // slot's value column. Mutually exclusive with the regular value
+      // text + struct_view + inline_cells (all suppressed at apply_event
+      // time for DynRef / BoxDyn values). The `dyn-cell-vtable` cell carries
+      // `data-vtable-addr` so dispatch arrows (rendered transiently at
+      // method-call steps) can resolve the right vtable box.
+      if (slot.dyn_view) {
+        const dv = slot.dyn_view;
+        const dvEl = el("div", { class: "dyn-fat-pointer" });
+        dvEl.setAttribute("data-vtable-addr", String(dv.vtable_addr));
+        const dataCell = el("div", { class: "dyn-cell dyn-cell-data" });
+        dataCell.appendChild(el("span", { class: "dyn-cell-label", text: "data:" }));
+        dataCell.appendChild(el("span", { class: "dyn-cell-target", text: `→ ${dv.data_label}` }));
+        const vtableCell = el("div", { class: "dyn-cell dyn-cell-vtable" });
+        vtableCell.setAttribute("data-vtable-addr", String(dv.vtable_addr));
+        vtableCell.appendChild(el("span", { class: "dyn-cell-label", text: "vtable:" }));
+        vtableCell.appendChild(el("span", { class: "dyn-cell-target", text: `→ ${dv.vtable_label}` }));
+        dvEl.appendChild(dataCell);
+        dvEl.appendChild(vtableCell);
+        valueEl.appendChild(dvEl);
+      }
       // **M07.3**: arrays render inline byte-cells + element labels INSIDE
       // the value cell, so the row still consumes exactly 3 grid cells
       // (name | type | value) — appending them as siblings of valueEl
@@ -306,6 +328,10 @@ function render(state) {
   // slice arrows targeting `&'static str` literals query `data-static-addr`.
   renderStaticRegion(state.static_region || []);
   renderHeap(state.heap || []);
+  // **M07.7**: render the VTABLES panel. Each VtableView is one box
+  // listing the trait's methods. Persists for the trace's lifetime,
+  // same as static memory (content-deduplicated by `(trait, type)`).
+  renderVtables(state.vtables || []);
 
   // M06.1 → M07: render arrows LAST, after the status bar AND heap have
   // taken their final layout. Use requestAnimationFrame so the browser has
@@ -316,6 +342,7 @@ function render(state) {
   requestAnimationFrame(() => {
     renderArrows(state.arrows || []);
     renderCopyArrow(state.pending_copy || null);
+    renderDispatchArrow(state.pending_dispatch || null);
   });
 }
 
@@ -759,6 +786,85 @@ function renderCopyArrow(pendingCopy) {
   }
 }
 
+// **M07.7**: render the transient trait-object dispatch indicator. Fires
+// only at the FrameEnter cursor step for a `<Type as Trait>::method`
+// dispatch where a caller slot holds the matching DynRef/BoxDyn. Draws:
+//   1. ONE dashed-orange arrow from the source slot's `dyn-cell-vtable`
+//      directly to the new method frame card.
+//   2. A highlight on the matching method row inside the vtable box —
+//      conveys "the vtable resolved THIS method" without a second arrow.
+// Cleared on the next cursor step (transient, same lifecycle as the
+// BytesCopy arrow).
+function renderDispatchArrow(pendingDispatch) {
+  // Always clear stale method-row highlights from previous step.
+  for (const el of document.querySelectorAll(".vtable-method.vtable-method-highlighted")) {
+    el.classList.remove("vtable-method-highlighted");
+  }
+  if (!pendingDispatch) return;
+  const overlay = document.getElementById("arrow-overlay");
+  if (!overlay) return;
+  const NS = "http://www.w3.org/2000/svg";
+
+  const sourceSlot = pendingDispatch.source_slot;
+  const vtableAddr = pendingDispatch.vtable_addr;
+  const method = pendingDispatch.method;
+
+  const slotEl = document.querySelector(`[data-slot-id="${sourceSlot}"]`);
+  if (!slotEl) return;
+  const slotRow = slotEl.closest(".slot-row");
+  if (!slotRow) return;
+  const vtableCell = slotRow.querySelector(".dyn-cell-vtable");
+  const vtableBox = document.querySelector(`.vtable-box[data-vtable-addr="${vtableAddr}"]`);
+  const frameCard = document.querySelector(".frame-card.frame-current");
+
+  // Highlight the matching method row inside the vtable box (always, even
+  // when the arrow paths can't render). This is the "indirection step"
+  // visual cue — the vtable resolved this specific method.
+  if (vtableBox) {
+    const methodRow = vtableBox.querySelector(`.vtable-method[data-method="${method}"]`);
+    if (methodRow) {
+      methodRow.classList.add("vtable-method-highlighted");
+    }
+  }
+
+  if (!vtableCell || !frameCard) return;
+
+  const overlayBox = overlay.getBoundingClientRect();
+  const dst = frameCard.getBoundingClientRect();
+
+  // Anchor the arrow source at the SLOT NAME element (same anchor as
+  // borrow arrows) so dispatch arrows share the visual vocabulary of
+  // other arrows in the panel — they all "leave the slot from the left".
+  const slotNameSrc = slotEl.getBoundingClientRect();
+
+  // Right-angle path through a dedicated left gutter wider than the
+  // borrow gutter (24px) so dispatch arrows don't overlap any borrow
+  // arrows that share the source slot. Distinctive dashed-orange style
+  // disambiguates anyway, but the wider lane keeps the geometry clean.
+  const ARROW_TIP_GAP = 6;
+  const x1 = slotNameSrc.left - overlayBox.left;
+  const y1 = slotNameSrc.top + slotNameSrc.height / 2 - overlayBox.top;
+  const x2 = dst.left - overlayBox.left - ARROW_TIP_GAP;
+  const y2 = dst.top + dst.height / 2 - overlayBox.top;
+  const lane = 36;
+  const gutterX = Math.min(x1, x2) - lane;
+  const d = `M${x1},${y1} H${gutterX} V${y2} H${x2}`;
+  const path = document.createElementNS(NS, "path");
+  path.setAttribute("d", d);
+  path.setAttribute("class", "arrow-vtable-dispatch");
+  path.setAttribute("marker-end", "url(#arrow-head-vtable)");
+  overlay.appendChild(path);
+
+  // Method label near the arrowhead, just left of the dispatch frame card.
+  const label = document.createElementNS(NS, "text");
+  label.setAttribute("x", String(x2 - 4));
+  label.setAttribute("y", String(y2 - 6));
+  label.setAttribute("class", "arrow-vtable-dispatch-label");
+  label.setAttribute("text-anchor", "end");
+  label.textContent = `dispatch: ${method}`;
+  overlay.appendChild(label);
+}
+
 // **M07.1**: render a heap-box's display, segmenting Vec elements into
 // `<span data-elem-idx="i">` so the slice hover handler can highlight
 // individual elements. Match `Vec [e0, e1, ...] (cap=N, len=N)`. For
@@ -898,6 +1004,56 @@ function renderStaticRegion(staticRegion) {
     if (!seenAddrs.has(addr)) {
       el.remove();
       staticElements.delete(addr);
+    }
+  }
+}
+
+// **M07.7**: render the VTABLES panel. Each VtableView is one box
+// listing the trait's methods. Re-used across renders via a per-addr
+// DOM-element map so the same vtable box stays in place (vtables never
+// move once allocated — content-deduplicated like static memory).
+const vtableElements = new Map();
+function renderVtables(vtables) {
+  const panel = document.getElementById("vtables");
+  if (!panel) return;
+  let container = panel.querySelector(".vtable-blocks");
+  if (!container) {
+    container = document.createElement("div");
+    container.className = "vtable-blocks";
+    panel.appendChild(container);
+  }
+  const seenAddrs = new Set();
+  for (const v of vtables) {
+    seenAddrs.add(v.addr);
+    let box = vtableElements.get(v.addr);
+    if (!box) {
+      box = document.createElement("div");
+      box.className = "vtable-box";
+      box.setAttribute("data-vtable-addr", String(v.addr));
+      const headerEl = document.createElement("div");
+      headerEl.className = "vtable-header";
+      headerEl.textContent = `<${v.type_name} as ${v.trait_name}>`;
+      const methods = document.createElement("div");
+      methods.className = "vtable-methods";
+      for (const [name, target] of v.methods) {
+        const row = document.createElement("div");
+        row.className = "vtable-method";
+        row.setAttribute("data-method", name);
+        row.textContent = `${name} → ${target}`;
+        methods.appendChild(row);
+      }
+      box.appendChild(headerEl);
+      box.appendChild(methods);
+      container.appendChild(box);
+      vtableElements.set(v.addr, box);
+    }
+  }
+  // Cleanup stale entries on cursor rewind (vtables never disappear in
+  // forward execution, but rewinding can rewind past their VtableAlloc).
+  for (const [addr, el] of [...vtableElements.entries()]) {
+    if (!seenAddrs.has(addr)) {
+      el.remove();
+      vtableElements.delete(addr);
     }
   }
 }

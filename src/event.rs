@@ -51,6 +51,13 @@ pub enum Pointee {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct StaticAddr(pub u32);
 
+/// **M07.7**: identifier for a vtable in the VTABLES region. Distinct from
+/// `HeapAddr` / `StaticAddr` / `SlotId` — vtables are a separate memory
+/// region (analog of M07.2's static memory but for function-pointer tables).
+/// Content-deduplicated by `(trait, type)`; monotonic; never reused.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct VtableAddr(pub u32);
+
 /// A runtime value held in a stack slot.
 ///
 /// **M03.2**: integer and float variants unified to `{ kind, bits|value }` form
@@ -141,6 +148,33 @@ pub enum Value {
         /// Field values in declaration order. Tuples are `(name, value)`.
         fields: Vec<(String, Value)>,
     },
+    /// **M07.7**: fat-pointer trait-object value (borrow form). Contains
+    /// data ptr (target Pointee) + vtable ptr (VtableAddr). The borrow_id
+    /// tracks the underlying borrow for lifecycle / aliasing.
+    DynRef {
+        /// Identifier of the active borrow.
+        borrow_id: BorrowId,
+        /// What the data ptr points at — a stack slot or a heap allocation.
+        target: Pointee,
+        /// What the vtable ptr points at — a vtable in the VTABLES region.
+        vtable: VtableAddr,
+        /// `true` for `&mut dyn Trait`, `false` for `&dyn Trait`.
+        mutable: bool,
+        /// The trait this dyn-ref exposes (e.g. `"Show"`).
+        trait_name: String,
+    },
+    /// **M07.7**: fat-pointer trait-object value (heap-owning form via Box).
+    /// Heap addr stores the underlying data; vtable addr identifies the
+    /// per-(type, trait) vtable. Sibling of `Value::Box` (not an extension)
+    /// because the runtime shape differs (16 bytes vs 8).
+    BoxDyn {
+        /// Heap address of the underlying data allocation.
+        addr: HeapAddr,
+        /// VTABLES-region addr identifying the (trait, type) pair.
+        vtable: VtableAddr,
+        /// The trait this dyn-Box exposes.
+        trait_name: String,
+    },
     /// **M07.1**: slice value — a fat pointer (target + length) into a heap
     /// allocation. Sibling of `Value::Ref` (not an extension); slices carry
     /// extra `len` metadata and live in the same active-borrow registry, so
@@ -197,6 +231,11 @@ impl Value {
             Self::Array { .. } => "[]",
             // M07.4: struct. Short tag — full `"Point"` rendering comes from the Ty layer.
             Self::Struct { .. } => "{}",
+            // **M07.7**: trait-object fat pointers. Short tags; the Ty layer
+            // renders the full `&dyn Show` / `Box<dyn Show>` form.
+            Self::DynRef { mutable: false, .. } => "&dyn",
+            Self::DynRef { mutable: true, .. } => "&mut dyn",
+            Self::BoxDyn { .. } => "Box<dyn>",
         }
     }
 }
@@ -395,6 +434,26 @@ pub enum MemEvent {
         /// resolution in the lexer).
         bytes: String,
         /// Source location of the literal that first interned this content.
+        span: Span,
+    },
+    /// **M07.7**: a vtable was allocated in the VTABLES region. Fires
+    /// ONCE per unique `(trait_name, type_name)` pair when the first
+    /// trait-object value targeting that pair is constructed. Content-
+    /// deduplicated — multiple `&dyn Show` borrows of Point share one
+    /// vtable. Never freed (vtables persist for the trace's lifetime).
+    /// Analog of `MemEvent::StaticAlloc` from M07.2.
+    VtableAlloc {
+        /// Identifier of the new vtable.
+        addr: VtableAddr,
+        /// Trait the vtable implements (e.g. `"Show"`).
+        trait_name: String,
+        /// Concrete type the vtable is for (e.g. `"Point"`).
+        type_name: String,
+        /// Method names in trait-declaration order. Each name carries a
+        /// dispatch-target label rendered as `<TypeName as TraitName>::method`
+        /// (resolved by the UI from the trait registries).
+        methods: Vec<String>,
+        /// Source location of the construction that triggered the interning.
         span: Span,
     },
     /// **M07.2**: N bytes were copied from a source memory region into a

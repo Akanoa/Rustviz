@@ -231,6 +231,16 @@ pub enum Type {
         /// Span from `[` through `]`.
         span: Span,
     },
+    /// **M07.7**: trait-object type `dyn TraitName`. The `&` / `&mut` wrap
+    /// is handled by the outer `Type::Ref { inner: Type::DynTrait, .. }`
+    /// pattern; bare `Type::DynTrait` only appears inside `Box<dyn _>`
+    /// (the wrapping `Box<T>` machinery provides the indirection).
+    DynTrait {
+        /// Single-segment trait name (e.g. `"Show"`).
+        trait_name: String,
+        /// Span from `dyn` keyword through the trait name.
+        span: Span,
+    },
 }
 
 /// A block: zero or more statements followed by an optional tail expression.
@@ -443,6 +453,17 @@ pub enum Expr {
         /// Span from receiver start through `name`.
         span: Span,
     },
+    /// **M07.7**: cast expression `inner as TargetType`. In M07.7 only used
+    /// for `&p as &dyn Show` coercion; future numeric/string casts would
+    /// reuse this AST node.
+    Cast {
+        /// The value being cast.
+        inner: Box<Expr>,
+        /// Destination type.
+        target_ty: Type,
+        /// Span from `inner` start through `target_ty`'s end.
+        span: Span,
+    },
 }
 
 /// **M07.4**: one field initializer inside a struct literal.
@@ -478,7 +499,8 @@ impl Expr {
             | Self::Range { span, .. }
             | Self::ArrayLit { span, .. }
             | Self::StructLit { span, .. }
-            | Self::FieldAccess { span, .. } => *span,
+            | Self::FieldAccess { span, .. }
+            | Self::Cast { span, .. } => *span,
             Self::StrLit(_, s) => *s,
             Self::Block(b) => b.span,
         }

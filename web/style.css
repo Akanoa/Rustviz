@@ -628,6 +628,130 @@ main > section:last-child {
   box-sizing: border-box;
 }
 
+/* **M07.7**: VTABLES panel. One box per `(trait, type)` pair; persists for
+   the trace's lifetime. Visually distinct from static — warm cream background
+   + orange accent (matches the dispatch-arrow color). */
+#vtables {
+  padding: 0.5rem 1rem;
+  background: linear-gradient(to bottom, #fbf6ee, #f0e8d8);
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  min-height: 60px;
+  flex: 0.6; /* narrower than stacks/heap */
+}
+
+#vtables .vtables-label {
+  font-style: italic;
+  font-size: 11px;
+  color: var(--muted);
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+
+#vtables .vtable-blocks {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  align-content: flex-start;
+}
+
+.vtable-box {
+  display: inline-flex;
+  flex-direction: column;
+  border: 1px solid #c9a96a;
+  border-radius: 4px;
+  padding: 0.3rem 0.5rem;
+  background: #fdfaf2;
+  font-size: 12px;
+  max-width: 100%;
+}
+
+.vtable-box .vtable-header {
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-weight: 600;
+  font-size: 11px;
+  color: #b46e16;
+  margin-bottom: 2px;
+}
+
+.vtable-box .vtable-methods {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.vtable-box .vtable-method {
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-size: 11px;
+  color: #5a4a2a;
+  padding: 1px 2px;
+  border-radius: 2px;
+  transition: background 120ms ease-out, color 120ms ease-out;
+}
+
+/* **M07.7**: transient highlight on a vtable method row when dispatch
+   resolved to that method. Set by `renderDispatchArrow` at the FrameEnter
+   cursor step; cleared on the next step. The visual is "this row was
+   looked up" — the indirection step made concrete without a second arrow. */
+.vtable-box .vtable-method.vtable-method-highlighted {
+  background: #f4d398;
+  color: #6a3a08;
+  font-weight: 600;
+}
+
+/* **M07.7**: trait-object slot rendering — fat-pointer cells inside the
+   slot's value column. Two stacked labeled rows (`data:` and `vtable:`)
+   make the 16-byte fat-pointer composition tangible. Mirrors the
+   struct-view's labeled-row pattern but with orange accent (matches
+   vtable visual language). */
+.dyn-fat-pointer {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 2px 0;
+  padding: 3px 6px;
+  border: 1px solid #c9a96a;
+  border-radius: 3px;
+  background: #fdfaf2;
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-size: 11px;
+}
+
+.dyn-cell {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+}
+
+.dyn-cell-label {
+  color: var(--muted);
+  font-size: 10px;
+  min-width: 40px;
+}
+
+.dyn-cell-target {
+  color: #5a4a2a;
+}
+
+/* **M07.7**: trait-object dispatch arrows. Dashed orange to convey
+   "runtime indirection" — visually distinct from M06-7's solid palette
+   (blue=shared, red=mut, black=owning, orange-solid=copy). Transient —
+   visible only at the dispatch cursor step. */
+.arrow-vtable-dispatch {
+  stroke: #b46e16;
+  stroke-width: 2;
+  stroke-dasharray: 4 3;
+  fill: none;
+}
+
+.arrow-vtable-dispatch-label {
+  fill: #b46e16;
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-size: 10px;
+  font-weight: 600;
+}
+
 #heap {
   /* M07: the later #heap rule above defines padding for the active heap
      panel (4rem top to give arrow lanes room). This rule only contributes

@@ -63,6 +63,7 @@ fn event_span(event: &MemEvent) -> rustviz::Span {
         | MemEvent::HeapFree { span, .. }
         | MemEvent::StaticAlloc { span, .. }
         | MemEvent::BytesCopy { span, .. }
+        | MemEvent::VtableAlloc { span, .. }
         | MemEvent::BorrowShared { span, .. }
         | MemEvent::BorrowMut { span, .. }
         | MemEvent::BorrowEnd { span, .. }
