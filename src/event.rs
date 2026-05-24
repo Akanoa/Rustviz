@@ -81,11 +81,12 @@ pub enum Value {
     Bool(bool),
     /// Unit `()`.
     Unit,
-    /// **M06 (restructured in M07)**: a borrow value held in a stack slot.
-    /// Created by an `Expr::Borrow` evaluation; identified by `borrow_id`
-    /// matching a `BorrowShared` or `BorrowMut` event. `target` was
-    /// `target_slot: SlotId` in M06; M07 widens to `Pointee` so heap
-    /// borrows (`&v[0]` into a Vec's allocation) are representable.
+    /// **M06 (restructured in M07; extended in M07.4)**: a borrow value held
+    /// in a stack slot. Created by an `Expr::Borrow` evaluation; identified
+    /// by `borrow_id` matching a `BorrowShared` or `BorrowMut` event.
+    /// `target` was `target_slot: SlotId` in M06; M07 widens to `Pointee` so
+    /// heap borrows are representable. M07.4 adds `field_path` for
+    /// sub-field borrows (`&p.x` → `field_path: vec!["x"]`).
     Ref {
         /// Identifier of the active borrow.
         borrow_id: BorrowId,
@@ -93,6 +94,15 @@ pub enum Value {
         target: Pointee,
         /// `true` for `&mut`, `false` for `&`.
         mutable: bool,
+        /// **M07.4**: navigation path into a sub-field of the target.
+        /// Empty when the ref points at the whole binding (M06+ semantics);
+        /// non-empty when it points at a struct sub-field via `&p.x`.
+        /// Single-segment in M07.4 (nested struct fields are out of scope).
+        /// Serde-default-empty so existing M06+ borrow snapshots stay
+        /// byte-identical (the field is omitted from JSON when empty and
+        /// defaults back to empty on deserialization).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        field_path: Vec<String>,
     },
     /// **M07**: owns a Box-allocated value. The actual value lives in the
     /// evaluator's heap state at `addr`.
@@ -120,6 +130,16 @@ pub enum Value {
         /// Element type — used for sizing (`N * elem_size`) and as the
         /// parent type when this array is sliced (`Ty::Slice(elem_ty)`).
         elem_ty: crate::typeck::Ty,
+    },
+    /// **M07.4**: struct value — N fields held inline in the binding's
+    /// stack slot. No heap allocation. Field order matches the type's
+    /// declaration order. Cloning deep-copies each field. Structs are
+    /// Copy in M07.4 (primitive-only field restriction).
+    Struct {
+        /// Struct type name (e.g. `"Point"`).
+        name: String,
+        /// Field values in declaration order. Tuples are `(name, value)`.
+        fields: Vec<(String, Value)>,
     },
     /// **M07.1**: slice value — a fat pointer (target + length) into a heap
     /// allocation. Sibling of `Value::Ref` (not an extension); slices carry
@@ -175,6 +195,8 @@ impl Value {
             Self::Slice { .. } => "&[]",
             // M07.3: array. Short tag — full `[T; N]` rendering comes from the Ty layer.
             Self::Array { .. } => "[]",
+            // M07.4: struct. Short tag — full `"Point"` rendering comes from the Ty layer.
+            Self::Struct { .. } => "{}",
         }
     }
 }

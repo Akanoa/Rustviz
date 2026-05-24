@@ -222,6 +222,10 @@ pub fn lex(file: FileId, source_map: &SourceMap) -> Result<Vec<Token>, ParseErro
                 "return" => TokenKind::Return,
                 "true" => TokenKind::Bool(true),
                 "false" => TokenKind::Bool(false),
+                // **M07.4**: struct decl + impl block + self-receiver keywords.
+                "struct" => TokenKind::Struct,
+                "impl" => TokenKind::Impl,
+                "self" => TokenKind::SelfKw,
                 _ => TokenKind::Ident(s.to_owned()),
             };
             tokens.push(Token {

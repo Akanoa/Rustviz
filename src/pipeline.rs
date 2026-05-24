@@ -1091,4 +1091,380 @@ mod tests {
         ));
         assert!(has_inv, "expected runtime error for inverted slice range");
     }
+
+    // ─── M07.4 / US1: struct decl + literal + field access ────────────────
+
+    /// `struct Point { x: i32, y: i32 } let p = Point { x: 1, y: 2 };
+    /// let a = p.x;` — typechecks; emits Value::Struct SlotWrite for p
+    /// with field order matching the declaration; a's SlotWrite has
+    /// Int(I32, 1); zero heap events.
+    #[test]
+    fn run_pipeline_struct_basic() {
+        let source = "struct Point { x: i32, y: i32 }\nfn main() {\n    let p = Point { x: 1, y: 2 };\n    let a = p.x;\n}\n";
+        let events = run_pipeline(source).expect("struct compiles");
+        // SlotWrite of p with Value::Struct { name: "Point", fields: [("x", 1), ("y", 2)] }.
+        let p_write = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite {
+                value: crate::Value::Struct { name, fields },
+                ..
+            } if name == "Point"
+                && fields.len() == 2
+                && matches!(&fields[0], (fname, crate::Value::Int { kind: crate::typeck::IntKind::I32, bits: 1 }) if fname == "x")
+                && matches!(&fields[1], (fname, crate::Value::Int { kind: crate::typeck::IntKind::I32, bits: 2 }) if fname == "y")
+        ));
+        assert!(p_write, "expected SlotWrite of Value::Struct {{ Point, [(x,1),(y,2)] }}");
+        // SlotWrite of a with Int(I32, 1).
+        let a_write = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite {
+                value: crate::Value::Int { kind: crate::typeck::IntKind::I32, bits: 1 },
+                ..
+            }
+        ));
+        assert!(a_write, "expected a = p.x = 1_i32");
+        // Zero heap events.
+        let heap_count = events.iter().filter(|e| matches!(
+            e,
+            crate::MemEvent::HeapAlloc { .. } | crate::MemEvent::HeapRealloc { .. } | crate::MemEvent::HeapFree { .. }
+        )).count();
+        assert_eq!(heap_count, 0, "structs are stack-only — no heap events expected");
+    }
+
+    /// Field-shorthand: `let x = 1; let y = 2; let p = Point { x, y };`.
+    /// Resolves each shorthand to the bound local; constructed struct
+    /// identical to the full-form literal.
+    #[test]
+    fn run_pipeline_struct_shorthand() {
+        let source = "struct Point { x: i32, y: i32 }\nfn main() {\n    let x = 1;\n    let y = 2;\n    let p = Point { x, y };\n}\n";
+        let events = run_pipeline(source).expect("shorthand compiles");
+        let p_write = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite {
+                value: crate::Value::Struct { name, fields },
+                ..
+            } if name == "Point"
+                && matches!(&fields[0], (n, crate::Value::Int { bits: 1, .. }) if n == "x")
+                && matches!(&fields[1], (n, crate::Value::Int { bits: 2, .. }) if n == "y")
+        ));
+        assert!(p_write, "expected Point {{ x: 1, y: 2 }} via shorthand");
+    }
+
+    /// Missing field in struct literal — typeck error.
+    #[test]
+    fn run_pipeline_struct_missing_field() {
+        let source = "struct Point { x: i32, y: i32 }\nfn main() {\n    let p = Point { x: 1 };\n}\n";
+        let err = run_pipeline(source).expect_err("missing field should fail typeck");
+        assert_eq!(err.stage, CompileStage::Typeck);
+        assert!(
+            err.message.contains("missing field `y`"),
+            "error mentions the missing field: got `{}`",
+            err.message
+        );
+    }
+
+    /// Extra field in struct literal — typeck error.
+    #[test]
+    fn run_pipeline_struct_extra_field() {
+        let source = "struct Point { x: i32, y: i32 }\nfn main() {\n    let p = Point { x: 1, y: 2, z: 3 };\n}\n";
+        let err = run_pipeline(source).expect_err("extra field should fail typeck");
+        assert_eq!(err.stage, CompileStage::Typeck);
+        assert!(
+            err.message.contains("no field `z`"),
+            "error mentions the unknown field: got `{}`",
+            err.message
+        );
+    }
+
+    /// Mixed primitive field types — integer literal coerces to f64 field.
+    /// Regression: an early M07.4 build emitted `Value::Int { I32, 2 }`
+    /// for `y: 2` because eval's `LitInt` arm only honored coerced
+    /// `Ty::Int` types and fell through to default I32 for `Ty::Float`.
+    /// The UI showed `y: i32` for an f64 field as a result.
+    #[test]
+    fn run_pipeline_struct_int_to_float_coercion() {
+        let source = "struct Point { x: i32, y: f64 }\nfn main() {\n    let p = Point { x: 1, y: 2 };\n}\n";
+        let events = run_pipeline(source).expect("mixed-type struct compiles");
+        let p_write = events.iter().find_map(|e| match e {
+            crate::MemEvent::SlotWrite {
+                value: crate::Value::Struct { name, fields },
+                ..
+            } if name == "Point" => Some(fields.clone()),
+            _ => None,
+        });
+        let fields = p_write.expect("expected Value::Struct for Point");
+        assert!(
+            matches!(&fields[0], (n, crate::Value::Int { kind: crate::typeck::IntKind::I32, bits: 1 }) if n == "x"),
+            "x should be i32 = 1, got {:?}", fields[0],
+        );
+        assert!(
+            matches!(&fields[1], (n, crate::Value::Float { kind: crate::typeck::FloatKind::F64, value }) if n == "y" && *value == 2.0),
+            "y should be f64 = 2.0 (coerced from int literal), got {:?}", fields[1],
+        );
+    }
+
+    /// Wrong-type field value — typeck error pointing at the value.
+    #[test]
+    fn run_pipeline_struct_wrong_type() {
+        let source = "struct Point { x: i32, y: i32 }\nfn main() {\n    let p = Point { x: true, y: 2 };\n}\n";
+        let err = run_pipeline(source).expect_err("wrong-type field should fail typeck");
+        assert_eq!(err.stage, CompileStage::Typeck);
+        assert!(
+            err.message.contains("expected `i32`") && err.message.contains("found `bool`"),
+            "error mentions the type mismatch: got `{}`",
+            err.message
+        );
+    }
+
+    // ─── M07.4 / US2: field borrow + per-field metadata ─────────────────
+
+    /// `let r = &p.x;` — emits Value::Ref { field_path: ["x"],
+    /// target: Pointee::Slot(p_slot) } in r's SlotWrite, AND skips
+    /// BorrowShared emission (slot-target field borrows use lazy
+    /// materialization per M07.3 pattern).
+    #[test]
+    fn run_pipeline_field_borrow() {
+        let source = "struct Point { x: i32, y: i32 }\nfn main() {\n    let p = Point { x: 1, y: 2 };\n    let r = &p.x;\n}\n";
+        let events = run_pipeline(source).expect("field borrow compiles");
+        let ref_write = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite {
+                value: crate::Value::Ref {
+                    target: crate::event::Pointee::Slot(_),
+                    mutable: false,
+                    field_path,
+                    ..
+                },
+                ..
+            } if field_path.len() == 1 && field_path[0] == "x"
+        ));
+        assert!(ref_write, "expected SlotWrite of Value::Ref with field_path=[\"x\"]");
+        // Lazy materialization: no BorrowShared event for this borrow.
+        let bs_count = events.iter().filter(|e| matches!(
+            e,
+            crate::MemEvent::BorrowShared { target: crate::event::Pointee::Slot(_), .. }
+        )).count();
+        assert_eq!(
+            bs_count, 0,
+            "field-borrow lifecycle is invisible — no BorrowShared event expected"
+        );
+    }
+
+    // ─── M07.4 / US3: method dispatch ───────────────────────────────────
+
+    /// `impl Point { fn x(&self) -> i32 { self.x } } let v = p.x();` —
+    /// method dispatches into a new frame; self is bound to a Value::Ref
+    /// pointing at p's slot; self.x reads through the ref to find the
+    /// struct field; ReturnValue carries Int(I32, 1); v gets 1_i32.
+    #[test]
+    fn run_pipeline_method() {
+        let source = "struct Point { x: i32, y: i32 }\nimpl Point { fn x(&self) -> i32 { self.x } }\nfn main() {\n    let p = Point { x: 1, y: 2 };\n    let v = p.x();\n}\n";
+        let events = run_pipeline(source).expect("method compiles");
+        // FrameEnter for Point::x.
+        let frame_enter = events.iter().any(|e| matches!(e,
+            crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "Point::x"
+        ));
+        assert!(frame_enter, "expected FrameEnter for `Point::x`");
+        // self SlotWrite with Value::Ref → Pointee::Slot.
+        let self_write = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite {
+                value: crate::Value::Ref {
+                    target: crate::event::Pointee::Slot(_),
+                    mutable: false,
+                    field_path,
+                    ..
+                },
+                ..
+            } if field_path.is_empty()
+        ));
+        assert!(self_write, "expected SlotWrite for self with Value::Ref {{ target: Slot, .. }}");
+        // ReturnValue Int(I32, 1).
+        let return_value = events.iter().any(|e| matches!(e,
+            crate::MemEvent::ReturnValue {
+                value: crate::Value::Int { kind: crate::typeck::IntKind::I32, bits: 1 },
+                ..
+            }
+        ));
+        assert!(return_value, "expected ReturnValue Int(I32, 1) from Point::x");
+        // v's SlotWrite carries Int(I32, 1).
+        let v_write = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite {
+                value: crate::Value::Int { kind: crate::typeck::IntKind::I32, bits: 1 },
+                ..
+            }
+        ));
+        assert!(v_write, "expected v = p.x() = 1_i32");
+    }
+
+    /// Two methods in one impl block — dispatch correctly resolves each.
+    #[test]
+    fn run_pipeline_method_two_methods() {
+        let source = "struct Point { x: i32, y: i32 }\nimpl Point {\n    fn x(&self) -> i32 { self.x }\n    fn dist(&self) -> i32 { self.x }\n}\nfn main() {\n    let p = Point { x: 7, y: 9 };\n    let v = p.dist();\n}\n";
+        let events = run_pipeline(source).expect("two-method impl compiles");
+        let dist_frame = events.iter().any(|e| matches!(e,
+            crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "Point::dist"
+        ));
+        assert!(dist_frame, "expected FrameEnter for Point::dist (not Point::x)");
+        let v_write = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite {
+                value: crate::Value::Int { kind: crate::typeck::IntKind::I32, bits: 7 },
+                ..
+            }
+        ));
+        assert!(v_write, "expected v = p.dist() = 7_i32");
+    }
+
+    /// Unknown method — typeck error.
+    #[test]
+    fn run_pipeline_method_unknown() {
+        let source = "struct Point { x: i32, y: i32 }\nfn main() {\n    let p = Point { x: 1, y: 2 };\n    let v = p.bogus();\n}\n";
+        let err = run_pipeline(source).expect_err("unknown method should fail typeck");
+        assert_eq!(err.stage, CompileStage::Typeck);
+        assert!(
+            err.message.contains("no method `bogus`"),
+            "error mentions the unknown method: got `{}`",
+            err.message
+        );
+    }
+
+    /// `&p.z` where Point has no field `z` — typeck error.
+    #[test]
+    fn run_pipeline_field_borrow_unknown() {
+        let source = "struct Point { x: i32, y: i32 }\nfn main() {\n    let p = Point { x: 1, y: 2 };\n    let r = &p.z;\n}\n";
+        let err = run_pipeline(source).expect_err("unknown field should fail typeck");
+        assert_eq!(err.stage, CompileStage::Typeck);
+        assert!(
+            err.message.contains("no field `z`"),
+            "error mentions the unknown field: got `{}`",
+            err.message
+        );
+    }
+
+    // ─── M07.4 / US4: associated function ────────────────────────────────
+
+    /// `impl Point { fn new(x: i32, y: i32) -> Point { Point { x, y } } }
+    /// let p = Point::new(1, 2);` — path call dispatches to the user
+    /// assoc fn; new frame opens with x=1, y=2 params (NO self); body
+    /// constructs Point { x, y } via shorthand; returns the struct; p
+    /// lands it.
+    #[test]
+    fn run_pipeline_assoc_fn() {
+        let source = "struct Point { x: i32, y: i32 }\nimpl Point { fn new(x: i32, y: i32) -> Point { Point { x, y } } }\nfn main() {\n    let p = Point::new(1, 2);\n}\n";
+        let events = run_pipeline(source).expect("assoc fn compiles");
+        let frame = events.iter().any(|e| matches!(e,
+            crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "Point::new"
+        ));
+        assert!(frame, "expected FrameEnter for `Point::new`");
+        // ReturnValue carries the constructed Value::Struct.
+        let rv = events.iter().any(|e| matches!(e,
+            crate::MemEvent::ReturnValue {
+                value: crate::Value::Struct { name, fields },
+                ..
+            } if name == "Point"
+                && matches!(&fields[0], (n, crate::Value::Int { bits: 1, .. }) if n == "x")
+                && matches!(&fields[1], (n, crate::Value::Int { bits: 2, .. }) if n == "y")
+        ));
+        assert!(rv, "expected ReturnValue of constructed Point");
+        // p's SlotWrite carries that struct.
+        let p_write = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite {
+                value: crate::Value::Struct { name, fields },
+                ..
+            } if name == "Point" && fields.len() == 2
+        ));
+        assert!(p_write, "expected SlotWrite for p with Value::Struct(Point)");
+    }
+
+    /// Mixed dispatch: `Vec::new` (builtin) + `Point::new` (user) both
+    /// resolve correctly.
+    #[test]
+    fn run_pipeline_assoc_fn_mixed() {
+        let source = "struct Point { x: i32, y: i32 }\nimpl Point { fn new(x: i32, y: i32) -> Point { Point { x, y } } }\nfn main() {\n    let v: Vec<i32> = Vec::new();\n    let p = Point::new(3, 4);\n}\n";
+        let events = run_pipeline(source).expect("mixed dispatch compiles");
+        // Vec::new emits HeapAlloc.
+        let heap = events.iter().any(|e| matches!(e, crate::MemEvent::HeapAlloc { .. }));
+        assert!(heap, "expected HeapAlloc from Vec::new (builtin)");
+        // Point::new emits FrameEnter.
+        let frame = events.iter().any(|e| matches!(e,
+            crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "Point::new"
+        ));
+        assert!(frame, "expected FrameEnter for Point::new (user assoc fn)");
+    }
+
+    /// Forward reference: `impl Point` AT TOP precedes `struct Point` —
+    /// 2-pass typeck makes this work since phase 1 collects all schemas
+    /// + impls before phase 2 typechecks bodies.
+    #[test]
+    fn run_pipeline_struct_forward_ref() {
+        let source = "impl Point { fn new(x: i32, y: i32) -> Point { Point { x, y } } }\nstruct Point { x: i32, y: i32 }\nfn main() {\n    let p = Point::new(5, 6);\n}\n";
+        let events = run_pipeline(source).expect("forward reference compiles via two-pass typeck");
+        let p_write = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite {
+                value: crate::Value::Struct { name, .. },
+                ..
+            } if name == "Point"
+        ));
+        assert!(p_write, "expected p = Point::new(5, 6) → Value::Struct(Point)");
+    }
+
+    // ─── M07.4 / T052: field assignment ─────────────────────────────────
+
+    /// `let mut p = Point { x: 1, y: 2 }; p.x = 5;` — mutates p's struct
+    /// in place. Emits a SlotWrite with the WHOLE updated Value::Struct
+    /// (x=5, y=2). After the write, p.x reads as 5.
+    #[test]
+    fn run_pipeline_struct_field_assign() {
+        let source = "struct Point { x: i32, y: i32 }\nfn main() {\n    let mut p = Point { x: 1, y: 2 };\n    p.x = 5;\n    let a = p.x;\n}\n";
+        let events = run_pipeline(source).expect("field assign compiles");
+        // Two SlotWrites for p: first with x=1,y=2; second with x=5,y=2.
+        let p_writes: Vec<_> = events.iter().filter_map(|e| match e {
+            crate::MemEvent::SlotWrite {
+                value: crate::Value::Struct { name, fields },
+                ..
+            } if name == "Point" => Some(fields.clone()),
+            _ => None,
+        }).collect();
+        assert_eq!(p_writes.len(), 2, "expected 2 SlotWrites for p (init + assign)");
+        // Second write has x=5, y=2.
+        let second = &p_writes[1];
+        assert!(
+            matches!(&second[0], (n, crate::Value::Int { bits: 5, .. }) if n == "x"),
+            "second SlotWrite should have x=5"
+        );
+        assert!(
+            matches!(&second[1], (n, crate::Value::Int { bits: 2, .. }) if n == "y"),
+            "second SlotWrite should keep y=2"
+        );
+        // a = p.x reads back as 5.
+        let a_write = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite {
+                value: crate::Value::Int { bits: 5, .. },
+                ..
+            }
+        ));
+        assert!(a_write, "expected a = p.x = 5_i32 after the assignment");
+    }
+
+    /// Field assignment to an immutable struct binding — typeck error.
+    #[test]
+    fn run_pipeline_struct_field_assign_immutable() {
+        let source = "struct Point { x: i32, y: i32 }\nfn main() {\n    let p = Point { x: 1, y: 2 };\n    p.x = 5;\n}\n";
+        let err = run_pipeline(source).expect_err("immutable field assign should fail");
+        assert_eq!(err.stage, CompileStage::Typeck);
+        assert!(
+            err.message.contains("immutable"),
+            "error mentions immutability: got `{}`",
+            err.message
+        );
+    }
+
+    /// Struct-only programs emit ZERO heap events (stack-only pedagogy).
+    #[test]
+    fn run_pipeline_struct_no_heap() {
+        let source = "struct Point { x: i32, y: i32 }\nimpl Point { fn new(x: i32, y: i32) -> Point { Point { x, y } } fn x(&self) -> i32 { self.x } }\nfn main() {\n    let p = Point::new(1, 2);\n    let v = p.x();\n}\n";
+        let events = run_pipeline(source).expect("struct-only compiles");
+        let heap_count = events.iter().filter(|e| matches!(
+            e,
+            crate::MemEvent::HeapAlloc { .. }
+                | crate::MemEvent::HeapRealloc { .. }
+                | crate::MemEvent::HeapFree { .. }
+        )).count();
+        assert_eq!(heap_count, 0, "struct-only programs must emit zero heap events");
+    }
 }

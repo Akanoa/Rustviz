@@ -23,6 +23,7 @@ Ok(
                                     ),
                                 },
                             },
+                            kind: Normal,
                             span: Span {
                                 start: 43,
                                 end: 49,
@@ -45,6 +46,7 @@ Ok(
                                     ),
                                 },
                             },
+                            kind: Normal,
                             span: Span {
                                 start: 51,
                                 end: 57,

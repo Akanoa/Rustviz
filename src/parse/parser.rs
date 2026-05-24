@@ -1,6 +1,9 @@
 //! Pratt parser for expressions; recursive descent for items, statements, blocks.
 
-use super::ast::{BinOp, Block, Expr, FnDecl, Item, LetStmt, Param, Program, Stmt, Type, UnOp};
+use super::ast::{
+    BinOp, Block, Expr, FnDecl, ImplBlock, Item, LetStmt, Param, ParamKind, Program, Stmt,
+    StructDecl, StructField, StructLitField, Type, UnOp,
+};
 use super::error::ParseError;
 use super::span::{FileId, Span, SourceMap};
 use super::token::{Token, TokenKind};
@@ -17,6 +20,7 @@ pub fn parse_tokens(
         cursor: 0,
         file,
         eof_pos,
+        restrict_struct_lit: false,
     };
     parser.parse_program()
 }
@@ -26,6 +30,17 @@ struct Parser {
     cursor: usize,
     file: FileId,
     eof_pos: u32,
+    /// **M07.4**: when true, `parse_atom` does NOT treat `Ident { ... }` as
+    /// a struct literal — instead it stops at the Ident and lets the outer
+    /// caller see the `{` (which is then interpreted as the start of a
+    /// block, e.g. the `then` block of an `if` or `while`). Mirrors Rust's
+    /// "no struct literals in cond positions" rule.
+    ///
+    /// Set true when parsing the cond of `if`/`while`; reset to false
+    /// inside `( ... )`, struct literals' fields, blocks `{ ... }`, and
+    /// any other context where a struct literal is grammatically
+    /// unambiguous.
+    restrict_struct_lit: bool,
 }
 
 impl Parser {
@@ -91,9 +106,74 @@ impl Parser {
     fn parse_item(&mut self) -> Result<Item, ParseError> {
         if self.at(&TokenKind::Fn) {
             Ok(Item::Fn(self.parse_fn_decl()?))
+        } else if self.at(&TokenKind::Struct) {
+            Ok(Item::Struct(self.parse_struct_decl()?))
+        } else if self.at(&TokenKind::Impl) {
+            Ok(Item::Impl(self.parse_impl_block()?))
         } else {
-            Err(self.error_expected("an item (e.g. `fn`)"))
+            Err(self.error_expected("an item (`fn`, `struct`, or `impl`)"))
         }
+    }
+
+    /// **M07.4**: `struct Name { f1: T1, f2: T2 }`. At least one field
+    /// required — empty structs rejected at parse time with a clear message.
+    fn parse_struct_decl(&mut self) -> Result<StructDecl, ParseError> {
+        let kw = self.expect(&TokenKind::Struct, "`struct`")?;
+        let name = self.expect_ident("struct name")?;
+        self.expect(&TokenKind::LBrace, "`{`")?;
+        let mut fields = Vec::new();
+        let mut field_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        while !self.at(&TokenKind::RBrace) {
+            let name_span = self.peek().span;
+            let field_name = self.expect_ident("field name")?;
+            if !field_names.insert(field_name.clone()) {
+                return Err(ParseError {
+                    message: format!("duplicate field `{field_name}` in struct `{name}`"),
+                    span: name_span,
+                });
+            }
+            self.expect(&TokenKind::Colon, "`:`")?;
+            let ty = self.parse_type()?;
+            let field_span = name_span.merge(type_span(&ty));
+            fields.push(StructField {
+                name: field_name,
+                ty,
+                span: field_span,
+            });
+            if self.bump_if(&TokenKind::Comma).is_none() {
+                break;
+            }
+        }
+        let rbrace = self.expect(&TokenKind::RBrace, "`}`")?;
+        if fields.is_empty() {
+            return Err(ParseError {
+                message: "structs in M07.4 must have at least one field".into(),
+                span: kw.span.merge(rbrace.span),
+            });
+        }
+        Ok(StructDecl {
+            name,
+            fields,
+            span: kw.span.merge(rbrace.span),
+        })
+    }
+
+    /// **M07.4**: `impl Type { fn ...; fn ...; }`. M07.4 supports inherent
+    /// impls only (no traits), and a single-segment type path.
+    fn parse_impl_block(&mut self) -> Result<ImplBlock, ParseError> {
+        let kw = self.expect(&TokenKind::Impl, "`impl`")?;
+        let ty_name = self.expect_ident("type name after `impl`")?;
+        self.expect(&TokenKind::LBrace, "`{`")?;
+        let mut items = Vec::new();
+        while !self.at(&TokenKind::RBrace) {
+            items.push(self.parse_fn_decl()?);
+        }
+        let rbrace = self.expect(&TokenKind::RBrace, "`}`")?;
+        Ok(ImplBlock {
+            ty_name,
+            items,
+            span: kw.span.merge(rbrace.span),
+        })
     }
 
     fn parse_fn_decl(&mut self) -> Result<FnDecl, ParseError> {
@@ -101,8 +181,10 @@ impl Parser {
         let name = self.expect_ident("function name")?;
         self.expect(&TokenKind::LParen, "`(`")?;
         let mut params = Vec::new();
+        let mut idx = 0usize;
         while !self.at(&TokenKind::RParen) {
-            params.push(self.parse_param()?);
+            params.push(self.parse_param(idx)?);
+            idx += 1;
             if self.bump_if(&TokenKind::Comma).is_none() {
                 break;
             }
@@ -124,13 +206,96 @@ impl Parser {
         })
     }
 
-    fn parse_param(&mut self) -> Result<Param, ParseError> {
+    /// Parse one parameter. `index` is the parameter's position (0-based) so
+    /// we can recognize self-receivers ONLY at position 0 and reject them
+    /// elsewhere. The parser doesn't know whether we're inside an `impl`
+    /// block — phase-1 typeck rejects self-receivers inside free `fn`
+    /// declarations.
+    fn parse_param(&mut self, index: usize) -> Result<Param, ParseError> {
+        // **M07.4**: self-receiver patterns at the first param position.
+        //   `self`, `&self`, `&mut self`
+        // The ty placeholder is `Type::Path { segments: ["__SelfPlaceholder"] }`
+        // which phase-1 typeck replaces with the enclosing impl block's
+        // real `Ty::Struct` (or `Ty::Ref { Ty::Struct, .. }`).
+        if matches!(
+            self.peek().kind,
+            TokenKind::SelfKw | TokenKind::Amp | TokenKind::AmpMut
+        ) {
+            // Determine if this is a self-receiver shape.
+            let kind_opt = match self.peek().kind {
+                TokenKind::SelfKw => Some(ParamKind::SelfOwned),
+                TokenKind::Amp
+                    if matches!(
+                        self.tokens.get(self.cursor + 1).map(|t| &t.kind),
+                        Some(TokenKind::SelfKw)
+                    ) =>
+                {
+                    Some(ParamKind::SelfShared)
+                }
+                TokenKind::AmpMut
+                    if matches!(
+                        self.tokens.get(self.cursor + 1).map(|t| &t.kind),
+                        Some(TokenKind::SelfKw)
+                    ) =>
+                {
+                    Some(ParamKind::SelfMut)
+                }
+                _ => None,
+            };
+            if let Some(kind) = kind_opt {
+                if index != 0 {
+                    let span_tok = self.peek().clone();
+                    return Err(ParseError {
+                        message: "`self` parameter must be the first parameter".into(),
+                        span: span_tok.span,
+                    });
+                }
+                // Consume the borrow prefix (if any) and the `self` keyword.
+                let start_span = self.peek().span;
+                if matches!(kind, ParamKind::SelfShared | ParamKind::SelfMut) {
+                    self.bump(); // `&` or `&mut`
+                }
+                let self_tok = self.expect(&TokenKind::SelfKw, "`self`")?;
+                let end_span = self_tok.span;
+                let placeholder_inner = Type::Path {
+                    segments: vec!["__SelfPlaceholder".to_owned()],
+                    span: end_span,
+                };
+                let ty = match kind {
+                    ParamKind::SelfOwned => placeholder_inner,
+                    ParamKind::SelfShared => Type::Ref {
+                        inner: Box::new(placeholder_inner),
+                        mutable: false,
+                        span: start_span.merge(end_span),
+                    },
+                    ParamKind::SelfMut => Type::Ref {
+                        inner: Box::new(placeholder_inner),
+                        mutable: true,
+                        span: start_span.merge(end_span),
+                    },
+                    ParamKind::Normal => unreachable!(),
+                };
+                return Ok(Param {
+                    name: "self".to_owned(),
+                    ty,
+                    kind,
+                    span: start_span.merge(end_span),
+                });
+            }
+            // `&` not followed by `self` at param position — fall through;
+            // the upcoming `expect_ident` will produce a clear error.
+        }
         let name_span = self.peek().span;
         let name = self.expect_ident("parameter name")?;
         self.expect(&TokenKind::Colon, "`:`")?;
         let ty = self.parse_type()?;
         let span = name_span.merge(type_span(&ty));
-        Ok(Param { name, ty, span })
+        Ok(Param {
+            name,
+            ty,
+            kind: ParamKind::Normal,
+            span,
+        })
     }
 
     fn parse_type(&mut self) -> Result<Type, ParseError> {
@@ -223,6 +388,9 @@ impl Parser {
 
     fn parse_block(&mut self) -> Result<Block, ParseError> {
         let lbrace = self.expect(&TokenKind::LBrace, "`{`")?;
+        // **M07.4**: block bodies are NOT cond positions — re-enable struct
+        // literals (in case we're parsing the then-block of an `if`).
+        let prev_restrict = std::mem::replace(&mut self.restrict_struct_lit, false);
         let mut stmts = Vec::new();
         let mut tail: Option<Box<Expr>> = None;
         loop {
@@ -252,6 +420,7 @@ impl Parser {
             }
         }
         let rbrace = self.expect(&TokenKind::RBrace, "`}`")?;
+        self.restrict_struct_lit = prev_restrict;
         let span = lbrace.span.merge(rbrace.span);
         Ok(Block { stmts, tail, span })
     }
@@ -282,25 +451,44 @@ impl Parser {
         let mut lhs = self.parse_atom()?;
         loop {
             // **M07**: postfix method call `expr.method(args)`.
+            // **M07.4**: same `Dot Ident` prefix can also mean field access
+            // `expr.name` when NOT followed by `(`. One-token lookahead
+            // disambiguates here.
             if self.at(&TokenKind::Dot) {
                 self.bump(); // `.`
-                let name = self.expect_ident("method name")?;
-                self.expect(&TokenKind::LParen, "`(`")?;
-                let mut args = Vec::new();
-                while !self.at(&TokenKind::RParen) {
-                    args.push(self.parse_expr(0)?);
-                    if self.bump_if(&TokenKind::Comma).is_none() {
-                        break;
+                let name_span = self.peek().span;
+                let name = self.expect_ident("field or method name")?;
+                if self.at(&TokenKind::LParen) {
+                    self.bump(); // `(`
+                    // **M07.4**: call args are NOT cond positions —
+                    // re-enable struct literals.
+                    let prev_restrict =
+                        std::mem::replace(&mut self.restrict_struct_lit, false);
+                    let mut args = Vec::new();
+                    while !self.at(&TokenKind::RParen) {
+                        args.push(self.parse_expr(0)?);
+                        if self.bump_if(&TokenKind::Comma).is_none() {
+                            break;
+                        }
                     }
+                    self.restrict_struct_lit = prev_restrict;
+                    let rparen = self.expect(&TokenKind::RParen, "`)`")?;
+                    let span = lhs.span().merge(rparen.span);
+                    lhs = Expr::MethodCall {
+                        receiver: Box::new(lhs),
+                        name,
+                        args,
+                        span,
+                    };
+                } else {
+                    // **M07.4**: field access — no trailing `(`.
+                    let span = lhs.span().merge(name_span);
+                    lhs = Expr::FieldAccess {
+                        receiver: Box::new(lhs),
+                        name,
+                        span,
+                    };
                 }
-                let rparen = self.expect(&TokenKind::RParen, "`)`")?;
-                let span = lhs.span().merge(rparen.span);
-                lhs = Expr::MethodCall {
-                    receiver: Box::new(lhs),
-                    name,
-                    args,
-                    span,
-                };
                 continue;
             }
             // **M07**: postfix indexing `expr[index]`.
@@ -309,7 +497,11 @@ impl Parser {
             // and produce an `Expr::Index { index: Expr::Range { .. }, .. }`.
             if self.at(&TokenKind::LBracket) {
                 let lbracket = self.bump(); // `[`
+                // **M07.4**: index arg is NOT cond position — re-enable
+                // struct literals.
+                let prev_restrict = std::mem::replace(&mut self.restrict_struct_lit, false);
                 let index = self.parse_index_inner(lbracket.span)?;
+                self.restrict_struct_lit = prev_restrict;
                 let rbracket = self.expect(&TokenKind::RBracket, "`]`")?;
                 let span = lhs.span().merge(rbracket.span);
                 lhs = Expr::Index {
@@ -322,6 +514,8 @@ impl Parser {
             // Postfix call: `expr(args, ...)`.
             if self.at(&TokenKind::LParen) {
                 self.bump(); // `(`
+                // **M07.4**: call args are NOT cond positions.
+                let prev_restrict = std::mem::replace(&mut self.restrict_struct_lit, false);
                 let mut args = Vec::new();
                 while !self.at(&TokenKind::RParen) {
                     args.push(self.parse_expr(0)?);
@@ -329,6 +523,7 @@ impl Parser {
                         break;
                     }
                 }
+                self.restrict_struct_lit = prev_restrict;
                 let rparen = self.expect(&TokenKind::RParen, "`)`")?;
                 let span = lhs.span().merge(rparen.span);
                 lhs = Expr::Call {
@@ -432,6 +627,8 @@ impl Parser {
         // after `parse_atom`, so there's no grammar conflict.
         if self.at(&TokenKind::LBracket) {
             let lbracket = self.bump();
+            // **M07.4**: array-literal elements are NOT cond positions.
+            let prev_restrict = std::mem::replace(&mut self.restrict_struct_lit, false);
             let mut elements = Vec::new();
             if !self.at(&TokenKind::RBracket) {
                 loop {
@@ -445,6 +642,7 @@ impl Parser {
                     }
                 }
             }
+            self.restrict_struct_lit = prev_restrict;
             let rbracket = self.expect(&TokenKind::RBracket, "`]`")?;
             return Ok(Expr::ArrayLit {
                 elements,
@@ -482,6 +680,12 @@ impl Parser {
                         segments,
                         span: start_tok.span.merge(end_span),
                     })
+                } else if self.at(&TokenKind::LBrace) && !self.restrict_struct_lit {
+                    // **M07.4**: struct literal `Name { f1: e1, f2: e2 }`.
+                    // Disabled in cond positions (`if c { ... }`,
+                    // `while c { ... }`) where a `{` after an ident MUST
+                    // be the start of the then-block per Rust's grammar.
+                    self.parse_struct_lit(vec![name], start_tok.span)
                 } else {
                     Ok(Expr::Ident(name, tok.span))
                 }
@@ -494,7 +698,12 @@ impl Parser {
             }
             TokenKind::LParen => {
                 let lparen = self.bump();
+                // **M07.4**: parentheses re-enable struct literals
+                // regardless of the outer cond-position restriction
+                // (matches Rust: `if (Point { .. }).x > 0` is fine).
+                let prev_restrict = std::mem::replace(&mut self.restrict_struct_lit, false);
                 let inner = self.parse_expr(0)?;
+                self.restrict_struct_lit = prev_restrict;
                 let rparen = self.expect(&TokenKind::RParen, "`)`")?;
                 Ok(Expr::Paren {
                     inner: Box::new(inner),
@@ -507,7 +716,13 @@ impl Parser {
             }
             TokenKind::If => {
                 let if_kw = self.bump();
+                // **M07.4**: gate struct-literal parsing inside the cond.
+                // `if c { ... }` must NOT parse `c { ... }` as a struct
+                // literal — the `{` is the then-block. Save and restore
+                // around the cond expression.
+                let prev_restrict = std::mem::replace(&mut self.restrict_struct_lit, true);
                 let cond = self.parse_expr(0)?;
+                self.restrict_struct_lit = prev_restrict;
                 let then_block = self.parse_block()?;
                 let else_block = if self.bump_if(&TokenKind::Else).is_some() {
                     Some(Box::new(self.parse_block()?))
@@ -529,6 +744,14 @@ impl Parser {
             TokenKind::Bang => self.parse_unary(UnOp::Not),
             TokenKind::Amp | TokenKind::AmpMut => self.parse_borrow_expr(),
             TokenKind::Star => self.parse_deref_expr(),
+            // **M07.4**: `self` in expression position resolves to the
+            // bound `self` parameter of the enclosing method. Treated as
+            // a regular identifier from here on — resolve.rs looks up
+            // "self" in the current scope.
+            TokenKind::SelfKw => {
+                self.bump();
+                Ok(Expr::Ident("self".to_owned(), tok.span))
+            }
             _ => Err(self.error_expected("expression")),
         }
     }
@@ -573,6 +796,49 @@ impl Parser {
         })
     }
 
+    /// **M07.4**: parse `{ name: expr, name, ... }` after a struct's path
+    /// has already been consumed. `path_start_span` covers the path; the
+    /// resulting `Expr::StructLit` span runs from path start through `}`.
+    fn parse_struct_lit(
+        &mut self,
+        path: Vec<String>,
+        path_start_span: Span,
+    ) -> Result<Expr, ParseError> {
+        self.expect(&TokenKind::LBrace, "`{`")?;
+        // **M07.4**: struct-literal field VALUES are arbitrary expressions
+        // and not in cond-position — re-enable struct literals (in case
+        // we're nested inside an `if` cond context that disabled them).
+        let prev_restrict = std::mem::replace(&mut self.restrict_struct_lit, false);
+        let mut fields = Vec::new();
+        while !self.at(&TokenKind::RBrace) {
+            let name_span = self.peek().span;
+            let field_name = self.expect_ident("field name")?;
+            let (value, end_span) = if self.bump_if(&TokenKind::Colon).is_some() {
+                let value = self.parse_expr(0)?;
+                let end = value.span();
+                (Some(value), end)
+            } else {
+                // Shorthand: just the bound local name, no `: value`.
+                (None, name_span)
+            };
+            fields.push(StructLitField {
+                name: field_name,
+                value,
+                span: name_span.merge(end_span),
+            });
+            if self.bump_if(&TokenKind::Comma).is_none() {
+                break;
+            }
+        }
+        self.restrict_struct_lit = prev_restrict;
+        let rbrace = self.expect(&TokenKind::RBrace, "`}`")?;
+        Ok(Expr::StructLit {
+            path,
+            fields,
+            span: path_start_span.merge(rbrace.span),
+        })
+    }
+
     fn expect_ident(&mut self, label: &str) -> Result<String, ParseError> {
         let tok = self.peek().clone();
         if let TokenKind::Ident(s) = &tok.kind {
@@ -596,6 +862,8 @@ fn items_last_span(items: &[Item]) -> Span {
 fn item_span(item: &Item) -> Span {
     match item {
         Item::Fn(f) => f.span,
+        Item::Struct(s) => s.span,
+        Item::Impl(i) => i.span,
     }
 }
 

@@ -276,6 +276,67 @@ main > section {
   gap: 2px;
 }
 
+/* **M07.4**: struct view inside a stack slot's value area. Per
+   research R-016 Proposal A — vertical labeled rows. Each field
+   gets a row with `name: ty` label, byte-cells, and the value.
+   Pedagogically: makes the byte layout + named composition visible
+   together. */
+.slot-row .slot-value:has(.struct-view) {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+.struct-view {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  border: 1px solid #999;
+  padding: 4px 6px;
+  background: #fafafa;
+  border-radius: 3px;
+  max-width: 260px;
+}
+
+.struct-field {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 8px;
+  align-items: center;
+  font-size: 11px;
+  padding: 2px 4px;
+  border-radius: 2px;
+}
+
+.struct-field-label {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  color: var(--muted);
+}
+
+.struct-field-cells {
+  display: flex;
+  gap: 1px;
+}
+
+.struct-field-cells .byte-cell {
+  width: 8px;
+  height: 8px;
+  border: 1px solid #999;
+  background: #c8c8c6;
+  box-sizing: border-box;
+}
+
+.struct-field-value {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  color: inherit;
+}
+
+/* M07.4 — per-field hover-highlight (US2 wires this up next). */
+.struct-field.field-borrow-highlighted {
+  background: #fffde7;
+  outline: 2px solid #fbc02d;
+}
+
 /* **M07.3**: inline byte-cells for stack-allocated arrays. Rendered
    inside the slot's value area (NOT in the heap panel). Gray-tinted
    to distinguish from heap blocks' blue cells — pedagogically conveys
@@ -431,6 +492,34 @@ main > section {
 }
 
 #arrow-overlay .arrow-len-label.label-visible {
+  opacity: 1;
+}
+
+/* **M07.4**: field-borrow annotation (`.x`) on `&p.x` arrows. Same
+   hover-revealed pattern as the slice [len: N] label. */
+#arrow-overlay .arrow-field-label {
+  font-size: 10px;
+  fill: #4d8fcd;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  user-select: none;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 100ms ease-out;
+}
+
+#arrow-overlay .arrow-field-label.label-visible {
+  opacity: 1;
+}
+
+/* **M07.4**: method-self arrow (calling-convention borrow). Hidden by
+   default; revealed on hover of the `self` slot row. Same fade timing
+   as the slice/field labels — visually consistent reveal-on-hover. */
+#arrow-overlay .arrow-hover-only {
+  opacity: 0;
+  transition: opacity 100ms ease-out;
+}
+
+#arrow-overlay .arrow-hover-only.arrow-visible {
   opacity: 1;
 }
 

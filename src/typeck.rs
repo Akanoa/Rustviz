@@ -201,6 +201,17 @@ pub enum Ty {
     /// runtime size) and `Ty::Slice(T)` (size-erased borrow). Copy iff
     /// `T: Copy` — M07.3 restricts elements to primitives so always Copy.
     Array(Box<Ty>, u64),
+    /// **M07.4**: nominal struct type. Equality is by `name` only (the
+    /// `fields` are carried for convenience so callers can read the
+    /// schema without a registry round-trip; they're redundant for
+    /// identity). M07.4 fields are restricted to primitives so the
+    /// struct is always Copy.
+    Struct {
+        /// Type name (e.g. `"Point"`).
+        name: String,
+        /// Fields in declaration order. Mirrors `StructDecl.fields`.
+        fields: Vec<(String, Ty)>,
+    },
 }
 
 impl Ty {
@@ -229,6 +240,8 @@ impl Ty {
             Self::Str => "&str".to_owned(),
             // M07.3: array — `[T; N]`.
             Self::Array(inner, size) => format!("[{}; {}]", inner.name(), size),
+            // M07.4: struct — bare type name (matches Rust's nominal typing).
+            Self::Struct { name, .. } => name.clone(),
         }
     }
 
@@ -249,6 +262,10 @@ impl Ty {
             // M07.3: arrays are Copy iff their element type is Copy. M07.3
             // restricts elements to primitives (all Copy), so always true.
             Self::Array(inner, _) => inner.is_copy(),
+            // M07.4: structs are Copy iff all fields are Copy. M07.4
+            // restricts fields to primitives so always true; future
+            // milestones with non-Copy fields will produce false here.
+            Self::Struct { fields, .. } => fields.iter().all(|(_, t)| t.is_copy()),
         }
     }
 }
@@ -291,7 +308,15 @@ pub struct TypeMap {
 pub fn typeck(program: &ast::Program, resolution: &Resolution) -> Result<TypeMap, ParseError> {
     let mut t = Typechecker::new(program, resolution);
 
-    // Phase 1: compute FnSig for every top-level fn item and seed binding_types.
+    // Phase 1: collect struct schemas + impl-block signatures into the
+    // typeck-side registries (M07.4) AND compute FnSig for every top-level
+    // free fn item, seeding binding_types.
+    // **M07.4**: structs first so impl blocks can reference them.
+    for item in &program.items {
+        if let ast::Item::Struct(decl) = item {
+            t.register_struct(decl)?;
+        }
+    }
     for item in &program.items {
         match item {
             ast::Item::Fn(decl) => {
@@ -301,13 +326,26 @@ pub fn typeck(program: &ast::Program, resolution: &Resolution) -> Result<TypeMap
                     .expect("fn binding present after resolve");
                 t.types.binding_types.insert(id, BindingType::Fn(sig));
             }
+            // Structs already processed above.
+            ast::Item::Struct(_) => {}
+            // M07.4 impl blocks register methods + assoc fns.
+            ast::Item::Impl(block) => t.register_impl(block)?,
         }
     }
 
-    // Phase 2: typecheck each fn body.
+    // Phase 2: typecheck each fn body. Free fns go through the regular
+    // typecheck_fn path. Impl-block fns (methods + assoc fns) use the
+    // dedicated typecheck_impl_fn helper which handles the self-receiver
+    // placeholder substitution.
     for item in &program.items {
         match item {
             ast::Item::Fn(decl) => t.typecheck_fn(decl)?,
+            ast::Item::Struct(_) => {}
+            ast::Item::Impl(block) => {
+                for fn_decl in &block.items {
+                    t.typecheck_impl_fn(&block.ty_name, fn_decl)?;
+                }
+            }
         }
     }
 
@@ -414,6 +452,35 @@ mod borrow_tracker {
     }
 }
 
+/// **M07.4**: per-struct schema collected during phase 1. Maps struct name →
+/// declaration-ordered field list. Phase 2 consults this to typecheck struct
+/// literals, field accesses, and field borrows.
+#[derive(Default)]
+struct StructRegistry {
+    schemas: IndexMap<String, Vec<(String, Ty)>>,
+    /// Spans of the declaring `Item::Struct` for diagnostic anchoring on
+    /// duplicate-definition errors.
+    decl_spans: IndexMap<String, Span>,
+}
+
+/// **M07.4**: collected method + associated-function signatures from `impl`
+/// blocks. Built during phase 1 so phase 2 dispatch lookups have full
+/// visibility regardless of source order.
+#[derive(Default)]
+struct ImplRegistry {
+    /// `(struct_name, method_name)` → method signature (with self-receiver
+    /// info stripped from `params` — recorded on `ParamKind`).
+    methods: IndexMap<(String, String), FnSig>,
+    /// `vec!["Struct", "name"]` → associated-fn signature.
+    assoc_fns: IndexMap<Vec<String>, FnSig>,
+    /// Spans for diagnostics.
+    method_spans: IndexMap<(String, String), Span>,
+    assoc_fn_spans: IndexMap<Vec<String>, Span>,
+    /// Tracks struct names that already have one impl block so duplicates
+    /// can be rejected per the M07.4 "one impl block per type" rule.
+    impl_block_spans: IndexMap<String, Span>,
+}
+
 struct Typechecker<'a> {
     resolution: &'a Resolution,
     types: TypeMap,
@@ -423,6 +490,10 @@ struct Typechecker<'a> {
     borrow_tracker: borrow_tracker::BorrowTracker,
     /// **M06**: current scope depth (incremented on block enter, decremented on exit).
     scope_depth: u32,
+    /// **M07.4**: struct schemas collected in phase 1.
+    structs: StructRegistry,
+    /// **M07.4**: method + assoc-fn registry collected in phase 1.
+    impls: ImplRegistry,
 }
 
 impl<'a> Typechecker<'a> {
@@ -433,7 +504,171 @@ impl<'a> Typechecker<'a> {
             current_fn_ret: None,
             borrow_tracker: borrow_tracker::BorrowTracker::new(),
             scope_depth: 0,
+            structs: StructRegistry::default(),
+            impls: ImplRegistry::default(),
         }
+    }
+
+    /// **M07.4**: phase-1 — register a struct's schema. Rejects duplicate
+    /// struct names and non-primitive field types.
+    fn register_struct(&mut self, decl: &ast::StructDecl) -> Result<(), ParseError> {
+        if let Some(prev) = self.structs.decl_spans.get(&decl.name) {
+            let prev_line = prev.start; // raw byte offset; good enough for the message
+            return Err(ParseError {
+                message: format!(
+                    "struct `{}` already defined (previous definition at byte {prev_line})",
+                    decl.name
+                ),
+                span: decl.span,
+            });
+        }
+        let mut fields: Vec<(String, Ty)> = Vec::with_capacity(decl.fields.len());
+        for field in &decl.fields {
+            let ty = ty_from_ast(&field.ty)?;
+            // M07.4 restricts fields to primitive types (Int, Float, Bool,
+            // Unit). Non-Copy / composite types are out of scope.
+            let primitive = matches!(
+                ty,
+                Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Unit
+            );
+            if !primitive {
+                return Err(ParseError {
+                    message: format!(
+                        "field `{}` of struct `{}` has type `{}`; M07.4 fields must be primitive types (i32, bool, etc.)",
+                        field.name,
+                        decl.name,
+                        ty.name()
+                    ),
+                    span: field.span,
+                });
+            }
+            fields.push((field.name.clone(), ty));
+        }
+        self.structs.schemas.insert(decl.name.clone(), fields);
+        self.structs.decl_spans.insert(decl.name.clone(), decl.span);
+        Ok(())
+    }
+
+    /// **M07.4**: struct-aware `ty_from_ast` wrapper. Used by phase-1 fn
+    /// signature collection (free + impl-block) so `-> Point` and
+    /// param types like `p: Point` resolve to `Ty::Struct(...)` instead
+    /// of "unknown type `Point`". Falls back to the standard `ty_from_ast`
+    /// for everything else.
+    fn ty_from_ast_resolving_structs(&self, t: &ast::Type) -> Result<Ty, ParseError> {
+        if let ast::Type::Path { segments, .. } = t {
+            if segments.len() == 1 {
+                if let Some(fields) = self.structs.schemas.get(&segments[0]) {
+                    return Ok(Ty::Struct {
+                        name: segments[0].clone(),
+                        fields: fields.clone(),
+                    });
+                }
+            }
+        }
+        ty_from_ast(t)
+    }
+
+    /// **M07.4**: phase-1 — register an impl block's methods + assoc fns
+    /// into the dispatch tables. Verifies the type exists, rejects a second
+    /// impl block for the same type, and rejects duplicate item names.
+    fn register_impl(&mut self, block: &ast::ImplBlock) -> Result<(), ParseError> {
+        if !self.structs.schemas.contains_key(&block.ty_name) {
+            return Err(ParseError {
+                message: format!(
+                    "impl block references unknown type `{}` (M07.4 supports inherent impls on user-defined structs only — not on built-ins like Vec or String)",
+                    block.ty_name
+                ),
+                span: block.span,
+            });
+        }
+        if let Some(prev_span) = self.impls.impl_block_spans.get(&block.ty_name) {
+            let _ = prev_span;
+            return Err(ParseError {
+                message: format!(
+                    "M07.4 supports only one impl block per type; merge into a single block (existing impl block for `{}` already declared)",
+                    block.ty_name
+                ),
+                span: block.span,
+            });
+        }
+        self.impls.impl_block_spans.insert(block.ty_name.clone(), block.span);
+        for fn_decl in &block.items {
+            self.register_impl_fn(&block.ty_name, fn_decl)?;
+        }
+        Ok(())
+    }
+
+    /// **M07.4**: register one fn item inside an impl block. The first
+    /// param's `kind` distinguishes method (self-receiver) from associated
+    /// fn (no self). For methods, the self-receiver's placeholder type is
+    /// swapped for the real `Ty::Struct(_)` or `Ty::Ref { Ty::Struct(_), .. }`.
+    fn register_impl_fn(
+        &mut self,
+        struct_name: &str,
+        decl: &ast::FnDecl,
+    ) -> Result<(), ParseError> {
+        // Resolve the struct's Ty for self-receiver substitution.
+        let struct_ty = Ty::Struct {
+            name: struct_name.to_owned(),
+            fields: self.structs.schemas[struct_name].clone(),
+        };
+        // Build the signature, treating the self-receiver (if present) as
+        // ALREADY consumed — `params` here is the explicit-only param list.
+        let mut explicit_params: Vec<Ty> = Vec::new();
+        let mut self_kind: Option<ast::ParamKind> = None;
+        for (i, param) in decl.params.iter().enumerate() {
+            if i == 0 && !matches!(param.kind, ast::ParamKind::Normal) {
+                self_kind = Some(param.kind);
+                continue;
+            }
+            if !matches!(param.kind, ast::ParamKind::Normal) {
+                return Err(ParseError {
+                    message: "`self` parameter must be the first parameter".into(),
+                    span: param.span,
+                });
+            }
+            explicit_params.push(self.ty_from_ast_resolving_structs(&param.ty)?);
+        }
+        let ret = match &decl.return_ty {
+            Some(t) => self.ty_from_ast_resolving_structs(t)?,
+            None => Ty::Unit,
+        };
+        let sig = FnSig { params: explicit_params, ret };
+        match self_kind {
+            Some(_) => {
+                // Method. The self-receiver type is implicit (struct_ty for
+                // SelfOwned, &struct_ty / &mut struct_ty for SelfShared/SelfMut)
+                // and recorded separately via Param.kind on the FnDecl AST node.
+                let _ = struct_ty;
+                let key = (struct_name.to_owned(), decl.name.clone());
+                if self.impls.methods.contains_key(&key) {
+                    return Err(ParseError {
+                        message: format!(
+                            "method `{}` already defined on `{}`",
+                            decl.name, struct_name
+                        ),
+                        span: decl.span,
+                    });
+                }
+                self.impls.method_spans.insert(key.clone(), decl.span);
+                self.impls.methods.insert(key, sig);
+            }
+            None => {
+                let key = vec![struct_name.to_owned(), decl.name.clone()];
+                if self.impls.assoc_fns.contains_key(&key) {
+                    return Err(ParseError {
+                        message: format!(
+                            "associated fn `{}` already defined on `{}`",
+                            decl.name, struct_name
+                        ),
+                        span: decl.span,
+                    });
+                }
+                self.impls.assoc_fn_spans.insert(key.clone(), decl.span);
+                self.impls.assoc_fns.insert(key, sig);
+            }
+        }
+        Ok(())
     }
 
     fn lookup_binding(&self, mut pred: impl FnMut(&crate::resolve::BindingDecl) -> bool) -> Option<BindingId> {
@@ -446,10 +681,10 @@ impl<'a> Typechecker<'a> {
     fn build_fn_sig(&self, decl: &ast::FnDecl) -> Result<FnSig, ParseError> {
         let mut params = Vec::with_capacity(decl.params.len());
         for param in &decl.params {
-            params.push(ty_from_ast(&param.ty)?);
+            params.push(self.ty_from_ast_resolving_structs(&param.ty)?);
         }
         let ret = match &decl.return_ty {
-            Some(t) => ty_from_ast(t)?,
+            Some(t) => self.ty_from_ast_resolving_structs(t)?,
             None => Ty::Unit,
         };
         Ok(FnSig { params, ret })
@@ -470,6 +705,79 @@ impl<'a> Typechecker<'a> {
             self.types
                 .binding_types
                 .insert(pid, BindingType::Var(param_ty.clone()));
+        }
+        let prev = self.current_fn_ret.replace(sig.ret.clone());
+        let body_ty = self.typecheck_block(&decl.body)?;
+        if body_ty != sig.ret {
+            return Err(ParseError {
+                message: format!(
+                    "function returns `{}`, but body has type `{}`",
+                    sig.ret.name(),
+                    body_ty.name()
+                ),
+                span: decl
+                    .body
+                    .tail
+                    .as_ref()
+                    .map(|t| t.span())
+                    .unwrap_or(decl.body.span),
+            });
+        }
+        self.current_fn_ret = prev;
+        Ok(())
+    }
+
+    /// **M07.4**: typecheck an impl-block fn body. Mirrors `typecheck_fn`
+    /// but:
+    ///   - Substitutes the self-receiver's placeholder type with the
+    ///     enclosing impl block's real `Ty::Struct` (or borrow thereof).
+    ///   - Reads the sig from `impls.methods` / `impls.assoc_fns` rather
+    ///     than `binding_types` (impl-block fns have no top-level Fn id).
+    fn typecheck_impl_fn(
+        &mut self,
+        struct_name: &str,
+        decl: &ast::FnDecl,
+    ) -> Result<(), ParseError> {
+        let struct_ty = Ty::Struct {
+            name: struct_name.to_owned(),
+            fields: self.structs.schemas[struct_name].clone(),
+        };
+        // Look up the explicit-only sig from the registries.
+        let key_method = (struct_name.to_owned(), decl.name.clone());
+        let key_assoc = vec![struct_name.to_owned(), decl.name.clone()];
+        let sig = self
+            .impls
+            .methods
+            .get(&key_method)
+            .or_else(|| self.impls.assoc_fns.get(&key_assoc))
+            .cloned()
+            .expect("impl fn registered in phase 1");
+        // Bind every param's type. For self-receivers, use the substituted
+        // type; for normal params, zip against sig.params.
+        let mut explicit_iter = sig.params.iter();
+        for (i, param) in decl.params.iter().enumerate() {
+            let bind_ty = if i == 0 {
+                match param.kind {
+                    ast::ParamKind::SelfOwned => struct_ty.clone(),
+                    ast::ParamKind::SelfShared => Ty::Ref {
+                        inner: Box::new(struct_ty.clone()),
+                        mutable: false,
+                    },
+                    ast::ParamKind::SelfMut => Ty::Ref {
+                        inner: Box::new(struct_ty.clone()),
+                        mutable: true,
+                    },
+                    ast::ParamKind::Normal => explicit_iter.next().expect("normal sig").clone(),
+                }
+            } else {
+                explicit_iter.next().expect("normal sig").clone()
+            };
+            let pid = self
+                .lookup_binding(|d| matches!(d.kind, BindingKind::Param) && d.name_span == param.span)
+                .expect("param binding present");
+            self.types
+                .binding_types
+                .insert(pid, BindingType::Var(bind_ty));
         }
         let prev = self.current_fn_ret.replace(sig.ret.clone());
         let body_ty = self.typecheck_block(&decl.body)?;
@@ -517,7 +825,7 @@ impl<'a> Typechecker<'a> {
                 let init_ty = self.typecheck_expr(&let_stmt.init)?;
                 let bind_ty = match &let_stmt.ty {
                     Some(annot) => {
-                        let annot_ty = ty_from_ast(annot)?;
+                        let annot_ty = self.ty_from_ast_resolving_structs(annot)?;
                         // M03.2: attempt to coerce a literal init to the annotated
                         // type before checking equality. Allows `let x: u8 = 5;`.
                         let init_ty = self
@@ -641,6 +949,86 @@ impl<'a> Typechecker<'a> {
                         });
                     }
                 }
+            }
+            // **M07.4**: field assignment `p.x = rhs;`. Place check: the
+            // receiver must be an `Expr::Ident` resolving to a mutable
+            // struct binding; the field must exist; the rhs must coerce to
+            // the field's type. Eval will read the slot's current
+            // Value::Struct, mutate the named field, emit a SlotWrite with
+            // the updated struct.
+            ast::Expr::FieldAccess { receiver, name, span: fa_span } => {
+                let recv_ident_span = match receiver.as_ref() {
+                    ast::Expr::Ident(_, sp) => *sp,
+                    _ => {
+                        return Err(ParseError {
+                            message: "M07.4 field assignment requires a direct binding receiver (`p.x = v;`); chained field access (`p.x.y = v;`) is out of scope".into(),
+                            span: receiver.span(),
+                        });
+                    }
+                };
+                let recv_binding = *self
+                    .resolution
+                    .uses
+                    .get(&recv_ident_span)
+                    .expect("ident resolved");
+                let recv_decl = &self.resolution.bindings[&recv_binding];
+                let recv_name = recv_decl.name.clone();
+                let is_mut_let = matches!(
+                    recv_decl.kind,
+                    BindingKind::Let { mutable: true, .. },
+                );
+                if !is_mut_let {
+                    return Err(ParseError {
+                        message: format!(
+                            "cannot assign to field of immutable variable `{recv_name}`"
+                        ),
+                        span: recv_ident_span,
+                    });
+                }
+                if self.borrow_tracker.is_borrowed(recv_binding) {
+                    return Err(ParseError {
+                        message: format!(
+                            "cannot assign to field of `{recv_name}` because it is borrowed"
+                        ),
+                        span: recv_ident_span,
+                    });
+                }
+                let recv_ty = match self.types.binding_types.get(&recv_binding) {
+                    Some(BindingType::Var(t)) => t.clone(),
+                    _ => panic!("typeck saw non-var ident at field-assign lhs"),
+                };
+                let schema = match &recv_ty {
+                    Ty::Struct { fields, .. } => fields.clone(),
+                    other => {
+                        return Err(ParseError {
+                            message: format!(
+                                "field assignment requires a struct receiver, found `{}`",
+                                other.name()
+                            ),
+                            span: receiver.span(),
+                        });
+                    }
+                };
+                let field_ty = match schema.iter().find(|(n, _)| n == name) {
+                    Some((_, t)) => t.clone(),
+                    None => {
+                        let struct_name = match &recv_ty {
+                            Ty::Struct { name, .. } => name.clone(),
+                            _ => "<unknown>".to_owned(),
+                        };
+                        return Err(ParseError {
+                            message: format!(
+                                "no field `{name}` on struct `{struct_name}`"
+                            ),
+                            span: *fa_span,
+                        });
+                    }
+                };
+                // Record the lhs FieldAccess's type so eval/snapshots see it.
+                self.types.expr_types.insert(*fa_span, field_ty.clone());
+                // Record the receiver's type too (eval may consult).
+                self.types.expr_types.insert(recv_ident_span, recv_ty);
+                field_ty
             }
             _ => {
                 return Err(ParseError {
@@ -900,6 +1288,193 @@ impl<'a> Typechecker<'a> {
             // must unify to a common type via `try_coerce_to`. Result:
             // `Ty::Array(elem_ty, elements.len())`.
             ast::Expr::ArrayLit { elements, span } => self.typecheck_array_lit(elements, *span),
+            // **M07.4**: struct literal — verify path resolves to a known
+            // struct; verify every declared field appears with the right
+            // type; reject extras.
+            ast::Expr::StructLit { path, fields, span } => {
+                self.typecheck_struct_lit(path, fields, *span)
+            }
+            // **M07.4**: field access on a struct (or auto-deref a &Struct).
+            ast::Expr::FieldAccess { receiver, name, span } => {
+                self.typecheck_field_access(receiver, name, *span)
+            }
+        }
+    }
+
+    /// **M07.4**: typecheck `Path { f1: e1, ... }`. Verifies the path
+    /// resolves to a struct, every declared field appears exactly once,
+    /// no extras, and each value's type matches the declared field type
+    /// (with M03.2 literal-narrowing via `try_coerce_to`). Shorthand
+    /// fields resolve to the bound local of the same name.
+    fn typecheck_struct_lit(
+        &mut self,
+        path: &[String],
+        fields: &[ast::StructLitField],
+        span: Span,
+    ) -> Result<Ty, ParseError> {
+        if path.len() != 1 {
+            return Err(ParseError {
+                message: "M07.4 supports single-segment struct paths only".into(),
+                span,
+            });
+        }
+        let struct_name = &path[0];
+        let schema = match self.structs.schemas.get(struct_name) {
+            Some(s) => s.clone(),
+            None => {
+                return Err(ParseError {
+                    message: format!("unknown struct `{struct_name}`"),
+                    span,
+                });
+            }
+        };
+        // Pass 1: verify no extras. Each provided field name must exist in
+        // the schema.
+        for field in fields {
+            if !schema.iter().any(|(n, _)| n == &field.name) {
+                return Err(ParseError {
+                    message: format!(
+                        "no field `{}` on struct `{}`",
+                        field.name, struct_name
+                    ),
+                    span: field.span,
+                });
+            }
+        }
+        // Pass 2: for each declared field, find the matching init OR
+        // shorthand. Report missing fields.
+        for (declared_name, declared_ty) in &schema {
+            let init = fields.iter().find(|f| &f.name == declared_name);
+            let Some(init) = init else {
+                return Err(ParseError {
+                    message: format!(
+                        "missing field `{}` in struct literal `{}`",
+                        declared_name, struct_name
+                    ),
+                    span,
+                });
+            };
+            // Determine the field's typecheck-result and coerce to the
+            // declared type. For shorthand (value: None), the bound local
+            // of the same name is the source.
+            let (value_ty, value_span, expr_for_coerce): (Ty, Span, Option<&ast::Expr>) =
+                match &init.value {
+                    Some(expr) => (self.typecheck_expr(expr)?, expr.span(), Some(expr)),
+                    None => {
+                        // Shorthand: resolve via the field's span (which
+                        // resolve.rs registered as the use site for the
+                        // bare ident).
+                        let bid = *self
+                            .resolution
+                            .uses
+                            .get(&init.span)
+                            .expect("shorthand resolved in resolve.rs");
+                        let bty = match self.types.binding_types.get(&bid) {
+                            Some(BindingType::Var(t)) => t.clone(),
+                            _ => panic!(
+                                "shorthand binding has no Var type — resolve invariant"
+                            ),
+                        };
+                        (bty, init.span, None)
+                    }
+                };
+            let coerced = match expr_for_coerce {
+                Some(e) => self
+                    .try_coerce_to(e, value_ty.clone(), declared_ty.clone())
+                    .unwrap_or(value_ty),
+                None => value_ty,
+            };
+            if coerced != *declared_ty {
+                return Err(ParseError {
+                    message: format!(
+                        "expected `{}`, found `{}`",
+                        declared_ty.name(),
+                        coerced.name()
+                    ),
+                    span: value_span,
+                });
+            }
+        }
+        // Duplicate-field check (`Point { x: 1, x: 2 }` — caught by the
+        // first scan finding a second match below the first one in pass 2's
+        // search, but easier to surface explicitly).
+        for (i, field) in fields.iter().enumerate() {
+            if fields[..i].iter().any(|f| f.name == field.name) {
+                return Err(ParseError {
+                    message: format!(
+                        "field `{}` specified more than once",
+                        field.name
+                    ),
+                    span: field.span,
+                });
+            }
+        }
+        Ok(Ty::Struct {
+            name: struct_name.clone(),
+            fields: schema,
+        })
+    }
+
+    /// **M07.4**: typecheck `receiver.name`. Receiver must be `Ty::Struct(_)`
+    /// or `Ty::Ref { Ty::Struct(_), .. }` (auto-deref). Field name must
+    /// exist in the struct's schema. Multi-level access (`p.x.y`) rejected
+    /// in M07.4.
+    fn typecheck_field_access(
+        &mut self,
+        receiver: &ast::Expr,
+        name: &str,
+        span: Span,
+    ) -> Result<Ty, ParseError> {
+        // Reject multi-level: receiver must NOT be a FieldAccess itself.
+        if matches!(receiver, ast::Expr::FieldAccess { .. }) {
+            return Err(ParseError {
+                message:
+                    "nested struct fields not supported in M07.4 — use an intermediate let binding"
+                        .into(),
+                span,
+            });
+        }
+        let receiver_ty = self.typecheck_expr(receiver)?;
+        let schema = match &receiver_ty {
+            Ty::Struct { fields, .. } => fields.clone(),
+            Ty::Ref { inner, .. } => match inner.as_ref() {
+                Ty::Struct { fields, .. } => fields.clone(),
+                other => {
+                    return Err(ParseError {
+                        message: format!(
+                            "field access requires a struct receiver, found `&{}`",
+                            other.name()
+                        ),
+                        span: receiver.span(),
+                    });
+                }
+            },
+            other => {
+                return Err(ParseError {
+                    message: format!(
+                        "field access requires a struct receiver, found `{}`",
+                        other.name()
+                    ),
+                    span: receiver.span(),
+                });
+            }
+        };
+        match schema.iter().find(|(n, _)| n == name) {
+            Some((_, ty)) => Ok(ty.clone()),
+            None => {
+                let struct_name = match &receiver_ty {
+                    Ty::Struct { name, .. } => name.clone(),
+                    Ty::Ref { inner, .. } => match inner.as_ref() {
+                        Ty::Struct { name, .. } => name.clone(),
+                        _ => "<unknown>".to_owned(),
+                    },
+                    _ => "<unknown>".to_owned(),
+                };
+                Err(ParseError {
+                    message: format!("no field `{name}` on struct `{struct_name}`"),
+                    span,
+                })
+            }
         }
     }
 
@@ -1120,13 +1695,45 @@ impl<'a> Typechecker<'a> {
                 }
                 Ok(Ty::String)
             }
-            _ => Err(ParseError {
-                message: format!(
-                    "unknown path `{}` (M07 supports `Box::new`, `Vec::new`, `String::from`)",
-                    segments.join("::")
-                ),
-                span: path_span,
-            }),
+            _ => {
+                // **M07.4**: fall through to user-defined associated functions.
+                let key: Vec<String> = segments.to_vec();
+                if let Some(sig) = self.impls.assoc_fns.get(&key).cloned() {
+                    if args.len() != sig.params.len() {
+                        return Err(ParseError {
+                            message: format!(
+                                "associated fn `{}` expects {} argument(s), found {}",
+                                segments.join("::"),
+                                sig.params.len(),
+                                args.len()
+                            ),
+                            span: call_span,
+                        });
+                    }
+                    for (i, (arg, param_ty)) in args.iter().zip(sig.params.iter()).enumerate() {
+                        let arg_ty = self.typecheck_expr(arg)?;
+                        let arg_ty = self
+                            .try_coerce_to(arg, arg_ty.clone(), param_ty.clone())
+                            .unwrap_or(arg_ty);
+                        if arg_ty != *param_ty {
+                            return Err(ParseError {
+                                message: format!(
+                                    "argument {}: expected `{}`, found `{}`",
+                                    i + 1,
+                                    param_ty.name(),
+                                    arg_ty.name()
+                                ),
+                                span: arg.span(),
+                            });
+                        }
+                    }
+                    return Ok(sig.ret);
+                }
+                Err(ParseError {
+                    message: format!("unknown path `{}`", segments.join("::")),
+                    span: path_span,
+                })
+            }
         }
     }
 
@@ -1206,13 +1813,61 @@ impl<'a> Typechecker<'a> {
                 }
                 Ok(Ty::Unit)
             }
-            _ => Err(ParseError {
-                message: format!(
-                    "no method `{name}` on type `{}` (supported: Vec::push/len, String::push_str, Slice::len)",
-                    receiver_ty.name()
-                ),
-                span,
-            }),
+            _ => {
+                // **M07.4**: fall through to user-defined methods. Hardcoded
+                // built-ins above always win (R-018 tie-breaker). Auto-deref:
+                // `&T` / `&mut T` receivers dispatch as the underlying T.
+                let receiver_struct_name = match receiver_ty {
+                    Ty::Struct { name, .. } => Some(name.clone()),
+                    Ty::Ref { inner, .. } => match inner.as_ref() {
+                        Ty::Struct { name, .. } => Some(name.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(struct_name) = receiver_struct_name {
+                    let key = (struct_name.clone(), name.to_owned());
+                    if let Some(sig) = self.impls.methods.get(&key).cloned() {
+                        if args.len() != sig.params.len() {
+                            return Err(ParseError {
+                                message: format!(
+                                    "method `{}` on `{struct_name}` expects {} argument(s), found {}",
+                                    name,
+                                    sig.params.len(),
+                                    args.len()
+                                ),
+                                span,
+                            });
+                        }
+                        for (i, (arg, param_ty)) in args.iter().zip(sig.params.iter()).enumerate()
+                        {
+                            let arg_ty = self.typecheck_expr(arg)?;
+                            let arg_ty = self
+                                .try_coerce_to(arg, arg_ty.clone(), param_ty.clone())
+                                .unwrap_or(arg_ty);
+                            if arg_ty != *param_ty {
+                                return Err(ParseError {
+                                    message: format!(
+                                        "argument {}: expected `{}`, found `{}`",
+                                        i + 1,
+                                        param_ty.name(),
+                                        arg_ty.name()
+                                    ),
+                                    span: arg.span(),
+                                });
+                            }
+                        }
+                        return Ok(sig.ret);
+                    }
+                }
+                Err(ParseError {
+                    message: format!(
+                        "no method `{name}` on type `{}`",
+                        receiver_ty.name()
+                    ),
+                    span,
+                })
+            }
         }
     }
 
@@ -1225,7 +1880,8 @@ impl<'a> Typechecker<'a> {
         mutable: bool,
         span: Span,
     ) -> Result<Ty, ParseError> {
-        // Place-expression check: Ident (M06), or Index of an Ident (M07: `&v[i]`).
+        // Place-expression check: Ident (M06), Index of an Ident (M07: `&v[i]`),
+        // or FieldAccess on an Ident (M07.4: `&p.x`).
         let target_binding = match inner {
             ast::Expr::Ident(_, sp) => *self.resolution.uses.get(sp).expect("ident resolved"),
             // **M07**: `&v[i]` borrows the Vec's heap allocation. The target
@@ -1237,9 +1893,79 @@ impl<'a> Typechecker<'a> {
                     span: receiver.span(),
                 }),
             },
+            // **M07.4**: `&p.x` borrows a sub-field of a struct binding.
+            // The target binding (for mut-check + borrow-tracker) is the
+            // receiver of the field access; multi-level paths (`&p.x.y`)
+            // are rejected to keep M07.4 scope tight.
+            ast::Expr::FieldAccess { receiver, name: field_name, span: fa_span } => {
+                let recv_binding = match receiver.as_ref() {
+                    ast::Expr::Ident(_, sp) => {
+                        *self.resolution.uses.get(sp).expect("ident resolved")
+                    }
+                    _ => {
+                        return Err(ParseError {
+                            message: "expected `&place.field` with a binding name as the receiver"
+                                .into(),
+                            span: receiver.span(),
+                        });
+                    }
+                };
+                // Verify the receiver's type is a struct AND the field exists.
+                // We let the regular typecheck_field_access path handle the
+                // error messages by typechecking the inner expression (it
+                // catches both non-struct receivers and unknown fields).
+                let inner_ty = self.typecheck_field_access(receiver, field_name, *fa_span)?;
+                self.types.expr_types.insert(*fa_span, inner_ty.clone());
+                // For `&mut p.x` the receiver binding must be `mut`. We
+                // intentionally don't track per-field aliasing — a `&p.x`
+                // takes a shared borrow on `p`, and the borrow tracker
+                // catches obvious aliasing conflicts at the binding level.
+                if mutable {
+                    let target_decl = &self.resolution.bindings[&recv_binding];
+                    let is_mut_let = matches!(
+                        target_decl.kind,
+                        BindingKind::Let { mutable: true, .. },
+                    );
+                    if !is_mut_let {
+                        let name = target_decl.name.clone();
+                        return Err(ParseError {
+                            message: format!(
+                                "cannot borrow `{name}` as mutable; it is not declared as `mut`"
+                            ),
+                            span,
+                        });
+                    }
+                }
+                // Take the borrow on the receiver binding.
+                let depth = self.scope_depth;
+                let check = if mutable {
+                    self.borrow_tracker.try_take_mut(recv_binding, depth, span)
+                } else {
+                    self.borrow_tracker.try_take_shared(recv_binding, depth, span)
+                };
+                if let Err(conflict) = check {
+                    let target_name =
+                        self.resolution.bindings[&recv_binding].name.clone();
+                    return Err(ParseError {
+                        message: format!(
+                            "cannot borrow `{target_name}` as {new_kind} because it is already borrowed as {existing_kind}",
+                            new_kind = if mutable { "mutable" } else { "immutable" },
+                            existing_kind = match conflict.existing_kind {
+                                borrow_tracker::BorrowKind::Shared => "immutable",
+                                borrow_tracker::BorrowKind::Mut => "mutable",
+                            }
+                        ),
+                        span,
+                    });
+                }
+                return Ok(Ty::Ref {
+                    inner: Box::new(inner_ty),
+                    mutable,
+                });
+            }
             other => {
                 return Err(ParseError {
-                    message: "expected place expression for borrow (identifier or `&place[index]`)".into(),
+                    message: "expected place expression for borrow (identifier, `&place[index]`, or `&place.field`)".into(),
                     span: other.span(),
                 });
             }

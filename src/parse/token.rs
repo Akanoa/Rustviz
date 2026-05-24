@@ -41,6 +41,13 @@ pub enum TokenKind {
     Else,
     /// `return`
     Return,
+    /// **M07.4**: `struct` keyword (top-level item).
+    Struct,
+    /// **M07.4**: `impl` keyword (top-level item).
+    Impl,
+    /// **M07.4**: `self` keyword (only valid as the first parameter of an
+    /// impl-block fn — `self`, `&self`, `&mut self`).
+    SelfKw,
 
     /// `+`
     Plus,
@@ -133,6 +140,9 @@ impl TokenKind {
             Self::If => "`if`",
             Self::Else => "`else`",
             Self::Return => "`return`",
+            Self::Struct => "`struct`",
+            Self::Impl => "`impl`",
+            Self::SelfKw => "`self`",
             Self::Plus => "`+`",
             Self::Minus => "`-`",
             Self::Star => "`*`",

@@ -186,6 +186,32 @@ function render(state) {
       } else {
         valueEl.textContent = `= ${slot.value}`;
       }
+      // **M07.4**: structs render a per-field labeled-rows view
+      // (research R-016 Proposal A — vertical labeled rows). Built
+      // INSIDE the value cell so the row still consumes exactly 3
+      // grid cells (name | type | value).
+      if (slot.struct_view) {
+        const sv = slot.struct_view;
+        const svEl = el("div", { class: "struct-view" });
+        svEl.setAttribute("data-struct-name", sv.name);
+        for (const f of sv.fields) {
+          const fieldEl = el("div", { class: "struct-field" });
+          fieldEl.setAttribute("data-field-name", f.name);
+          fieldEl.appendChild(
+            el("span", { class: "struct-field-label", text: `${f.name}: ${f.ty_label}` }),
+          );
+          const cellsEl = el("div", { class: "struct-field-cells" });
+          for (let i = 0; i < f.size; i++) {
+            cellsEl.appendChild(el("span", { class: "byte-cell byte-used" }));
+          }
+          fieldEl.appendChild(cellsEl);
+          fieldEl.appendChild(
+            el("span", { class: "struct-field-value", text: `= ${f.display}` }),
+          );
+          svEl.appendChild(fieldEl);
+        }
+        valueEl.appendChild(svEl);
+      }
       // **M07.3**: arrays render inline byte-cells + element labels INSIDE
       // the value cell, so the row still consumes exactly 3 grid cells
       // (name | type | value) — appending them as siblings of valueEl
@@ -420,9 +446,19 @@ function renderArrows(arrows) {
       const tIdx = tList.indexOf(a);
       const yOffsetTgt = distOffset(tgt.height, tIdx, tList.length);
       const globalNudge = (arrIdx - (arrows.length - 1) / 2) * 4;
-      const x2 = tgt.left - overlayBox.left;
+      // M07.4: pull the arrowhead back from the target's left edge so the
+      // tip doesn't touch the box border (was visually cramped — the
+      // arrowhead's flat back sat flush against the slot row, reading as
+      // "stuck to" rather than "pointing at"). 6px is enough once the
+      // lane offset below adds the longer horizontal stub.
+      const ARROW_TIP_GAP = 6;
+      const x2 = tgt.left - overlayBox.left - ARROW_TIP_GAP;
       const y2 = tgt.top + tgt.height / 2 + yOffsetTgt + globalNudge - overlayBox.top;
-      const lane = 10 + arrIdx * 6;
+      // M07.4: extended the lane (gutter) offset from 10 → 24 so the final
+      // H segment connecting the vertical line to the arrowhead is wider
+      // — the previous ~10px stub read as "arrow stuck against gutter"
+      // rather than "arrow approaches target from the left".
+      const lane = 24 + arrIdx * 6;
       const gutterX = Math.min(x1, x2) - lane;
       d = `M${x1},${y1 + globalNudge} H${gutterX} V${y2} H${x2}`;
     }
@@ -450,6 +486,28 @@ function renderArrows(arrows) {
     // mouseleave events for the slice-highlight handler too.
     overlay.appendChild(hitTarget);
     overlay.appendChild(path);
+
+    // **M07.4**: hover-only arrows (method `self` receivers) start hidden
+    // and reveal when the source slot row is hovered. Calling-convention
+    // borrows don't deserve permanent visual weight like an explicit
+    // `let r = &p.x` does.
+    if (a.hover_only) {
+      path.classList.add("arrow-hover-only");
+      // The hit-target stays in the DOM but with no purpose for hover-only
+      // arrows — the source slot row is what receives mouseenter. Keep
+      // pointer-events off so an invisible hit-target doesn't capture
+      // mouse events.
+      hitTarget.style.pointerEvents = "none";
+      const sourceRow = srcEl.closest(".slot-row");
+      if (sourceRow) {
+        sourceRow.addEventListener("mouseenter", () =>
+          path.classList.add("arrow-visible"),
+        );
+        sourceRow.addEventListener("mouseleave", () =>
+          path.classList.remove("arrow-visible"),
+        );
+      }
+    }
 
     // **M07.1**: slice arrows carry a length annotation. When `len` is
     // present, render a small `[len: N]` label near the arrowhead.
@@ -482,6 +540,49 @@ function renderArrows(arrows) {
       lenLabel.setAttribute("class", "arrow-len-label");
       lenLabel.textContent = `[len: ${a.len}]`;
       overlay.appendChild(lenLabel);
+    }
+
+    // **M07.4**: field-borrow arrows carry a field name annotation
+    // (`.x`). Render a small label next to the arrowhead — same
+    // hover-revealed pattern as `[len: N]` slice labels. Built upfront
+    // so the hover handler below can toggle its visibility.
+    let fieldLabelEl = null;
+    if (a.field_label) {
+      fieldLabelEl = document.createElementNS(NS, "text");
+      // Position the field label slightly above the arrow's target end
+      // (analogous to slice [len: N] positioning for Slot targets).
+      const tListF = byTarget.get(targetKey(a));
+      const tIdxF = tListF.indexOf(a);
+      const yOffsetTgtF = distOffset(tgt.height, tIdxF, tListF.length);
+      const globalNudgeF = (arrIdx - (arrows.length - 1) / 2) * 4;
+      const x2F = tgt.left - overlayBox.left;
+      const y2F = tgt.top + tgt.height / 2 + yOffsetTgtF + globalNudgeF - overlayBox.top;
+      fieldLabelEl.setAttribute("x", String(x2F - 24));
+      fieldLabelEl.setAttribute("y", String(y2F - 4));
+      fieldLabelEl.setAttribute("class", "arrow-field-label");
+      fieldLabelEl.textContent = a.field_label;
+      overlay.appendChild(fieldLabelEl);
+    }
+
+    // **M07.4**: field-borrow arrows highlight ONLY the borrowed field's
+    // row in the target struct view on hover — pedagogically: "this
+    // borrow views a sub-region of the composite value". Strip the
+    // leading `.` from the field label to recover the bare field name.
+    if (a.field_label && a.target && a.target.Slot !== undefined) {
+      const fieldName = a.field_label.startsWith(".")
+        ? a.field_label.slice(1)
+        : a.field_label;
+      const nameEl = document.querySelector(`[data-slot-id="${a.target.Slot}"]`);
+      const slotRow = nameEl ? nameEl.closest(".slot-row") : null;
+      const fieldRow = slotRow
+        ? slotRow.querySelector(`.struct-field[data-field-name="${fieldName}"]`)
+        : null;
+      const setFieldHighlight = (on) => {
+        if (fieldRow) fieldRow.classList.toggle("field-borrow-highlighted", on);
+        if (fieldLabelEl) fieldLabelEl.classList.toggle("label-visible", on);
+      };
+      hitTarget.addEventListener("mouseenter", () => setFieldHighlight(true));
+      hitTarget.addEventListener("mouseleave", () => setFieldHighlight(false));
     }
 
     // **M07.1**: slice arrows highlight their covered region in the target

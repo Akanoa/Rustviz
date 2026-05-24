@@ -77,11 +77,25 @@ pub fn resolve(program: &ast::Program) -> Result<Resolution, ParseError> {
                 // lightweight M02 stance of permissive shadowing — see spec edge cases).
                 r.declare(decl.name.clone(), BindingKind::Fn, decl.span, decl.span);
             }
+            // **M07.4**: structs and impl blocks don't introduce value-level
+            // bindings (the type lives in typeck's `StructRegistry`). No
+            // declare() needed here.
+            ast::Item::Struct(_) | ast::Item::Impl(_) => {}
         }
     }
     for item in &program.items {
         match item {
             ast::Item::Fn(decl) => r.resolve_fn(decl)?,
+            // **M07.4**: structs have no resolvable bodies — fields are
+            // types, which name-resolve to top-level type bindings (handled
+            // in typeck). Impl blocks' fn items are resolved here just like
+            // top-level fns, but in a fresh param scope each.
+            ast::Item::Struct(_) => {}
+            ast::Item::Impl(block) => {
+                for fn_decl in &block.items {
+                    r.resolve_fn(fn_decl)?;
+                }
+            }
         }
     }
     r.pop_scope();
@@ -258,6 +272,39 @@ impl Resolver {
                     self.resolve_expr(e)?;
                 }
             }
+            // **M07.4**: struct literal — resolve each non-shorthand field value;
+            // shorthand fields (value: None) are resolved here too as if they
+            // were `name: name` (each shorthand resolves the bare `name` as an
+            // identifier use in the current scope). This lets a missing local
+            // surface the standard "use of undeclared variable" error pointing
+            // at the shorthand's span.
+            ast::Expr::StructLit { fields, .. } => {
+                for field in fields {
+                    match &field.value {
+                        Some(expr) => self.resolve_expr(expr)?,
+                        None => {
+                            // Shorthand: resolve `name` in the current scope.
+                            match self.lookup(&field.name) {
+                                Some(id) => {
+                                    self.resolution.uses.insert(field.span, id);
+                                }
+                                None => {
+                                    return Err(ParseError {
+                                        message: format!(
+                                            "no local named `{}` in scope for field-shorthand",
+                                            field.name
+                                        ),
+                                        span: field.span,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // **M07.4**: field access — recurse on receiver only; field name
+            // is a symbol-lookup deferred to typeck (it's not a binding).
+            ast::Expr::FieldAccess { receiver, .. } => self.resolve_expr(receiver)?,
             ast::Expr::Binary { lhs, rhs, .. } => {
                 self.resolve_expr(lhs)?;
                 self.resolve_expr(rhs)?;

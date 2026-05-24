@@ -22,6 +22,46 @@ pub struct Program {
 pub enum Item {
     /// Function declaration.
     Fn(FnDecl),
+    /// **M07.4**: struct declaration `struct Name { f1: T1, f2: T2 }`. At
+    /// least one field required (empty structs rejected at parse time).
+    Struct(StructDecl),
+    /// **M07.4**: inherent impl block `impl Type { fn ...; fn ...; }`.
+    Impl(ImplBlock),
+}
+
+/// **M07.4**: struct declaration with named fields.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StructDecl {
+    /// Type name (e.g. `"Point"`).
+    pub name: String,
+    /// Fields in declaration order. At least one — order drives byte layout
+    /// AND drop order.
+    pub fields: Vec<StructField>,
+    /// Span from `struct` keyword through closing `}`.
+    pub span: Span,
+}
+
+/// **M07.4**: one declared field of a struct.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StructField {
+    /// Field name.
+    pub name: String,
+    /// Field type.
+    pub ty: Type,
+    /// Span covering `name: ty`.
+    pub span: Span,
+}
+
+/// **M07.4**: inherent impl block.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImplBlock {
+    /// Receiver type name (single-segment in M07.4 — `"Point"`).
+    pub ty_name: String,
+    /// Associated functions + methods. Each fn may have a self-receiver as
+    /// its first `Param` (via `Param.kind`).
+    pub items: Vec<FnDecl>,
+    /// Span from `impl` keyword through closing `}`.
+    pub span: Span,
 }
 
 /// A function declaration.
@@ -46,8 +86,25 @@ pub struct Param {
     pub name: String,
     /// Parameter type.
     pub ty: Type,
+    /// **M07.4**: param classification — distinguishes regular params from
+    /// the four self-receiver shapes that only appear inside `impl` blocks.
+    /// Pre-M07.4 free-fn params are always `Normal`.
+    pub kind: ParamKind,
     /// Span covering the parameter (name through type).
     pub span: Span,
+}
+
+/// **M07.4**: param classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamKind {
+    /// Regular `name: Type` param.
+    Normal,
+    /// `self` — owned receiver. Only valid at param index 0 of an impl-block fn.
+    SelfOwned,
+    /// `&self` — shared borrow receiver.
+    SelfShared,
+    /// `&mut self` — mutable borrow receiver.
+    SelfMut,
 }
 
 /// A type annotation.
@@ -291,6 +348,38 @@ pub enum Expr {
         /// Span from `[` through `]`.
         span: Span,
     },
+    /// **M07.4**: struct literal `Path { f1: e1, f2: e2 }`. Single-segment
+    /// `path` in M07.4 (multi-segment typeck-rejected).
+    StructLit {
+        /// Path segments naming the struct type. `["Point"]` in M07.4.
+        path: Vec<String>,
+        /// Field initializers in source order.
+        fields: Vec<StructLitField>,
+        /// Span from path start through closing `}`.
+        span: Span,
+    },
+    /// **M07.4**: field access `receiver.name`. Postfix; `name` is an
+    /// identifier NOT followed by `(` (a trailing `(` would be `MethodCall`).
+    FieldAccess {
+        /// Receiver expression.
+        receiver: Box<Expr>,
+        /// Field name.
+        name: String,
+        /// Span from receiver start through `name`.
+        span: Span,
+    },
+}
+
+/// **M07.4**: one field initializer inside a struct literal.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StructLitField {
+    /// Field name.
+    pub name: String,
+    /// Field value. `None` indicates field-shorthand `Point { x, y }` —
+    /// resolves to the local binding of the same name at typeck/eval.
+    pub value: Option<Expr>,
+    /// Span covering `name: value` (or just `name` for shorthand).
+    pub span: Span,
 }
 
 impl Expr {
@@ -312,7 +401,9 @@ impl Expr {
             | Self::MethodCall { span, .. }
             | Self::Index { span, .. }
             | Self::Range { span, .. }
-            | Self::ArrayLit { span, .. } => *span,
+            | Self::ArrayLit { span, .. }
+            | Self::StructLit { span, .. }
+            | Self::FieldAccess { span, .. } => *span,
             Self::StrLit(_, s) => *s,
             Self::Block(b) => b.span,
         }

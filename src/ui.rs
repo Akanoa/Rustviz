@@ -142,6 +142,20 @@ pub struct ArrowView {
     /// element labels (`2_i32, 3_i32`) alongside their bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub elem_start: Option<u64>,
+    /// **M07.4**: field name for sub-field borrow arrows (`&p.x` →
+    /// `Some("x")`). Drives a `.x` annotation rendered at the arrow's
+    /// midpoint (analogous to slice arrows' `[len: N]`) AND a per-field
+    /// hover-highlight that lights up only the borrowed field's row in
+    /// the target struct view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field_label: Option<String>,
+    /// **M07.4**: hide the arrow by default; reveal only on hover of the
+    /// source slot. Set for method `self` receivers — the borrow is part
+    /// of the calling convention, not explicit user code, so the always-
+    /// on arrow added visual noise without pedagogical payoff. Hover
+    /// reveals the arrow + targets the corresponding caller slot.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hover_only: bool,
 }
 
 /// **M07**: arrow target — slot (for borrows-of-locals), heap (for borrows-of-heap
@@ -236,6 +250,34 @@ pub struct SlotRowView {
     /// to convey "stack memory" not "heap memory".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inline_cells: Option<InlineCellsView>,
+    /// **M07.4**: present when the slot holds a `Value::Struct`. The JS
+    /// renders per-field labeled rows with byte-cells (research R-016
+    /// Proposal A — vertical labeled rows). Mutually exclusive with
+    /// both `value` (text fallback) and `inline_cells` (array rendering).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub struct_view: Option<StructView>,
+}
+
+/// **M07.4**: per-struct render data for the stack-slot visualization.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StructView {
+    /// Struct type name (e.g. `"Point"`).
+    pub name: String,
+    /// Fields in declaration order. Each entry drives one row.
+    pub fields: Vec<StructFieldView>,
+}
+
+/// **M07.4**: per-field render data inside a `StructView`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StructFieldView {
+    /// Field name (e.g. `"x"`).
+    pub name: String,
+    /// Field type label (e.g. `"i32"`).
+    pub ty_label: String,
+    /// Byte size of the field (drives the byte-cell count).
+    pub size: u32,
+    /// Rendered field value (e.g. `"1_i32"`).
+    pub display: String,
 }
 
 /// **M07.3**: inline byte-cell rendering for a stack-allocated array.
@@ -351,6 +393,13 @@ impl Cursor {
                     byte_offset: b.slice_byte_offset,
                     byte_len: b.slice_byte_len,
                     elem_start: b.slice_elem_start,
+                    // M07.4: field-borrow annotation (`.x`) — present for
+                    // `&p.x` arrows; None for whole-binding borrows.
+                    field_label: b.field_label.clone(),
+                    // M07.4: method `self` borrows hide their arrow until
+                    // the source slot is hovered (calling-convention info,
+                    // not explicit user code).
+                    hover_only: b.hover_only,
                 })
             })
             .collect::<Vec<ArrowView>>();
@@ -365,6 +414,8 @@ impl Cursor {
                 byte_offset: None,
                 byte_len: None,
                 elem_start: None,
+                field_label: None,
+                hover_only: false,
             });
         }
         let heap = world.heap.iter().map(|h| HeapView {
@@ -439,6 +490,15 @@ struct ActiveBorrowState {
     /// **M07.1**: element index where the slice starts; populated alongside
     /// the byte fields. Drives the element-span highlight on hover.
     slice_elem_start: Option<u64>,
+    /// **M07.4**: field name when this borrow targets a sub-field of a
+    /// struct (`&p.x` → `Some("x")`). Populated by the lazy-materialization
+    /// path in apply_event's SlotWrite arm when it sees a Value::Ref with
+    /// non-empty field_path.
+    field_label: Option<String>,
+    /// **M07.4**: hide the arrow until the source slot is hovered. Set on
+    /// method self-receiver borrows so the always-on arrow doesn't clutter
+    /// the visualization (the borrow is calling-convention, not user code).
+    hover_only: bool,
 }
 
 #[derive(Copy, Clone)]
@@ -492,6 +552,10 @@ struct LiveSlot {
     /// **M07.3**: populated when the slot holds a `Value::Array` — drives
     /// the inline byte-cell rendering in the slot's value area.
     inline_cells: Option<InlineCellsView>,
+    /// **M07.4**: populated when the slot holds a `Value::Struct` — drives
+    /// the per-field labeled-row rendering. Mutually exclusive with `value`
+    /// and `inline_cells`.
+    struct_view: Option<StructView>,
 }
 
 fn apply_event(world: &mut World, event: &MemEvent) {
@@ -536,6 +600,7 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                     ty: render_ty(ty),
                     value: None,
                     inline_cells: None,
+                    struct_view: None,
                 });
             }
         }
@@ -585,6 +650,57 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                         slice_byte_offset: Some(*byte_offset),
                         slice_byte_len: Some(*byte_len),
                         slice_elem_start: Some(*start),
+                        // Slice borrows don't carry field labels — slicing
+                        // a struct field isn't an M07.4 path.
+                        field_label: None,
+                        hover_only: false,
+                    });
+                }
+            }
+            // **M07.4**: lazy-materialize a Value::Ref when no prior borrow
+            // entry exists for its borrow_id. Two distinct shapes both hit
+            // this path:
+            //   1. Field borrows (`&p.x` → non-empty `field_path`) — eval
+            //      skips BorrowShared per the M07.3 lazy pattern; here we
+            //      create the entry with a `.x` field_label that drives
+            //      the arrow's annotation + per-field hover highlight.
+            //   2. Method-call self-receivers (`&self` / `&mut self`) —
+            //      eval skips BorrowShared because a separate BorrowShared
+            //      cursor step between FrameEnter and the self SlotWrite
+            //      would just be a silent tick. The arrow should still
+            //      render; no field label.
+            // M06 paths (`&p`, `&mut p`) emit BorrowShared first → the
+            // borrow entry already exists, so this lazy path is a no-op.
+            if let Value::Ref { borrow_id, target, mutable, field_path } = value {
+                if !world.borrows.iter().any(|b| b.borrow_id == borrow_id.0) {
+                    let t = match target {
+                        crate::event::Pointee::Slot(id) => BorrowTarget::Slot(id.0),
+                        crate::event::Pointee::Heap(addr) => BorrowTarget::Heap(addr.0),
+                        crate::event::Pointee::Static(addr) => BorrowTarget::Static(addr.0),
+                    };
+                    let field_label = if field_path.is_empty() {
+                        None
+                    } else {
+                        Some(format!(".{}", field_path.join(".")))
+                    };
+                    // M07.4: method self-receivers landed in a slot named
+                    // `self`. Mark the arrow as hover-only so it stays
+                    // hidden by default — the borrow is calling-convention,
+                    // and an always-on arrow added visual noise to the
+                    // method-call visualization.
+                    let dest_name = lookup_slot_name(&world.frames, slot_id.0);
+                    let is_self = dest_name.as_deref() == Some("self");
+                    world.borrows.push(ActiveBorrowState {
+                        borrow_id: borrow_id.0,
+                        source_slot: Some(slot_id.0),
+                        target: t,
+                        mutable: *mutable,
+                        slice_len: None,
+                        slice_byte_offset: None,
+                        slice_byte_len: None,
+                        slice_elem_start: None,
+                        field_label,
+                        hover_only: is_self,
                     });
                 }
             }
@@ -592,15 +708,27 @@ fn apply_event(world: &mut World, event: &MemEvent) {
             // slot (`&x`, `&mut x`) instead of `&slot0` / `&mut slot0`. The
             // SlotId is implementation jargon; learners think in binding names.
             // Fall back to `slot{N}` only if the target slot isn't found.
+            // **M07.4**: when field_path is non-empty (`&p.x`), append the
+            // path to the binding name (`&p.x`, `&mut p.x`).
             let rendered = match value {
                 // M06.1 → M07: target widened from SlotId to Pointee.
-                Value::Ref { target: crate::event::Pointee::Slot(target_slot), mutable, .. } => {
+                Value::Ref {
+                    target: crate::event::Pointee::Slot(target_slot),
+                    mutable,
+                    field_path,
+                    ..
+                } => {
                     let name = lookup_slot_name(&world.frames, target_slot.0)
                         .unwrap_or_else(|| format!("slot{}", target_slot.0));
-                    if *mutable {
-                        format!("&mut {name}")
+                    let suffix = if field_path.is_empty() {
+                        String::new()
                     } else {
-                        format!("&{name}")
+                        format!(".{}", field_path.join("."))
+                    };
+                    if *mutable {
+                        format!("&mut {name}{suffix}")
+                    } else {
+                        format!("&{name}{suffix}")
                     }
                 }
                 Value::Ref { target: crate::event::Pointee::Heap(addr), mutable, .. } => {
@@ -631,6 +759,10 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                 // M07.3: text value suppressed; the inline byte-cells (set
                 // below) are the visualization.
                 String::new()
+            } else if matches!(value, Value::Struct { .. }) {
+                // M07.4: text value suppressed; the per-field StructView
+                // (built below) is the visualization.
+                String::new()
             } else {
                 rendered
             };
@@ -650,10 +782,42 @@ fn apply_event(world: &mut World, event: &MemEvent) {
             } else {
                 None
             };
+            // **M07.4**: if Value::Struct, build the StructView from the
+            // field values. Drives the per-field labeled-row rendering in
+            // the JS (research R-016 Proposal A).
+            let struct_view = if let Value::Struct { name, fields } = value {
+                let field_views: Vec<StructFieldView> = fields
+                    .iter()
+                    .map(|(fname, fval)| {
+                        let ty_label = match fval {
+                            Value::Int { kind, .. } => kind.name().to_owned(),
+                            Value::Float { kind, .. } => kind.name().to_owned(),
+                            Value::Bool(_) => "bool".to_owned(),
+                            Value::Unit => "()".to_owned(),
+                            // Non-primitive field types are out of M07.4
+                            // scope but the fallback still renders cleanly.
+                            other => other.type_name().to_owned(),
+                        };
+                        StructFieldView {
+                            name: fname.clone(),
+                            ty_label,
+                            size: value_size_bytes_ui(fval),
+                            display: render_value(fval),
+                        }
+                    })
+                    .collect();
+                Some(StructView {
+                    name: name.clone(),
+                    fields: field_views,
+                })
+            } else {
+                None
+            };
             for frame in &mut world.frames {
                 if let Some(slot) = frame.slots.iter_mut().find(|s| s.slot_id == slot_id.0) {
                     slot.value = Some(rendered);
                     slot.inline_cells = inline_cells;
+                    slot.struct_view = struct_view;
                     return;
                 }
             }
@@ -695,6 +859,8 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                 slice_byte_offset: None,
                 slice_byte_len: None,
                 slice_elem_start: None,
+                field_label: None,
+                hover_only: false,
             });
         }
         MemEvent::BorrowMut { borrow_id, target, .. } => {
@@ -712,6 +878,8 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                 slice_byte_offset: None,
                 slice_byte_len: None,
                 slice_elem_start: None,
+                field_label: None,
+                hover_only: false,
             });
         }
         MemEvent::BorrowEnd { borrow_id, .. } => {
@@ -846,6 +1014,7 @@ fn frame_to_view(frame: FrameInProgress, current_frame_id: Option<u32>) -> Frame
                 ty: s.ty,
                 value: s.value,
                 inline_cells: s.inline_cells,
+                struct_view: s.struct_view,
             })
             .collect(),
         active: frame.active,
@@ -913,6 +1082,35 @@ fn lookup_slot_name(frames: &[FrameInProgress], slot_id: u32) -> Option<String> 
     None
 }
 
+/// **M07.4**: byte size of a `Value` for UI sizing — used to size the
+/// per-field byte-cell strip in a struct's slot rendering.
+fn value_size_bytes_ui(v: &Value) -> u32 {
+    use crate::typeck::{IntKind, FloatKind};
+    match v {
+        Value::Int { kind, .. } => match kind {
+            IntKind::I8 | IntKind::U8 => 1,
+            IntKind::I16 | IntKind::U16 => 2,
+            IntKind::I32 | IntKind::U32 => 4,
+            IntKind::I64 | IntKind::U64 | IntKind::ISize | IntKind::USize => 8,
+            IntKind::I128 | IntKind::U128 => 16,
+        },
+        Value::Float { kind, .. } => match kind {
+            FloatKind::F32 => 4,
+            FloatKind::F64 => 8,
+        },
+        Value::Bool(_) => 1,
+        Value::Unit => 0,
+        Value::Ref { .. } | Value::Box { .. } | Value::String { .. } | Value::Vec { .. } => 8,
+        Value::Slice { .. } => 16,
+        Value::Array { elements, elem_ty } => {
+            elements.len() as u32 * ty_size_bytes_ui(elem_ty)
+        }
+        Value::Struct { fields, .. } => {
+            fields.iter().map(|(_, v)| value_size_bytes_ui(v)).sum()
+        }
+    }
+}
+
 /// **M07.3**: byte size of a `Ty` for UI sizing — duplicates the eval-side
 /// `ty_size_bytes` to avoid pulling eval into ui's compile graph. Element
 /// types are restricted to primitives in M07.3, so the surface is small.
@@ -935,6 +1133,8 @@ fn ty_size_bytes_ui(ty: &Ty) -> u32 {
         Ty::Ref { .. } | Ty::Box(_) | Ty::String | Ty::Vec(_) => 8,
         Ty::Slice(_) | Ty::Str => 16,
         Ty::Array(inner, size) => ty_size_bytes_ui(inner) * (*size as u32),
+        // M07.4: struct = sum of field sizes (no padding).
+        Ty::Struct { fields, .. } => fields.iter().map(|(_, t)| ty_size_bytes_ui(t)).sum(),
     }
 }
 
@@ -998,6 +1198,17 @@ fn render_value(value: &Value) -> String {
         // is reached only outside that path (e.g. future ReturnValue of
         // an array — not constructible currently).
         Value::Array { elements, .. } => format!("[_; {}]", elements.len()),
+        // M07.4: struct fallback — short `Name { x: 1, y: 2 }` form. The
+        // normal SlotWrite path uses struct_view for the full per-field
+        // visualization; this fallback fires e.g. when a method returns
+        // a struct (ReturnValue annotation).
+        Value::Struct { name, fields } => {
+            let body: Vec<String> = fields
+                .iter()
+                .map(|(fname, fval)| format!("{fname}: {}", render_value(fval)))
+                .collect();
+            format!("{name} {{ {} }}", body.join(", "))
+        }
     }
 }
 

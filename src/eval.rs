@@ -55,6 +55,12 @@ struct Evaluator<'a> {
     types: &'a TypeMap,
     /// `BindingId` → `&FnDecl` lookup, built once at construction.
     fn_decls: HashMap<BindingId, &'a ast::FnDecl>,
+    /// **M07.4**: `(struct_name, method_name)` → `&FnDecl` for instance
+    /// methods declared in `impl` blocks. Built once at construction.
+    methods: HashMap<(String, String), &'a ast::FnDecl>,
+    /// **M07.4**: `vec![struct_name, fn_name]` → `&FnDecl` for associated
+    /// functions (no self) declared in `impl` blocks. Built once.
+    assoc_fns: HashMap<Vec<String>, &'a ast::FnDecl>,
     /// Call stack — innermost frame last.
     frames: Vec<Frame>,
     next_slot_id: u32,
@@ -174,6 +180,9 @@ fn ty_size_bytes(ty: &Ty) -> u32 {
         Ty::Slice(_) | Ty::Str => 16,
         // M07.3: array is the sum of its elements — N * elem_size.
         Ty::Array(inner, size) => ty_size_bytes(inner) * (*size as u32),
+        // M07.4: struct is the sum of its field sizes (no padding — the
+        // pedagogical visualization shows a packed layout).
+        Ty::Struct { fields, .. } => fields.iter().map(|(_, t)| ty_size_bytes(t)).sum(),
     }
 }
 
@@ -201,6 +210,10 @@ fn value_size_bytes(v: &Value) -> u32 {
         // M07.3: array's total size = N * element_size.
         Value::Array { elements, elem_ty } => {
             elements.len() as u32 * ty_size_bytes(elem_ty)
+        }
+        // M07.4: struct's total size = sum of field sizes (no padding).
+        Value::Struct { fields, .. } => {
+            fields.iter().map(|(_, v)| value_size_bytes(v)).sum()
         }
     }
 }
@@ -257,31 +270,63 @@ impl<'a> Evaluator<'a> {
         types: &'a TypeMap,
     ) -> Result<Self, ParseError> {
         let mut fn_decls = HashMap::new();
+        let mut methods: HashMap<(String, String), &'a ast::FnDecl> = HashMap::new();
+        let mut assoc_fns: HashMap<Vec<String>, &'a ast::FnDecl> = HashMap::new();
         for item in &program.items {
-            let ast::Item::Fn(decl) = item;
-            let id = resolution
-                .bindings
-                .iter()
-                .find_map(|(id, b)| {
-                    if b.name == decl.name && matches!(b.kind, BindingKind::Fn) {
-                        Some(*id)
-                    } else {
-                        None
+            match item {
+                ast::Item::Fn(decl) => {
+                    let id = resolution
+                        .bindings
+                        .iter()
+                        .find_map(|(id, b)| {
+                            if b.name == decl.name && matches!(b.kind, BindingKind::Fn) {
+                                Some(*id)
+                            } else {
+                                None
+                            }
+                        })
+                        .ok_or_else(|| ParseError {
+                            message: format!(
+                                "fn `{}` has no resolved binding (M02 invariant violation)",
+                                decl.name
+                            ),
+                            span: decl.span,
+                        })?;
+                    fn_decls.insert(id, decl);
+                }
+                // **M07.4**: struct decls register no value-level bindings.
+                ast::Item::Struct(_) => {}
+                // **M07.4**: impl-block fn items split into methods vs assoc
+                // fns by the first param's `ParamKind`. Methods key by
+                // `(struct_name, method_name)`; assoc fns key by full path.
+                ast::Item::Impl(block) => {
+                    for fn_decl in &block.items {
+                        let is_method = fn_decl
+                            .params
+                            .first()
+                            .map(|p| !matches!(p.kind, ast::ParamKind::Normal))
+                            .unwrap_or(false);
+                        if is_method {
+                            methods.insert(
+                                (block.ty_name.clone(), fn_decl.name.clone()),
+                                fn_decl,
+                            );
+                        } else {
+                            assoc_fns.insert(
+                                vec![block.ty_name.clone(), fn_decl.name.clone()],
+                                fn_decl,
+                            );
+                        }
                     }
-                })
-                .ok_or_else(|| ParseError {
-                    message: format!(
-                        "fn `{}` has no resolved binding (M02 invariant violation)",
-                        decl.name
-                    ),
-                    span: decl.span,
-                })?;
-            fn_decls.insert(id, decl);
+                }
+            }
         }
         Ok(Self {
             resolution,
             types,
             fn_decls,
+            methods,
+            assoc_fns,
             frames: Vec::new(),
             next_slot_id: 0,
             next_frame_id: 0,
@@ -614,6 +659,23 @@ impl<'a> Evaluator<'a> {
     // ─── call_fn / scope / frame management ────────────────────────────────
 
     fn call_fn(&mut self, fn_binding: BindingId, args: Vec<Value>, call_span: Span) -> Value {
+        let decl = self.fn_decls[&fn_binding];
+        self.call_decl(decl, &decl.name.clone(), args, call_span)
+    }
+
+    /// **M07.4**: shared call-frame entry. Used by both free-fn calls
+    /// (via `call_fn`) and user-defined method / associated-fn calls
+    /// (via `eval_method_call`'s user-method fall-through and
+    /// `eval_path_call`'s assoc-fn fall-through). `display_name` is what
+    /// gets reported in `FrameEnter.fn_name` (e.g. `"Point::x"` for a
+    /// method, `"add"` for a free fn).
+    fn call_decl(
+        &mut self,
+        decl: &'a ast::FnDecl,
+        display_name: &str,
+        args: Vec<Value>,
+        call_span: Span,
+    ) -> Value {
         if self.halted {
             return Value::Unit;
         }
@@ -625,7 +687,6 @@ impl<'a> Evaluator<'a> {
             return Value::Unit;
         }
 
-        let decl = self.fn_decls[&fn_binding];
         let frame_id = self.alloc_frame_id();
 
         // Pre-allocate param SlotIds so subsequent SlotAlloc events can use them.
@@ -650,7 +711,7 @@ impl<'a> Evaluator<'a> {
         // reasonable fallback since there's no actual call site.
         self.events.push(MemEvent::FrameEnter {
             frame_id,
-            fn_name: decl.name.clone(),
+            fn_name: display_name.to_owned(),
             span: call_span,
         });
 
@@ -961,6 +1022,51 @@ impl<'a> Evaluator<'a> {
                 if self.halted {
                     return;
                 }
+                // **M07.4**: field assignment `p.x = rhs;`. Read the
+                // receiver's slot, clone its Value::Struct, mutate the
+                // named field, emit a single SlotWrite with the updated
+                // struct (drives the UI's struct-view refresh).
+                if let ast::Expr::FieldAccess { receiver, name: field_name, .. } = lhs {
+                    let recv_slot = match receiver.as_ref() {
+                        ast::Expr::Ident(_, sp) => {
+                            let bid = *self
+                                .resolution
+                                .uses
+                                .get(sp)
+                                .expect("ident resolved");
+                            self.lookup_local_slot(bid)
+                                .expect("local slot exists for field-assign receiver")
+                        }
+                        _ => panic!(
+                            "typeck rejects non-Ident receiver in M07.4 field assign"
+                        ),
+                    };
+                    let current = self
+                        .lookup_slot_value(recv_slot)
+                        .expect("receiver slot has a value");
+                    let new_struct = match current {
+                        Value::Struct { name: sname, mut fields } => {
+                            let mut found = false;
+                            for (fname, fval) in fields.iter_mut() {
+                                if fname == field_name {
+                                    *fval = value.clone();
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            assert!(found, "typeck verified field exists");
+                            Value::Struct { name: sname, fields }
+                        }
+                        _ => panic!("typeck rejects field assign on non-struct"),
+                    };
+                    self.events.push(MemEvent::SlotWrite {
+                        slot_id: recv_slot,
+                        value: new_struct.clone(),
+                        span: *span,
+                    });
+                    self.update_slot_value(recv_slot, new_struct);
+                    return;
+                }
                 // For deref-write we also queue an explanatory Note (same
                 // deferred-Note pattern as deref-read, so the message lands
                 // at the cursor step right after the SlotWrite that the
@@ -1075,11 +1181,31 @@ impl<'a> Evaluator<'a> {
                 // narrower `IntKind` by `try_coerce_to` (e.g. when this
                 // literal appears as `let x: u8 = 250` or as the RHS of
                 // `x: u8 + 10`).
-                let kind = match self.types.expr_types.get(span) {
-                    Some(crate::Ty::Int(k)) => *k,
-                    _ => IntKind::I32,
-                };
-                Value::Int { kind, bits: *v as i128 }
+                // **M07.4 fix**: typeck also coerces int literals to
+                // `Ty::Float(_)` when an annotation says float (e.g. struct
+                // field `y: f64`, `let x: f64 = 2;`). Before M07.4 this
+                // path went undetected — integer literals always produced
+                // `Value::Int` even when the recorded type was float —
+                // because no shipped sample exercised the "int literal in
+                // a float-typed context" case. Surfaced by M07.4's struct
+                // field-type coercion. Honor the recorded type here:
+                // recorded Ty::Float → emit Value::Float; otherwise the
+                // existing Value::Int path.
+                use crate::typeck::FloatKind;
+                match self.types.expr_types.get(span) {
+                    Some(crate::Ty::Float(k)) => {
+                        // Match LitFloat's narrowing semantics: f32 round-trip
+                        // so subsequent arithmetic uses the f32-narrowed bits.
+                        let raw = *v as f64;
+                        let value = match k {
+                            FloatKind::F32 => raw as f32 as f64,
+                            FloatKind::F64 => raw,
+                        };
+                        Value::Float { kind: *k, value }
+                    }
+                    Some(crate::Ty::Int(k)) => Value::Int { kind: *k, bits: *v as i128 },
+                    _ => Value::Int { kind: IntKind::I32, bits: *v as i128 },
+                }
             }
             ast::Expr::LitFloat(v, _suffix, span) => {
                 // M03.2: same coercion path for floats — typeck may have
@@ -1175,6 +1301,42 @@ impl<'a> Evaluator<'a> {
                         *span,
                     );
                 }
+                // **M07.4**: field-borrow `&p.x` — target is the receiver's
+                // slot, with field_path = [field_name]. NO BorrowShared event
+                // is emitted (slot-target borrows use the M07.3 lazy-
+                // materialization pattern — the UI materializes the arrow
+                // when the resulting Value::Ref lands in a SlotWrite). The
+                // borrow IS recorded in the scope's borrow list so a
+                // BorrowEnd fires at scope exit (consistent with M06+).
+                if let ast::Expr::FieldAccess { receiver, name: field_name, .. } = inner.as_ref()
+                {
+                    let recv_ident_sp = match receiver.as_ref() {
+                        ast::Expr::Ident(_, sp) => *sp,
+                        _ => panic!("typeck should reject non-Ident receiver in field borrow"),
+                    };
+                    let binding_id = *self
+                        .resolution
+                        .uses
+                        .get(&recv_ident_sp)
+                        .expect("ident resolved");
+                    let slot_id = self
+                        .lookup_local_slot(binding_id)
+                        .expect("local slot exists for borrowed binding");
+                    let borrow_id = self.alloc_borrow_id();
+                    // Record the borrow_id for scope-exit cleanup (BorrowEnd
+                    // is skipped though — UI's borrow lifecycle is invisible
+                    // for slot-target field borrows; the scope-exit cleanup
+                    // only matters for matching the M06+ borrow-tracker
+                    // model). Actually: skip the scope record too since no
+                    // event will fire — keeps the trace clean.
+                    let _ = borrow_id;
+                    return Value::Ref {
+                        borrow_id,
+                        target: crate::event::Pointee::Slot(slot_id),
+                        mutable: *mutable,
+                        field_path: vec![field_name.clone()],
+                    };
+                }
                 // M06 + M07: determine the borrow target (Slot or Heap).
                 let target = match inner.as_ref() {
                     ast::Expr::Ident(_, sp) => {
@@ -1226,6 +1388,9 @@ impl<'a> Evaluator<'a> {
                     borrow_id,
                     target,
                     mutable: *mutable,
+                    // **M07.4**: whole-binding borrow (not a field borrow);
+                    // field_path stays empty per the M06+ default semantics.
+                    field_path: Vec::new(),
                 }
             }
             // **M06.1**: `*r` — read through a reference. Inner evaluates to
@@ -1348,6 +1513,83 @@ impl<'a> Evaluator<'a> {
                 }
                 Value::Array { elements: evaled, elem_ty }
             }
+            // **M07.4**: struct literal — eval each field (resolving
+            // shorthand via the local binding lookup), build
+            // `Value::Struct { name, fields }` in declaration order
+            // (drives byte layout and rendering).
+            ast::Expr::StructLit { path, fields, span } => {
+                // Recover the struct's schema from typeck's recorded type
+                // on this expression's span. We need the declared field
+                // order (not the source order of the literal's inits).
+                let schema_pairs: Vec<(String, Ty)> = match self.types.expr_types.get(span) {
+                    Some(Ty::Struct { fields, .. }) => fields.clone(),
+                    _ => panic!("typeck should record Ty::Struct for StructLit"),
+                };
+                let mut evaled_fields: Vec<(String, Value)> =
+                    Vec::with_capacity(schema_pairs.len());
+                for (decl_name, _decl_ty) in &schema_pairs {
+                    let lit_field = fields
+                        .iter()
+                        .find(|f| &f.name == decl_name)
+                        .expect("typeck verified all declared fields present");
+                    let value = match &lit_field.value {
+                        Some(expr) => self.eval_expr(expr),
+                        None => {
+                            // Shorthand: read the local binding of the
+                            // same name (resolved at resolve-time on
+                            // `lit_field.span`).
+                            let bid = *self
+                                .resolution
+                                .uses
+                                .get(&lit_field.span)
+                                .expect("shorthand resolved at resolve time");
+                            self.lookup_local_value(bid)
+                                .expect("shorthand local has a value")
+                        }
+                    };
+                    if self.halted { return Value::Unit; }
+                    evaled_fields.push((decl_name.clone(), value));
+                }
+                Value::Struct {
+                    name: path[0].clone(),
+                    fields: evaled_fields,
+                }
+            }
+            // **M07.4**: field access — copy the named field out of the
+            // struct value. Auto-derefs through `Value::Ref` to a slot
+            // holding a struct (the `self.x` shape inside `&self` methods).
+            ast::Expr::FieldAccess { receiver, name, .. } => {
+                let recv = self.eval_expr(receiver);
+                if self.halted { return Value::Unit; }
+                match recv {
+                    Value::Struct { fields, .. } => fields
+                        .into_iter()
+                        .find_map(|(n, v)| if n == *name { Some(v) } else { None })
+                        .expect("typeck verified field exists"),
+                    Value::Ref {
+                        target: crate::event::Pointee::Slot(slot_id),
+                        field_path,
+                        ..
+                    } => {
+                        if !field_path.is_empty() {
+                            panic!(
+                                "multi-level field access through a sub-field ref is out of M07.4 scope"
+                            );
+                        }
+                        let value = self
+                            .lookup_slot_value(slot_id)
+                            .expect("target slot exists during borrow's lifetime");
+                        match value {
+                            Value::Struct { fields, .. } => fields
+                                .into_iter()
+                                .find_map(|(n, v)| if n == *name { Some(v) } else { None })
+                                .expect("typeck verified field exists"),
+                            _ => panic!("typeck should reject field access through non-struct ref"),
+                        }
+                    }
+                    _ => panic!("typeck should reject field access on non-struct receiver"),
+                }
+            }
         }
     }
 
@@ -1452,7 +1694,24 @@ impl<'a> Evaluator<'a> {
                 });
                 Value::String { addr }
             }
-            _ => panic!("typeck should have rejected unknown path"),
+            _ => {
+                // **M07.4**: user-defined associated function. Look up the
+                // FnDecl, evaluate args, enter a new frame. No `self`.
+                let key: Vec<String> = segments.to_vec();
+                let decl = self
+                    .assoc_fns
+                    .get(&key)
+                    .copied()
+                    .expect("typeck verified the assoc fn exists");
+                let mut arg_values: Vec<Value> = Vec::with_capacity(args.len());
+                for arg in args {
+                    let v = self.eval_expr(arg);
+                    if self.halted { return Value::Unit; }
+                    arg_values.push(v);
+                }
+                let display = segments.join("::");
+                self.call_decl(decl, &display, arg_values, span)
+            }
         }
     }
 
@@ -1542,7 +1801,92 @@ impl<'a> Evaluator<'a> {
                 let _ = span;
                 Value::Int { kind: IntKind::U64, bits: elements.len() as i128 }
             }
-            _ => panic!("typeck should reject this method call"),
+            // **M07.4**: fall through to user-defined methods. Look up the
+            // receiver's struct name (auto-deref through &T / &mut T) and
+            // dispatch via the methods table. Construct the self binding:
+            //   - SelfShared: Value::Ref { target: Pointee::Slot(p), .. }
+            //   - SelfMut:    Value::Ref { target: Pointee::Slot(p), mutable: true, .. }
+            //   - SelfOwned:  the receiver's value, moved.
+            _ => {
+                let struct_name = match &recv {
+                    Value::Struct { name, .. } => Some(name.clone()),
+                    Value::Ref { target: crate::event::Pointee::Slot(slot_id), .. } => {
+                        match self.lookup_slot_value(*slot_id) {
+                            Some(Value::Struct { name, .. }) => Some(name),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                let Some(struct_name) = struct_name else {
+                    panic!("typeck should reject method call on non-struct receiver");
+                };
+                let method_decl = self
+                    .methods
+                    .get(&(struct_name.clone(), name.to_owned()))
+                    .copied()
+                    .expect("typeck verified method exists");
+                // Determine self-receiver kind from the method's first param.
+                let self_kind = method_decl
+                    .params
+                    .first()
+                    .map(|p| p.kind)
+                    .unwrap_or(ast::ParamKind::Normal);
+                // Build the self value. Two cases for the borrow kinds:
+                //   - Receiver is a `Value::Struct` (direct binding like
+                //     `p.method()`): construct a fresh borrow of the
+                //     receiver binding's slot.
+                //   - Receiver is already a `Value::Ref` (e.g. inside a
+                //     method body calling `self.other_method()`, or a
+                //     binding like `r: &Point`): reuse the existing borrow
+                //     value directly — matches Rust's auto-deref
+                //     semantics ("&self gets whatever borrow you already
+                //     hold").
+                let self_value = match self_kind {
+                    ast::ParamKind::SelfOwned => recv.clone(),
+                    ast::ParamKind::SelfShared | ast::ParamKind::SelfMut => {
+                        match &recv {
+                            Value::Ref { .. } => recv.clone(),
+                            Value::Struct { .. } => {
+                                let recv_slot = match receiver {
+                                    ast::Expr::Ident(_, sp) => {
+                                        let bid = *self
+                                            .resolution
+                                            .uses
+                                            .get(sp)
+                                            .expect("ident resolved");
+                                        self.lookup_local_slot(bid)
+                                            .expect("local slot exists for method receiver")
+                                    }
+                                    _ => panic!(
+                                        "M07.4 method receivers on a struct value must be a direct binding ident"
+                                    ),
+                                };
+                                let mutable = matches!(self_kind, ast::ParamKind::SelfMut);
+                                let borrow_id = self.alloc_borrow_id();
+                                Value::Ref {
+                                    borrow_id,
+                                    target: crate::event::Pointee::Slot(recv_slot),
+                                    mutable,
+                                    field_path: Vec::new(),
+                                }
+                            }
+                            _ => panic!("typeck rejects non-struct/non-ref method receivers"),
+                        }
+                    }
+                    ast::ParamKind::Normal => unreachable!("typeck guaranteed self-receiver"),
+                };
+                // Evaluate explicit args (in source order, after self).
+                let mut arg_values: Vec<Value> = Vec::with_capacity(args.len() + 1);
+                arg_values.push(self_value);
+                for arg in args {
+                    let v = self.eval_expr(arg);
+                    if self.halted { return Value::Unit; }
+                    arg_values.push(v);
+                }
+                let display = format!("{struct_name}::{name}");
+                self.call_decl(method_decl, &display, arg_values, span)
+            }
         }
     }
 
@@ -2266,6 +2610,16 @@ fn render_value_for_note(value: &Value) -> String {
         Value::Slice { len, .. } => format!("&[_; {len}]"),
         // M07.3: array — render element count abstractly for notes.
         Value::Array { elements, .. } => format!("[_; {}]", elements.len()),
+        // M07.4: struct — render as `Point { x: 1, y: 2 }` for notes; gives
+        // the learner concrete field values without depending on UI's
+        // full struct-view rendering.
+        Value::Struct { name, fields } => {
+            let body: Vec<String> = fields
+                .iter()
+                .map(|(fname, fval)| format!("{fname}: {}", render_value_for_note(fval)))
+                .collect();
+            format!("{name} {{ {} }}", body.join(", "))
+        }
     }
 }
 
