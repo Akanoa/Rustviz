@@ -2,7 +2,7 @@
 
 use super::ast::{
     BinOp, Block, Expr, FnDecl, ImplBlock, Item, LetStmt, Param, ParamKind, Program, Stmt,
-    StructDecl, StructField, StructLitField, Type, TypeParam, UnOp,
+    StructDecl, StructField, StructLitField, TraitDecl, TraitItem, Type, TypeParam, UnOp,
 };
 use super::error::ParseError;
 use super::span::{FileId, Span, SourceMap};
@@ -110,9 +110,82 @@ impl Parser {
             Ok(Item::Struct(self.parse_struct_decl()?))
         } else if self.at(&TokenKind::Impl) {
             Ok(Item::Impl(self.parse_impl_block()?))
+        } else if self.at(&TokenKind::Trait) {
+            Ok(Item::Trait(self.parse_trait_decl()?))
         } else {
-            Err(self.error_expected("an item (`fn`, `struct`, or `impl`)"))
+            Err(self.error_expected("an item (`fn`, `struct`, `impl`, or `trait`)"))
         }
+    }
+
+    /// **M07.6**: `trait Name { fn item1; fn item2 { ... }; ... }`. Items
+    /// are fn declarations; `;` after the return type → required method
+    /// (no body); `{` after → default method (with body).
+    fn parse_trait_decl(&mut self) -> Result<TraitDecl, ParseError> {
+        let kw = self.expect(&TokenKind::Trait, "`trait`")?;
+        let name = self.expect_ident("trait name")?;
+        self.expect(&TokenKind::LBrace, "`{`")?;
+        let mut items = Vec::new();
+        let mut method_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        while !self.at(&TokenKind::RBrace) {
+            let fn_kw = self.expect(&TokenKind::Fn, "`fn`")?;
+            let item_name_span = self.peek().span;
+            let item_name = self.expect_ident("trait method name")?;
+            if !method_names.insert(item_name.clone()) {
+                return Err(ParseError {
+                    message: format!(
+                        "method `{item_name}` already declared in trait `{name}`"
+                    ),
+                    span: item_name_span,
+                });
+            }
+            self.expect(&TokenKind::LParen, "`(`")?;
+            let mut params = Vec::new();
+            let mut idx = 0usize;
+            while !self.at(&TokenKind::RParen) {
+                params.push(self.parse_param(idx)?);
+                idx += 1;
+                if self.bump_if(&TokenKind::Comma).is_none() {
+                    break;
+                }
+            }
+            self.expect(&TokenKind::RParen, "`)`")?;
+            let return_ty = if self.bump_if(&TokenKind::Arrow).is_some() {
+                Some(self.parse_type()?)
+            } else {
+                None
+            };
+            // **M07.6**: required vs default — `;` → required, `{ ... }` → default.
+            if self.bump_if(&TokenKind::Semi).is_some() {
+                items.push(TraitItem::Required {
+                    name: item_name,
+                    params,
+                    return_ty,
+                    span: fn_kw.span.merge(item_name_span),
+                });
+            } else if self.at(&TokenKind::LBrace) {
+                let body = self.parse_block()?;
+                let body_span = body.span;
+                items.push(TraitItem::Default {
+                    decl: FnDecl {
+                        name: item_name,
+                        type_params: Vec::new(),
+                        params,
+                        return_ty,
+                        body,
+                        span: fn_kw.span.merge(body_span),
+                    },
+                });
+            } else {
+                return Err(self.error_expected("`;` (required method) or `{` (default method body)"));
+            }
+        }
+        let rbrace = self.expect(&TokenKind::RBrace, "`}`")?;
+        Ok(TraitDecl {
+            name,
+            items,
+            span: kw.span.merge(rbrace.span),
+        })
     }
 
     /// **M07.5**: parse optional `<T>` / `<T, U>` type-parameter list. Bound
@@ -128,15 +201,18 @@ impl Parser {
         while !self.at(&TokenKind::Gt) {
             let name_span = self.peek().span;
             let name = self.expect_ident("type parameter name")?;
-            // **M07.5**: bound syntax `T: Foo` accepted at parse; typeck
-            // rejects with an M07.6-pointer message. Bound captured on
-            // TypeParam so typeck can see it.
-            let bound = if self.bump_if(&TokenKind::Colon).is_some() {
-                Some(self.expect_ident("trait name in bound")?)
-            } else {
-                None
-            };
-            params.push(TypeParam { name, bound, span: name_span });
+            // **M07.6**: bound syntax `T: Foo + Bar` — promoted from
+            // M07.5's single-bound `Option<String>` to a multi-bound
+            // `Vec<String>`. After the first bound ident, while `+`
+            // follows, consume and parse more.
+            let mut bounds: Vec<String> = Vec::new();
+            if self.bump_if(&TokenKind::Colon).is_some() {
+                bounds.push(self.expect_ident("trait name in bound")?);
+                while self.bump_if(&TokenKind::Plus).is_some() {
+                    bounds.push(self.expect_ident("trait name after `+`")?);
+                }
+            }
+            params.push(TypeParam { name, bounds, span: name_span });
             if self.bump_if(&TokenKind::Comma).is_none() {
                 break;
             }
@@ -191,11 +267,20 @@ impl Parser {
         })
     }
 
-    /// **M07.4**: `impl Type { fn ...; fn ...; }`. M07.4 supports inherent
-    /// impls only (no traits), and a single-segment type path.
+    /// **M07.4** + **M07.6**: `impl Type { ... }` (inherent) OR
+    /// `impl Trait for Type { ... }` (trait impl — M07.6 extension).
+    /// Disambiguates by peeking for the `for` keyword after the first ident.
     fn parse_impl_block(&mut self) -> Result<ImplBlock, ParseError> {
         let kw = self.expect(&TokenKind::Impl, "`impl`")?;
-        let ty_name = self.expect_ident("type name after `impl`")?;
+        let first_ident = self.expect_ident("type name after `impl`")?;
+        let (trait_name, ty_name) = if self.bump_if(&TokenKind::For).is_some() {
+            // **M07.6**: trait impl `impl <Trait> for <Type>`.
+            let ty_name = self.expect_ident("type name after `for`")?;
+            (Some(first_ident), ty_name)
+        } else {
+            // M07.4: inherent impl `impl <Type>`.
+            (None, first_ident)
+        };
         self.expect(&TokenKind::LBrace, "`{`")?;
         let mut items = Vec::new();
         while !self.at(&TokenKind::RBrace) {
@@ -203,6 +288,7 @@ impl Parser {
         }
         let rbrace = self.expect(&TokenKind::RBrace, "`}`")?;
         Ok(ImplBlock {
+            trait_name,
             ty_name,
             items,
             span: kw.span.merge(rbrace.span),
@@ -961,6 +1047,7 @@ fn item_span(item: &Item) -> Span {
         Item::Fn(f) => f.span,
         Item::Struct(s) => s.span,
         Item::Impl(i) => i.span,
+        Item::Trait(t) => t.span,
     }
 }
 

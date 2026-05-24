@@ -61,6 +61,18 @@ struct Evaluator<'a> {
     /// **M07.4**: `vec![struct_name, fn_name]` → `&FnDecl` for associated
     /// functions (no self) declared in `impl` blocks. Built once.
     assoc_fns: HashMap<Vec<String>, &'a ast::FnDecl>,
+    /// **M07.6**: `(trait_name, method_name)` → trait default-method body.
+    /// Dispatched when an impl doesn't provide an override for the method.
+    trait_default_bodies: HashMap<(String, String), &'a ast::FnDecl>,
+    /// **M07.6**: `(trait_name, type_name, method_name)` → impl override body.
+    /// Looked up first; falls through to `trait_default_bodies` if absent.
+    trait_impl_bodies: HashMap<(String, String, String), &'a ast::FnDecl>,
+    /// **M07.6**: set of `(trait_name, type_name)` pairs for which an impl
+    /// exists (regardless of whether the impl overrides any specific
+    /// method). Lets the dispatch path tell "type T implements trait Tr"
+    /// → fall through to Tr's default method body for any non-overridden
+    /// method.
+    trait_impl_present: std::collections::HashSet<(String, String)>,
     /// Call stack — innermost frame last.
     frames: Vec<Frame>,
     next_slot_id: u32,
@@ -309,6 +321,10 @@ impl<'a> Evaluator<'a> {
         let mut fn_decls = HashMap::new();
         let mut methods: HashMap<(String, String), &'a ast::FnDecl> = HashMap::new();
         let mut assoc_fns: HashMap<Vec<String>, &'a ast::FnDecl> = HashMap::new();
+        // **M07.6**: trait default-method bodies + trait-impl override bodies.
+        let mut trait_default_bodies: HashMap<(String, String), &'a ast::FnDecl> = HashMap::new();
+        let mut trait_impl_bodies: HashMap<(String, String, String), &'a ast::FnDecl> = HashMap::new();
+        let mut trait_impl_present: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
         for item in &program.items {
             match item {
                 ast::Item::Fn(decl) => {
@@ -333,24 +349,46 @@ impl<'a> Evaluator<'a> {
                 }
                 // **M07.4**: struct decls register no value-level bindings.
                 ast::Item::Struct(_) => {}
-                // **M07.4**: impl-block fn items split into methods vs assoc
-                // fns by the first param's `ParamKind`. Methods key by
-                // `(struct_name, method_name)`; assoc fns key by full path.
+                // **M07.4** + **M07.6**: impl block. Inherent (trait_name = None)
+                // populates `methods` / `assoc_fns`; trait impl (trait_name =
+                // Some) populates `trait_impl_bodies` instead.
                 ast::Item::Impl(block) => {
-                    for fn_decl in &block.items {
-                        let is_method = fn_decl
-                            .params
-                            .first()
-                            .map(|p| !matches!(p.kind, ast::ParamKind::Normal))
-                            .unwrap_or(false);
-                        if is_method {
-                            methods.insert(
-                                (block.ty_name.clone(), fn_decl.name.clone()),
+                    if let Some(trait_name) = &block.trait_name {
+                        trait_impl_present.insert((trait_name.clone(), block.ty_name.clone()));
+                        for fn_decl in &block.items {
+                            trait_impl_bodies.insert(
+                                (trait_name.clone(), block.ty_name.clone(), fn_decl.name.clone()),
                                 fn_decl,
                             );
-                        } else {
-                            assoc_fns.insert(
-                                vec![block.ty_name.clone(), fn_decl.name.clone()],
+                        }
+                    } else {
+                        for fn_decl in &block.items {
+                            let is_method = fn_decl
+                                .params
+                                .first()
+                                .map(|p| !matches!(p.kind, ast::ParamKind::Normal))
+                                .unwrap_or(false);
+                            if is_method {
+                                methods.insert(
+                                    (block.ty_name.clone(), fn_decl.name.clone()),
+                                    fn_decl,
+                                );
+                            } else {
+                                assoc_fns.insert(
+                                    vec![block.ty_name.clone(), fn_decl.name.clone()],
+                                    fn_decl,
+                                );
+                            }
+                        }
+                    }
+                }
+                // **M07.6**: trait declaration — stash default-method bodies
+                // for dispatch fall-through.
+                ast::Item::Trait(trait_decl) => {
+                    for item in &trait_decl.items {
+                        if let ast::TraitItem::Default { decl: fn_decl } = item {
+                            trait_default_bodies.insert(
+                                (trait_decl.name.clone(), fn_decl.name.clone()),
                                 fn_decl,
                             );
                         }
@@ -364,6 +402,9 @@ impl<'a> Evaluator<'a> {
             fn_decls,
             methods,
             assoc_fns,
+            trait_default_bodies,
+            trait_impl_bodies,
+            trait_impl_present,
             frames: Vec::new(),
             next_slot_id: 0,
             next_frame_id: 0,
@@ -1915,11 +1956,46 @@ impl<'a> Evaluator<'a> {
                 let Some(struct_name) = struct_name else {
                     panic!("typeck should reject method call on non-struct receiver");
                 };
-                let method_decl = self
-                    .methods
-                    .get(&(struct_name.clone(), name.to_owned()))
-                    .copied()
-                    .expect("typeck verified method exists");
+                // **M07.6**: three-layer dispatch.
+                //   1. Inherent (M07.4) — `methods[(struct, name)]`.
+                //   2. Trait impl override — `trait_impl_bodies[(trait, struct, name)]`.
+                //   3. Trait default — `trait_default_bodies[(trait, name)]` where
+                //      `(trait, struct) ∈ trait_impl_present`.
+                // For each layer, also record which trait (for mangled name).
+                let (method_decl, trait_label): (&ast::FnDecl, Option<String>) =
+                    if let Some(decl) = self
+                        .methods
+                        .get(&(struct_name.clone(), name.to_owned()))
+                        .copied()
+                    {
+                        (decl, None) // inherent — no `<as Trait>` in name.
+                    } else {
+                        // Scan trait_impl_bodies first (impl overrides).
+                        let override_hit: Option<(String, &ast::FnDecl)> = self
+                            .trait_impl_bodies
+                            .iter()
+                            .find(|((_, ty, mn), _)| ty == &struct_name && mn == name)
+                            .map(|((tn, _, _), d)| (tn.clone(), *d));
+                        if let Some((tn, decl)) = override_hit {
+                            (decl, Some(tn))
+                        } else {
+                            // Fall through to trait defaults.
+                            let default_hit: Option<(String, &ast::FnDecl)> = self
+                                .trait_default_bodies
+                                .iter()
+                                .find(|((tn, mn), _)| {
+                                    mn == name
+                                        && self
+                                            .trait_impl_present
+                                            .contains(&(tn.clone(), struct_name.clone()))
+                                })
+                                .map(|((tn, _), d)| (tn.clone(), *d));
+                            match default_hit {
+                                Some((tn, decl)) => (decl, Some(tn)),
+                                None => panic!("typeck verified method exists"),
+                            }
+                        }
+                    };
                 // Determine self-receiver kind from the method's first param.
                 let self_kind = method_decl
                     .params
@@ -1940,7 +2016,25 @@ impl<'a> Evaluator<'a> {
                     ast::ParamKind::SelfOwned => recv.clone(),
                     ast::ParamKind::SelfShared | ast::ParamKind::SelfMut => {
                         match &recv {
-                            Value::Ref { .. } => recv.clone(),
+                            // **M07.6 fix**: when reusing an existing Value::Ref
+                            // (e.g. nested `self.other()` inside a method or
+                            // default body), allocate a FRESH borrow_id so the
+                            // UI's lazy-materialization creates a distinct
+                            // ActiveBorrowState entry per call-site self
+                            // binding. Without this, both bindings share the
+                            // same borrow_id; only the first one materializes,
+                            // and the second's arrow is missing. Matches
+                            // Rust's actual semantics: each call site is a
+                            // fresh borrow of the same data.
+                            Value::Ref { target, mutable, field_path, .. } => {
+                                let borrow_id = self.alloc_borrow_id();
+                                Value::Ref {
+                                    borrow_id,
+                                    target: *target,
+                                    mutable: *mutable,
+                                    field_path: field_path.clone(),
+                                }
+                            }
                             Value::Struct { .. } => {
                                 let recv_slot = match receiver {
                                     ast::Expr::Ident(_, sp) => {
@@ -1978,9 +2072,13 @@ impl<'a> Evaluator<'a> {
                     if self.halted { return Value::Unit; }
                     arg_values.push(v);
                 }
-                // **M07.5**: mangled name if typeck recorded a substitution
-                // for this call site (generic method); otherwise bare.
-                let base = format!("{struct_name}::{name}");
+                // **M07.5/M07.6**: mangled name. Trait dispatch uses
+                // UFCS-style `<Point as Show>::show`; inherent uses
+                // `Point::show`.
+                let base = match &trait_label {
+                    Some(tn) => format!("<{struct_name} as {tn}>::{name}"),
+                    None => format!("{struct_name}::{name}"),
+                };
                 let display = self.mangle_fn_name(&base, span);
                 self.call_decl(method_decl, &display, arg_values, span)
             }

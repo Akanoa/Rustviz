@@ -80,7 +80,8 @@ pub fn resolve(program: &ast::Program) -> Result<Resolution, ParseError> {
             // **M07.4**: structs and impl blocks don't introduce value-level
             // bindings (the type lives in typeck's `StructRegistry`). No
             // declare() needed here.
-            ast::Item::Struct(_) | ast::Item::Impl(_) => {}
+            // **M07.6**: traits are also type-level (no value-level binding).
+            ast::Item::Struct(_) | ast::Item::Impl(_) | ast::Item::Trait(_) => {}
         }
     }
     for item in &program.items {
@@ -94,6 +95,15 @@ pub fn resolve(program: &ast::Program) -> Result<Resolution, ParseError> {
             ast::Item::Impl(block) => {
                 for fn_decl in &block.items {
                     r.resolve_fn(fn_decl)?;
+                }
+            }
+            // **M07.6**: trait items — default methods have bodies that need
+            // resolving. Required methods (no body) skipped.
+            ast::Item::Trait(trait_decl) => {
+                for item in &trait_decl.items {
+                    if let ast::TraitItem::Default { decl } = item {
+                        r.resolve_fn(decl)?;
+                    }
                 }
             }
         }

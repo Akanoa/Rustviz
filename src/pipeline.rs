@@ -1617,15 +1617,19 @@ mod tests {
         );
     }
 
-    /// `fn id<T: Foo>(...)` — typeck error: bounds deferred to M07.6.
+    /// `fn id<T: Foo>(...)` — typeck error: `Foo` is not a registered trait.
+    /// **M07.6 update**: this test was written in M07.5 expecting the
+    /// "bounds deferred to M07.6" pointer. Now that M07.6 ships, bounds
+    /// are accepted syntactically; this test asserts the unknown-trait
+    /// rejection instead.
     #[test]
     fn run_pipeline_generic_bound_rejected() {
         let source = "fn id<T: Foo>(x: T) -> T {\n    x\n}\nfn main() {\n    let _ = id(5);\n}\n";
-        let err = run_pipeline(source).expect_err("bound should fail");
+        let err = run_pipeline(source).expect_err("bound on unknown trait should fail");
         assert_eq!(err.stage, CompileStage::Typeck);
         assert!(
-            err.message.contains("M07.6"),
-            "expected M07.6-pointer error, got: `{}`",
+            err.message.contains("Foo") && err.message.contains("trait"),
+            "expected unknown-trait error mentioning `Foo`, got: `{}`",
             err.message
         );
     }
@@ -1639,6 +1643,206 @@ mod tests {
         assert!(
             err.message.contains("out of scope in M07.5") || err.message.contains("inside another generic"),
             "expected nested-call error, got: `{}`",
+            err.message
+        );
+    }
+
+    // ─── M07.6 / US1: trait decl + impl + dispatch ────────────────────────
+
+    /// `trait Show { fn show(&self) -> i32; } impl Show for Point { ... }
+    /// let s = p.show();` — trace contains FrameEnter for
+    /// `<Point as Show>::show`; s = 1_i32.
+    #[test]
+    fn run_pipeline_trait_basic() {
+        let source = "struct Point { x: i32, y: i32 }\ntrait Show { fn show(&self) -> i32; }\nimpl Show for Point { fn show(&self) -> i32 { self.x } }\nfn main() { let p = Point { x: 1, y: 2 }; let s = p.show(); }\n";
+        let events = run_pipeline(source).expect("trait basic compiles");
+        let frame = events.iter().any(|e| matches!(e,
+            crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "<Point as Show>::show"
+        ));
+        assert!(frame, "expected FrameEnter `<Point as Show>::show`");
+        let s_write = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite {
+                value: crate::Value::Int { kind: crate::typeck::IntKind::I32, bits: 1 },
+                ..
+            }
+        ));
+        assert!(s_write, "expected s = 1_i32");
+    }
+
+    /// Impl missing a required method → typeck error.
+    #[test]
+    fn run_pipeline_trait_missing_method() {
+        let source = "struct Point { x: i32, y: i32 }\ntrait Show { fn show(&self) -> i32; }\nimpl Show for Point {}\nfn main() {}\n";
+        let err = run_pipeline(source).expect_err("missing required method should fail");
+        assert_eq!(err.stage, CompileStage::Typeck);
+        assert!(
+            err.message.contains("missing implementation") && err.message.contains("show"),
+            "expected missing-method error: got `{}`",
+            err.message
+        );
+    }
+
+    /// Impl with a method not on the trait → typeck error.
+    #[test]
+    fn run_pipeline_trait_extra_method() {
+        let source = "struct Point { x: i32, y: i32 }\ntrait Show { fn show(&self) -> i32; }\nimpl Show for Point { fn show(&self) -> i32 { self.x } fn other(&self) -> i32 { 0 } }\nfn main() {}\n";
+        let err = run_pipeline(source).expect_err("extra method should fail");
+        assert_eq!(err.stage, CompileStage::Typeck);
+        assert!(
+            err.message.contains("not on trait") && err.message.contains("other"),
+            "expected extra-method error: got `{}`",
+            err.message
+        );
+    }
+
+    // ─── M07.6 / US2: default method ──────────────────────────────────────
+
+    /// Default method dispatch: impl provides only `count`; calling
+    /// `p.double()` routes to the trait's default body, which calls
+    /// `self.count()` (the impl override). Result = 2 * p.x.
+    #[test]
+    fn run_pipeline_default_method() {
+        let source = "struct Point { x: i32, y: i32 }\ntrait Counter { fn count(&self) -> i32; fn double(&self) -> i32 { self.count() * 2 } }\nimpl Counter for Point { fn count(&self) -> i32 { self.x } }\nfn main() { let p = Point { x: 1, y: 2 }; let v = p.double(); }\n";
+        let events = run_pipeline(source).expect("default method compiles");
+        let outer = events.iter().any(|e| matches!(e,
+            crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "<Point as Counter>::double"
+        ));
+        let inner = events.iter().any(|e| matches!(e,
+            crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "<Point as Counter>::count"
+        ));
+        assert!(outer, "expected outer FrameEnter `<Point as Counter>::double`");
+        assert!(inner, "expected nested FrameEnter `<Point as Counter>::count`");
+        let v_write = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite {
+                value: crate::Value::Int { kind: crate::typeck::IntKind::I32, bits: 2 },
+                ..
+            }
+        ));
+        assert!(v_write, "expected v = 2_i32 (1 * 2)");
+    }
+
+    // ─── M07.6 / US3: generic bound (THE HEADLINE) ────────────────────────
+
+    /// `fn print<T: Show>(x: T) -> i32 { x.show() } let r = print(p);` —
+    /// bound proves the call; nested frames `print::<Point>` and
+    /// `<Point as Show>::show`; r = p.x.
+    #[test]
+    fn run_pipeline_generic_bound() {
+        let source = "struct Point { x: i32, y: i32 }\ntrait Show { fn show(&self) -> i32; }\nimpl Show for Point { fn show(&self) -> i32 { self.x } }\nfn print<T: Show>(x: T) -> i32 { x.show() }\nfn main() { let p = Point { x: 1, y: 2 }; let r = print(p); }\n";
+        let events = run_pipeline(source).expect("generic bound compiles");
+        let outer = events.iter().any(|e| matches!(e,
+            crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "print::<Point>"
+        ));
+        let inner = events.iter().any(|e| matches!(e,
+            crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "<Point as Show>::show"
+        ));
+        assert!(outer, "expected outer FrameEnter `print::<Point>`");
+        assert!(inner, "expected nested FrameEnter `<Point as Show>::show`");
+    }
+
+    /// Bound not satisfied — `print(5)` where i32: Show absent.
+    #[test]
+    fn run_pipeline_trait_bound_unsatisfied() {
+        let source = "struct Point { x: i32, y: i32 }\ntrait Show { fn show(&self) -> i32; }\nimpl Show for Point { fn show(&self) -> i32 { self.x } }\nfn print<T: Show>(x: T) -> i32 { x.show() }\nfn main() { let r = print(5); }\n";
+        let err = run_pipeline(source).expect_err("bound not satisfied should fail");
+        assert_eq!(err.stage, CompileStage::Typeck);
+        assert!(
+            err.message.contains("trait bound") && err.message.contains("i32") && err.message.contains("Show"),
+            "expected bound-not-satisfied error: got `{}`",
+            err.message
+        );
+    }
+
+    // ─── M07.6 / US4: multi-bound ─────────────────────────────────────────
+
+    /// `fn show_n_count<T: Show + Counter>(x: T) -> i32 { x.show() + x.count() }`
+    /// — both bounds active; nested dispatches; r = 1 + 2 = 3.
+    #[test]
+    fn run_pipeline_multi_bound() {
+        let source = "struct Point { x: i32, y: i32 }\ntrait Show { fn show(&self) -> i32; }\ntrait Counter { fn count(&self) -> i32; }\nimpl Show for Point { fn show(&self) -> i32 { self.x } }\nimpl Counter for Point { fn count(&self) -> i32 { self.y } }\nfn show_n_count<T: Show + Counter>(x: T) -> i32 { x.show() + x.count() }\nfn main() { let p = Point { x: 1, y: 2 }; let r = show_n_count(p); }\n";
+        let events = run_pipeline(source).expect("multi-bound compiles");
+        let outer = events.iter().any(|e| matches!(e,
+            crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "show_n_count::<Point>"
+        ));
+        let show_frame = events.iter().any(|e| matches!(e,
+            crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "<Point as Show>::show"
+        ));
+        let count_frame = events.iter().any(|e| matches!(e,
+            crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "<Point as Counter>::count"
+        ));
+        assert!(outer, "expected outer FrameEnter `show_n_count::<Point>`");
+        assert!(show_frame, "expected nested FrameEnter `<Point as Show>::show`");
+        assert!(count_frame, "expected nested FrameEnter `<Point as Counter>::count`");
+        let r_write = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite {
+                value: crate::Value::Int { kind: crate::typeck::IntKind::I32, bits: 3 },
+                ..
+            }
+        ));
+        assert!(r_write, "expected r = 3_i32 (1 + 2)");
+    }
+
+    /// Method-name ambiguity in multi-bound → typeck error suggesting UFCS.
+    #[test]
+    fn run_pipeline_trait_method_ambiguous() {
+        let source = "struct Point { x: i32, y: i32 }\ntrait A { fn name(&self) -> i32; }\ntrait B { fn name(&self) -> i32; }\nimpl A for Point { fn name(&self) -> i32 { self.x } }\nimpl B for Point { fn name(&self) -> i32 { self.y } }\nfn foo<T: A + B>(x: T) -> i32 { x.name() }\nfn main() { let p = Point { x: 1, y: 2 }; let _ = foo(p); }\n";
+        let err = run_pipeline(source).expect_err("ambiguous method should fail");
+        assert_eq!(err.stage, CompileStage::Typeck);
+        assert!(
+            err.message.contains("ambiguous") && err.message.contains("UFCS"),
+            "expected ambiguous-method error suggesting UFCS: got `{}`",
+            err.message
+        );
+    }
+
+    // ─── M07.6 / cross-cutting rejection tests ────────────────────────────
+
+    /// Inherent dispatch wins over trait when both define `show`.
+    #[test]
+    fn run_pipeline_trait_inherent_wins() {
+        let source = "struct Point { x: i32, y: i32 }\ntrait Show { fn show(&self) -> i32; }\nimpl Point { fn show(&self) -> i32 { 42 } }\nimpl Show for Point { fn show(&self) -> i32 { self.x } }\nfn main() { let p = Point { x: 1, y: 2 }; let v = p.show(); }\n";
+        let events = run_pipeline(source).expect("inherent + trait compiles");
+        // Inherent frame (M07.4 format), NOT trait `<as>` form.
+        let inherent_frame = events.iter().any(|e| matches!(e,
+            crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "Point::show"
+        ));
+        let trait_frame = events.iter().any(|e| matches!(e,
+            crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "<Point as Show>::show"
+        ));
+        assert!(inherent_frame, "expected inherent frame `Point::show`");
+        assert!(!trait_frame, "should NOT see trait frame (inherent wins)");
+        // Value = 42 (inherent body), not p.x.
+        let v_write = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite {
+                value: crate::Value::Int { kind: crate::typeck::IntKind::I32, bits: 42 },
+                ..
+            }
+        ));
+        assert!(v_write, "expected v = 42 (inherent), not 1 (trait)");
+    }
+
+    /// Duplicate trait declaration → typeck error.
+    #[test]
+    fn run_pipeline_trait_duplicate_decl() {
+        let source = "trait Show { fn show(&self) -> i32; }\ntrait Show { fn show(&self) -> i32; }\nfn main() {}\n";
+        let err = run_pipeline(source).expect_err("duplicate trait should fail");
+        assert_eq!(err.stage, CompileStage::Typeck);
+        assert!(
+            err.message.contains("already defined") && err.message.contains("Show"),
+            "expected duplicate-trait error: got `{}`",
+            err.message
+        );
+    }
+
+    /// Duplicate trait impl for (trait, type) pair → typeck error.
+    #[test]
+    fn run_pipeline_trait_duplicate_impl() {
+        let source = "struct Point { x: i32, y: i32 }\ntrait Show { fn show(&self) -> i32; }\nimpl Show for Point { fn show(&self) -> i32 { self.x } }\nimpl Show for Point { fn show(&self) -> i32 { self.y } }\nfn main() {}\n";
+        let err = run_pipeline(source).expect_err("duplicate impl should fail");
+        assert_eq!(err.stage, CompileStage::Typeck);
+        assert!(
+            err.message.contains("duplicate") && err.message.contains("Show"),
+            "expected duplicate-impl error: got `{}`",
             err.message
         );
     }

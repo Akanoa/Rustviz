@@ -25,8 +25,47 @@ pub enum Item {
     /// **M07.4**: struct declaration `struct Name { f1: T1, f2: T2 }`. At
     /// least one field required (empty structs rejected at parse time).
     Struct(StructDecl),
-    /// **M07.4**: inherent impl block `impl Type { fn ...; fn ...; }`.
+    /// **M07.4**: impl block. M07.4 was inherent-only; M07.6 extended via
+    /// `ImplBlock.trait_name: Option<String>` to support trait impls
+    /// (`impl Trait for Type`).
     Impl(ImplBlock),
+    /// **M07.6**: trait declaration `trait Name { fn item1; fn item2 { ... }; }`.
+    /// Items are either required (signature-only) or default (with body).
+    Trait(TraitDecl),
+}
+
+/// **M07.6**: trait declaration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraitDecl {
+    /// Trait name (e.g. `"Show"`).
+    pub name: String,
+    /// Trait items in declaration order.
+    pub items: Vec<TraitItem>,
+    /// Span from `trait` keyword through closing `}`.
+    pub span: Span,
+}
+
+/// **M07.6**: one item declared inside a trait — either a required method
+/// (signature only, no body — impl must provide) or a default method
+/// (with a body the impl can override or fall through to).
+#[derive(Debug, Clone, PartialEq)]
+pub enum TraitItem {
+    /// Required method — signature only.
+    Required {
+        /// Method name.
+        name: String,
+        /// Param list (first param must be a self-receiver per `Param.kind`).
+        params: Vec<Param>,
+        /// Optional return type annotation.
+        return_ty: Option<Type>,
+        /// Span from `fn` keyword through `;`.
+        span: Span,
+    },
+    /// Default method — has a body. Impl can override or fall through.
+    Default {
+        /// Full FnDecl with body.
+        decl: FnDecl,
+    },
 }
 
 /// **M07.4**: struct declaration with named fields.
@@ -43,15 +82,18 @@ pub struct StructDecl {
     pub span: Span,
 }
 
-/// **M07.5**: type parameter declared on a fn or struct.
+/// **M07.5** + **M07.6**: type parameter declared on a fn or struct.
+/// M07.5 had `bound: Option<String>` (parser-stored, typeck-rejected);
+/// M07.6 promotes to `bounds: Vec<String>` (multi-bound supported,
+/// typeck-checked: each bound must reference an existing trait).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypeParam {
     /// Type parameter name (e.g. `"T"`).
     pub name: String,
-    /// **M07.5**: bound trait name if specified (`T: Foo` → `Some("Foo")`).
-    /// Parser-accepted for forward-compat; typeck rejects with an
-    /// M07.6-pointer error.
-    pub bound: Option<String>,
+    /// **M07.6**: trait bounds (`T: Foo + Bar` → `vec!["Foo", "Bar"]`).
+    /// Empty for unbounded params (M07.5 case). Each bound must reference
+    /// a registered trait (typeck phase 1 verifies).
+    pub bounds: Vec<String>,
     /// Span covering the name.
     pub span: Span,
 }
@@ -67,10 +109,15 @@ pub struct StructField {
     pub span: Span,
 }
 
-/// **M07.4**: inherent impl block.
+/// **M07.4** + **M07.6**: impl block. M07.4 introduced inherent impls
+/// (`trait_name = None`); M07.6 extends with trait impls
+/// (`trait_name = Some("Show")` for `impl Show for Point { .. }`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImplBlock {
-    /// Receiver type name (single-segment in M07.4 — `"Point"`).
+    /// **M07.6**: `None` for inherent impls (M07.4 behavior);
+    /// `Some(name)` for trait impls (`impl <name> for <ty_name>`).
+    pub trait_name: Option<String>,
+    /// Receiver type name (single-segment — `"Point"`).
     pub ty_name: String,
     /// Associated functions + methods. Each fn may have a self-receiver as
     /// its first `Param` (via `Param.kind`).

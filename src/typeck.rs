@@ -351,6 +351,13 @@ pub fn typeck(program: &ast::Program, resolution: &Resolution) -> Result<TypeMap
             t.register_struct(decl)?;
         }
     }
+    // **M07.6**: register trait declarations BEFORE impl blocks (trait
+    // impls reference traits by name; bound checks reference traits).
+    for item in &program.items {
+        if let ast::Item::Trait(decl) = item {
+            t.register_trait(decl)?;
+        }
+    }
     for item in &program.items {
         match item {
             ast::Item::Fn(decl) => {
@@ -365,10 +372,35 @@ pub fn typeck(program: &ast::Program, resolution: &Resolution) -> Result<TypeMap
                 if !tp_names.is_empty() {
                     t.fn_type_params.insert(id, tp_names);
                 }
+                // **M07.6**: validate that each bound references a registered
+                // trait. Reject unknown-trait bounds with a clear message.
+                for tp in &decl.type_params {
+                    for bound in &tp.bounds {
+                        if !t.traits.schemas.contains_key(bound) {
+                            return Err(ParseError {
+                                message: format!(
+                                    "unknown trait `{bound}` in bound `{}: {bound}`",
+                                    tp.name
+                                ),
+                                span: tp.span,
+                            });
+                        }
+                    }
+                }
+                // **M07.6**: stash the fn's per-param bounds for bound-checking.
+                let tp_bounds: Vec<(String, Vec<String>)> = decl
+                    .type_params
+                    .iter()
+                    .map(|p| (p.name.clone(), p.bounds.clone()))
+                    .collect();
+                if tp_bounds.iter().any(|(_, b)| !b.is_empty()) {
+                    t.fn_type_param_bounds.insert(id, tp_bounds);
+                }
             }
-            // Structs already processed above.
-            ast::Item::Struct(_) => {}
-            // M07.4 impl blocks register methods + assoc fns.
+            // Structs and traits already processed above.
+            ast::Item::Struct(_) | ast::Item::Trait(_) => {}
+            // M07.4 impl blocks register methods + assoc fns;
+            // M07.6 trait impls register override sigs in TraitImplRegistry.
             ast::Item::Impl(block) => t.register_impl(block)?,
         }
     }
@@ -382,8 +414,33 @@ pub fn typeck(program: &ast::Program, resolution: &Resolution) -> Result<TypeMap
             ast::Item::Fn(decl) => t.typecheck_fn(decl)?,
             ast::Item::Struct(_) => {}
             ast::Item::Impl(block) => {
-                for fn_decl in &block.items {
-                    t.typecheck_impl_fn(&block.ty_name, fn_decl)?;
+                if block.trait_name.is_some() {
+                    // **M07.6**: trait-impl method bodies typecheck similarly
+                    // to inherent methods but the sig comes from the
+                    // TraitImplRegistry instead of ImplRegistry.
+                    for fn_decl in &block.items {
+                        t.typecheck_trait_impl_fn(
+                            block.trait_name.as_ref().unwrap(),
+                            &block.ty_name,
+                            fn_decl,
+                        )?;
+                    }
+                } else {
+                    for fn_decl in &block.items {
+                        t.typecheck_impl_fn(&block.ty_name, fn_decl)?;
+                    }
+                }
+            }
+            // **M07.6**: trait default methods typecheck with self bound to
+            // `&Ty::Param("Self")` + an implicit "Self: <this trait>"
+            // bound, so method calls on self (`self.count()`) dispatch
+            // via the Param-receiver path in the third-layer dispatch.
+            ast::Item::Trait(trait_decl) => {
+                let trait_name = trait_decl.name.clone();
+                for item in &trait_decl.items {
+                    if let ast::TraitItem::Default { decl } = item {
+                        t.typecheck_trait_default_fn(&trait_name, decl)?;
+                    }
                 }
             }
         }
@@ -525,6 +582,41 @@ struct ImplRegistry {
     impl_block_spans: IndexMap<String, Span>,
 }
 
+/// **M07.6**: trait declarations + their methods (required and default).
+/// Phase 2 dispatch consults this when resolving method calls on
+/// type-param-typed values (via bounds) and when filling in default-method
+/// bodies for trait impls that don't override them.
+#[derive(Default)]
+struct TraitRegistry {
+    /// Trait name → schema.
+    schemas: IndexMap<String, TraitSchema>,
+}
+
+#[derive(Clone)]
+struct TraitSchema {
+    /// Required methods — signature only; impl must provide.
+    required_methods: IndexMap<String, FnSig>,
+    /// Default methods — signature AND a reference to the FnDecl for body
+    /// re-walk at typecheck (we don't typecheck default bodies but we
+    /// store them for eval-time dispatch).
+    default_methods: IndexMap<String, FnSig>,
+}
+
+/// **M07.6**: per-`(trait, type)` trait-impl registry. Records which
+/// methods the impl explicitly provides (the rest fall through to the
+/// trait's defaults).
+#[derive(Default)]
+struct TraitImplRegistry {
+    impls: IndexMap<(String, String), TraitImpl>,
+    impl_spans: IndexMap<(String, String), Span>,
+}
+
+struct TraitImpl {
+    /// Method name → override signature. Methods not in this map fall
+    /// through to the trait's `default_methods` at dispatch time.
+    overrides: IndexMap<String, FnSig>,
+}
+
 struct Typechecker<'a> {
     resolution: &'a Resolution,
     types: TypeMap,
@@ -542,6 +634,12 @@ struct Typechecker<'a> {
     /// fn body. Pushed at body entry from the FnDecl's `type_params`;
     /// popped at body exit. Top of stack = innermost generic context.
     current_type_params: Vec<Vec<String>>,
+    /// **M07.6**: stack of in-scope `(type_param_name, bound_trait_names)`
+    /// for the current fn body. Pushed/popped alongside `current_type_params`.
+    /// Used by the typecheck_method_call third-layer dispatch when the
+    /// receiver is `Ty::Param(T)` — looks up T's bounds to find available
+    /// trait methods.
+    current_type_param_bounds: Vec<Vec<(String, Vec<String>)>>,
     /// **M07.5**: substitution stack — one entry per active generic-fn
     /// call typecheck. Maps type-param name → concrete `Ty`. Pushed at
     /// call-site typecheck entry, popped after. M07.5 max depth = 1
@@ -552,6 +650,14 @@ struct Typechecker<'a> {
     /// alongside `binding_types`. Used at call sites to bind turbofish
     /// type-args positionally.
     fn_type_params: IndexMap<BindingId, Vec<String>>,
+    /// **M07.6**: per-free-fn type-param bounds. `Vec<(name, bound_traits)>`
+    /// in declaration order. Populated in phase 1; consulted at call sites
+    /// for bound-checking against the substituted concrete type.
+    fn_type_param_bounds: IndexMap<BindingId, Vec<(String, Vec<String>)>>,
+    /// **M07.6**: trait declarations.
+    traits: TraitRegistry,
+    /// **M07.6**: trait impls — per-`(trait, type)` registry.
+    trait_impls: TraitImplRegistry,
 }
 
 impl<'a> Typechecker<'a> {
@@ -565,8 +671,12 @@ impl<'a> Typechecker<'a> {
             structs: StructRegistry::default(),
             impls: ImplRegistry::default(),
             current_type_params: Vec::new(),
+            current_type_param_bounds: Vec::new(),
             subst: Vec::new(),
             fn_type_params: IndexMap::new(),
+            fn_type_param_bounds: IndexMap::new(),
+            traits: TraitRegistry::default(),
+            trait_impls: TraitImplRegistry::default(),
         }
     }
 
@@ -712,6 +822,11 @@ impl<'a> Typechecker<'a> {
     /// into the dispatch tables. Verifies the type exists, rejects a second
     /// impl block for the same type, and rejects duplicate item names.
     fn register_impl(&mut self, block: &ast::ImplBlock) -> Result<(), ParseError> {
+        // **M07.6**: trait impl (`impl Trait for Type`) routed separately.
+        if let Some(trait_name) = &block.trait_name {
+            return self.register_trait_impl(trait_name, block);
+        }
+        // M07.4: inherent impl. Requires the type to be a registered struct.
         if !self.structs.schemas.contains_key(&block.ty_name) {
             return Err(ParseError {
                 message: format!(
@@ -735,6 +850,137 @@ impl<'a> Typechecker<'a> {
         for fn_decl in &block.items {
             self.register_impl_fn(&block.ty_name, fn_decl)?;
         }
+        Ok(())
+    }
+
+    /// **M07.6**: register a trait declaration's schema (required + default
+    /// methods). Rejects duplicate traits and duplicate methods within a
+    /// trait. Stores FnSigs for both required and default methods so phase 2
+    /// dispatch knows what's available.
+    fn register_trait(&mut self, decl: &ast::TraitDecl) -> Result<(), ParseError> {
+        if self.traits.schemas.contains_key(&decl.name) {
+            return Err(ParseError {
+                message: format!("trait `{}` already defined", decl.name),
+                span: decl.span,
+            });
+        }
+        let mut schema = TraitSchema {
+            required_methods: IndexMap::new(),
+            default_methods: IndexMap::new(),
+        };
+        for item in &decl.items {
+            match item {
+                ast::TraitItem::Required { name, params, return_ty, span } => {
+                    // Build FnSig from params (skip self-receiver) + return.
+                    let mut explicit_params: Vec<Ty> = Vec::new();
+                    for (i, p) in params.iter().enumerate() {
+                        if i == 0 && !matches!(p.kind, ast::ParamKind::Normal) {
+                            continue;
+                        }
+                        explicit_params.push(self.ty_from_ast_resolving_structs(&p.ty)?);
+                    }
+                    let ret = match return_ty {
+                        Some(t) => self.ty_from_ast_resolving_structs(t)?,
+                        None => Ty::Unit,
+                    };
+                    let sig = FnSig { params: explicit_params, ret };
+                    let _ = span;
+                    schema.required_methods.insert(name.clone(), sig);
+                }
+                ast::TraitItem::Default { decl: fn_decl } => {
+                    let mut explicit_params: Vec<Ty> = Vec::new();
+                    for (i, p) in fn_decl.params.iter().enumerate() {
+                        if i == 0 && !matches!(p.kind, ast::ParamKind::Normal) {
+                            continue;
+                        }
+                        explicit_params.push(self.ty_from_ast_resolving_structs(&p.ty)?);
+                    }
+                    let ret = match &fn_decl.return_ty {
+                        Some(t) => self.ty_from_ast_resolving_structs(t)?,
+                        None => Ty::Unit,
+                    };
+                    schema.default_methods.insert(
+                        fn_decl.name.clone(),
+                        FnSig { params: explicit_params, ret },
+                    );
+                }
+            }
+        }
+        self.traits.schemas.insert(decl.name.clone(), schema);
+        Ok(())
+    }
+
+    /// **M07.6**: register a trait impl (`impl Trait for Type`). Validates:
+    /// - the trait exists;
+    /// - no duplicate `(trait, type)` pair;
+    /// - every method in the impl is on the trait (no extras);
+    /// - every required method on the trait is provided.
+    /// Stores override sigs in `TraitImplRegistry`; the eval-side body
+    /// lookups happen via `Evaluator.trait_impl_bodies`.
+    fn register_trait_impl(
+        &mut self,
+        trait_name: &str,
+        block: &ast::ImplBlock,
+    ) -> Result<(), ParseError> {
+        let trait_schema = self.traits.schemas.get(trait_name).cloned().ok_or_else(|| ParseError {
+            message: format!("unknown trait `{trait_name}` in impl block"),
+            span: block.span,
+        })?;
+        let key = (trait_name.to_owned(), block.ty_name.clone());
+        if self.trait_impls.impls.contains_key(&key) {
+            return Err(ParseError {
+                message: format!(
+                    "duplicate impl: `{}` already implements `{}`",
+                    block.ty_name, trait_name
+                ),
+                span: block.span,
+            });
+        }
+        let mut overrides: IndexMap<String, FnSig> = IndexMap::new();
+        for fn_decl in &block.items {
+            // Verify method is on the trait.
+            let is_known = trait_schema.required_methods.contains_key(&fn_decl.name)
+                || trait_schema.default_methods.contains_key(&fn_decl.name);
+            if !is_known {
+                return Err(ParseError {
+                    message: format!(
+                        "method `{}` is not on trait `{trait_name}`",
+                        fn_decl.name
+                    ),
+                    span: fn_decl.span,
+                });
+            }
+            // Build the override's sig.
+            let mut explicit_params: Vec<Ty> = Vec::new();
+            for (i, p) in fn_decl.params.iter().enumerate() {
+                if i == 0 && !matches!(p.kind, ast::ParamKind::Normal) {
+                    continue;
+                }
+                explicit_params.push(self.ty_from_ast_resolving_structs(&p.ty)?);
+            }
+            let ret = match &fn_decl.return_ty {
+                Some(t) => self.ty_from_ast_resolving_structs(t)?,
+                None => Ty::Unit,
+            };
+            overrides.insert(
+                fn_decl.name.clone(),
+                FnSig { params: explicit_params, ret },
+            );
+        }
+        // Verify every required method is implemented.
+        for req_name in trait_schema.required_methods.keys() {
+            if !overrides.contains_key(req_name) {
+                return Err(ParseError {
+                    message: format!(
+                        "missing implementation of trait method `{req_name}` for type `{}`",
+                        block.ty_name
+                    ),
+                    span: block.span,
+                });
+            }
+        }
+        self.trait_impls.impls.insert(key.clone(), TraitImpl { overrides });
+        self.trait_impls.impl_spans.insert(key, block.span);
         Ok(())
     }
 
@@ -820,19 +1066,10 @@ impl<'a> Typechecker<'a> {
     }
 
     fn build_fn_sig(&mut self, decl: &ast::FnDecl) -> Result<FnSig, ParseError> {
-        // **M07.5**: reject bounds + multi-T per the M07.5 single-param
-        // restriction.
-        for tp in &decl.type_params {
-            if tp.bound.is_some() {
-                return Err(ParseError {
-                    message: format!(
-                        "trait bounds on generics (`{}: ...`) are deferred to M07.6",
-                        tp.name
-                    ),
-                    span: tp.span,
-                });
-            }
-        }
+        // **M07.6**: bounds now supported (M07.5 rejected them; lifted here).
+        // Each bound must reference a registered trait (verified in
+        // `register_trait_bounds` called separately during phase 1).
+        // Multi-T still rejected per M07.5 single-param restriction.
         if decl.type_params.len() > 1 {
             return Err(ParseError {
                 message: "M07.5 supports a single type parameter; multi-type-param fns are out of scope".into(),
@@ -867,6 +1104,14 @@ impl<'a> Typechecker<'a> {
         // `T` as a type resolves to `Ty::Param("T")`.
         let tp_names: Vec<String> = decl.type_params.iter().map(|p| p.name.clone()).collect();
         self.current_type_params.push(tp_names);
+        // **M07.6**: push the per-param bounds for trait-method dispatch
+        // through bounds (`x.show()` inside `fn print<T: Show>`).
+        let tp_bounds: Vec<(String, Vec<String>)> = decl
+            .type_params
+            .iter()
+            .map(|p| (p.name.clone(), p.bounds.clone()))
+            .collect();
+        self.current_type_param_bounds.push(tp_bounds);
         for (param, param_ty) in decl.params.iter().zip(sig.params.iter()) {
             let pid = self
                 .lookup_binding(|d| matches!(d.kind, BindingKind::Param) && d.name_span == param.span)
@@ -879,6 +1124,7 @@ impl<'a> Typechecker<'a> {
         let body_ty = self.typecheck_block(&decl.body)?;
         if body_ty != sig.ret {
             self.current_type_params.pop();
+            self.current_type_param_bounds.pop();
             return Err(ParseError {
                 message: format!(
                     "function returns `{}`, but body has type `{}`",
@@ -895,6 +1141,7 @@ impl<'a> Typechecker<'a> {
         }
         self.current_fn_ret = prev;
         self.current_type_params.pop();
+        self.current_type_param_bounds.pop();
         Ok(())
     }
 
@@ -904,6 +1151,122 @@ impl<'a> Typechecker<'a> {
     ///     enclosing impl block's real `Ty::Struct` (or borrow thereof).
     ///   - Reads the sig from `impls.methods` / `impls.assoc_fns` rather
     ///     than `binding_types` (impl-block fns have no top-level Fn id).
+    /// **M07.6**: typecheck a trait DEFAULT method body. Self is abstract
+    /// (`Ty::Param("Self")`); push an implicit bound `Self: <this trait>`
+    /// so `self.other_method()` calls inside the body dispatch through
+    /// the Param-receiver path. Eval substitutes Self → concrete type at
+    /// impl-dispatch time.
+    fn typecheck_trait_default_fn(
+        &mut self,
+        trait_name: &str,
+        decl: &ast::FnDecl,
+    ) -> Result<(), ParseError> {
+        let self_ty = Ty::Param("Self".to_owned());
+        // Push Self with the implicit trait bound.
+        self.current_type_params.push(vec!["Self".to_owned()]);
+        self.current_type_param_bounds
+            .push(vec![("Self".to_owned(), vec![trait_name.to_owned()])]);
+        let ret = match &decl.return_ty {
+            Some(t) => self.ty_from_ast_resolving_structs(t)?,
+            None => Ty::Unit,
+        };
+        for (i, param) in decl.params.iter().enumerate() {
+            let bind_ty = if i == 0 {
+                match param.kind {
+                    ast::ParamKind::SelfOwned => self_ty.clone(),
+                    ast::ParamKind::SelfShared => Ty::Ref {
+                        inner: Box::new(self_ty.clone()),
+                        mutable: false,
+                    },
+                    ast::ParamKind::SelfMut => Ty::Ref {
+                        inner: Box::new(self_ty.clone()),
+                        mutable: true,
+                    },
+                    ast::ParamKind::Normal => self.ty_from_ast_resolving_structs(&param.ty)?,
+                }
+            } else {
+                self.ty_from_ast_resolving_structs(&param.ty)?
+            };
+            let pid = self
+                .lookup_binding(|d| matches!(d.kind, BindingKind::Param) && d.name_span == param.span)
+                .expect("trait default param binding present");
+            self.types.binding_types.insert(pid, BindingType::Var(bind_ty));
+        }
+        let prev = self.current_fn_ret.replace(ret.clone());
+        let body_ty = self.typecheck_block(&decl.body)?;
+        // Don't fail on body-ty mismatch for default methods — at impl-time,
+        // Self is substituted and the body re-binds with concrete types.
+        let _ = body_ty;
+        let _ = ret;
+        self.current_fn_ret = prev;
+        self.current_type_params.pop();
+        self.current_type_param_bounds.pop();
+        Ok(())
+    }
+
+    /// **M07.6**: typecheck a trait-impl fn body. Mirrors `typecheck_impl_fn`
+    /// but pulls the sig from `trait_impls.impls[(trait, type)].overrides`
+    /// instead of `impls.methods`. Self-receiver substitution uses the
+    /// trait-impl's receiver struct type.
+    fn typecheck_trait_impl_fn(
+        &mut self,
+        trait_name: &str,
+        struct_name: &str,
+        decl: &ast::FnDecl,
+    ) -> Result<(), ParseError> {
+        let struct_ty = Ty::Struct {
+            name: struct_name.to_owned(),
+            fields: self.structs.schemas.get(struct_name).cloned().unwrap_or_default(),
+            type_args: Vec::new(),
+        };
+        let key = (trait_name.to_owned(), struct_name.to_owned());
+        let sig = self
+            .trait_impls
+            .impls
+            .get(&key)
+            .and_then(|ti| ti.overrides.get(&decl.name))
+            .cloned()
+            .expect("trait-impl fn registered in phase 1");
+        let mut explicit_iter = sig.params.iter();
+        for (i, param) in decl.params.iter().enumerate() {
+            let bind_ty = if i == 0 {
+                match param.kind {
+                    ast::ParamKind::SelfOwned => struct_ty.clone(),
+                    ast::ParamKind::SelfShared => Ty::Ref {
+                        inner: Box::new(struct_ty.clone()),
+                        mutable: false,
+                    },
+                    ast::ParamKind::SelfMut => Ty::Ref {
+                        inner: Box::new(struct_ty.clone()),
+                        mutable: true,
+                    },
+                    ast::ParamKind::Normal => explicit_iter.next().expect("normal sig").clone(),
+                }
+            } else {
+                explicit_iter.next().expect("normal sig").clone()
+            };
+            let pid = self
+                .lookup_binding(|d| matches!(d.kind, BindingKind::Param) && d.name_span == param.span)
+                .expect("param binding present");
+            self.types.binding_types.insert(pid, BindingType::Var(bind_ty));
+        }
+        let prev = self.current_fn_ret.replace(sig.ret.clone());
+        let body_ty = self.typecheck_block(&decl.body)?;
+        if body_ty != sig.ret {
+            return Err(ParseError {
+                message: format!(
+                    "trait method `{}` returns `{}`, but body has type `{}`",
+                    decl.name,
+                    sig.ret.name(),
+                    body_ty.name()
+                ),
+                span: decl.body.tail.as_ref().map(|t| t.span()).unwrap_or(decl.body.span),
+            });
+        }
+        self.current_fn_ret = prev;
+        Ok(())
+    }
+
     fn typecheck_impl_fn(
         &mut self,
         struct_name: &str,
@@ -2091,7 +2454,7 @@ impl<'a> Typechecker<'a> {
                     },
                     _ => None,
                 };
-                if let Some(struct_name) = receiver_struct_name {
+                if let Some(struct_name) = receiver_struct_name.clone() {
                     let key = (struct_name.clone(), name.to_owned());
                     if let Some(sig) = self.impls.methods.get(&key).cloned() {
                         if args.len() != sig.params.len() {
@@ -2126,6 +2489,93 @@ impl<'a> Typechecker<'a> {
                         return Ok(sig.ret);
                     }
                 }
+                // **M07.6**: third layer — trait impls. Two cases:
+                //   1. Concrete receiver (Struct, Int, etc.): search
+                //      trait_impls for a matching `(trait, type_name)`
+                //      whose trait has the method.
+                //   2. Param receiver (`Ty::Param("T")`): consult the
+                //      current type-param bounds; for each bound trait,
+                //      check if the trait has the method. First-match
+                //      wins; ambiguity → error suggesting UFCS.
+                // M07.6: auto-deref Ref<Ty> for dispatch purposes.
+                let receiver_inner = match receiver_ty {
+                    Ty::Ref { inner, .. } => (**inner).clone(),
+                    other => other.clone(),
+                };
+                let receiver_concrete_name = match &receiver_inner {
+                    Ty::Param(_) => None,
+                    other => Some(other.name()),
+                };
+                if let Some(concrete_name) = receiver_concrete_name {
+                    // Concrete-receiver path. Search all trait_impls for
+                    // a matching (trait, type) whose trait has the method.
+                    let mut found: Vec<(String, FnSig)> = Vec::new();
+                    for ((tn, ty_name), tr_impl) in &self.trait_impls.impls {
+                        if ty_name == &concrete_name {
+                            // Method in overrides or trait defaults?
+                            if let Some(sig) = tr_impl.overrides.get(name) {
+                                found.push((tn.clone(), sig.clone()));
+                            } else if let Some(schema) = self.traits.schemas.get(tn) {
+                                if let Some(sig) = schema.default_methods.get(name) {
+                                    found.push((tn.clone(), sig.clone()));
+                                }
+                            }
+                        }
+                    }
+                    if found.len() == 1 {
+                        let (_, sig) = found.into_iter().next().unwrap();
+                        return self.typecheck_method_args(name, args, &sig, span);
+                    } else if found.len() > 1 {
+                        let candidates: Vec<String> = found
+                            .iter()
+                            .map(|(tn, _)| format!("`{tn}::{name}`"))
+                            .collect();
+                        return Err(ParseError {
+                            message: format!(
+                                "ambiguous method `{name}` — candidates: {}; use UFCS like `<Trait>::{name}(&x)` to disambiguate",
+                                candidates.join(", ")
+                            ),
+                            span,
+                        });
+                    }
+                } else if let Ty::Param(tp_name) = &receiver_inner {
+                    // Param-receiver path. Look up the param's bounds in
+                    // the current type-param scope and search each bound
+                    // trait's methods.
+                    let bounds: Vec<String> = self
+                        .current_type_param_bounds
+                        .last()
+                        .and_then(|frame| {
+                            frame.iter().find(|(n, _)| n == tp_name).map(|(_, b)| b.clone())
+                        })
+                        .unwrap_or_default();
+                    let mut found: Vec<(String, FnSig)> = Vec::new();
+                    for trait_name in &bounds {
+                        if let Some(schema) = self.traits.schemas.get(trait_name) {
+                            if let Some(sig) = schema.required_methods.get(name) {
+                                found.push((trait_name.clone(), sig.clone()));
+                            } else if let Some(sig) = schema.default_methods.get(name) {
+                                found.push((trait_name.clone(), sig.clone()));
+                            }
+                        }
+                    }
+                    if found.len() == 1 {
+                        let (_, sig) = found.into_iter().next().unwrap();
+                        return self.typecheck_method_args(name, args, &sig, span);
+                    } else if found.len() > 1 {
+                        let candidates: Vec<String> = found
+                            .iter()
+                            .map(|(tn, _)| format!("`{tn}::{name}`"))
+                            .collect();
+                        return Err(ParseError {
+                            message: format!(
+                                "ambiguous method `{name}` — candidates: {}; use UFCS like `<Trait>::{name}(&x)` to disambiguate",
+                                candidates.join(", ")
+                            ),
+                            span,
+                        });
+                    }
+                }
                 Err(ParseError {
                     message: format!(
                         "no method `{name}` on type `{}`",
@@ -2135,6 +2585,45 @@ impl<'a> Typechecker<'a> {
                 })
             }
         }
+    }
+
+    /// **M07.6**: helper for trait-method dispatch — typecheck args against
+    /// the resolved signature. Returns the sig's return type on success.
+    fn typecheck_method_args(
+        &mut self,
+        name: &str,
+        args: &[ast::Expr],
+        sig: &FnSig,
+        span: Span,
+    ) -> Result<Ty, ParseError> {
+        if args.len() != sig.params.len() {
+            return Err(ParseError {
+                message: format!(
+                    "method `{name}` expects {} argument(s), found {}",
+                    sig.params.len(),
+                    args.len()
+                ),
+                span,
+            });
+        }
+        for (i, (arg, param_ty)) in args.iter().zip(sig.params.iter()).enumerate() {
+            let arg_ty = self.typecheck_expr(arg)?;
+            let arg_ty = self
+                .try_coerce_to(arg, arg_ty.clone(), param_ty.clone())
+                .unwrap_or(arg_ty);
+            if arg_ty != *param_ty {
+                return Err(ParseError {
+                    message: format!(
+                        "argument {}: expected `{}`, found `{}`",
+                        i + 1,
+                        param_ty.name(),
+                        arg_ty.name()
+                    ),
+                    span: arg.span(),
+                });
+            }
+        }
+        Ok(sig.ret.clone())
     }
 
     /// **M06**: typecheck a borrow expression. Verifies inner is a place
@@ -2429,6 +2918,30 @@ impl<'a> Typechecker<'a> {
                 span: call_span,
             });
         }
+        // **M07.6**: verify each substituted concrete type satisfies the
+        // declared bounds. For `fn print<T: Show>(x: T)` called as `print(p)`:
+        // after substitution `T = Point`, check `trait_impls.contains_key
+        // (("Show", "Point"))`.
+        if let Some(bounds_list) = self.fn_type_param_bounds.get(&fn_binding).cloned() {
+            for (tp_name, bound_traits) in &bounds_list {
+                let concrete = match local_subst.get(tp_name) {
+                    Some(t) => t.clone(),
+                    None => continue,
+                };
+                let concrete_name = concrete.name();
+                for trait_name in bound_traits {
+                    let key = (trait_name.clone(), concrete_name.clone());
+                    if !self.trait_impls.impls.contains_key(&key) {
+                        return Err(ParseError {
+                            message: format!(
+                                "the trait bound `{concrete_name}: {trait_name}` is not satisfied"
+                            ),
+                            span: call_span,
+                        });
+                    }
+                }
+            }
+        }
         // Typecheck args against substituted param types.
         if args.len() != sig.params.len() {
             return Err(ParseError {
@@ -2593,6 +3106,28 @@ impl<'a> Typechecker<'a> {
         // **M07.5**: record the substitution per call-site so eval can build
         // the mangled `FrameEnter.fn_name`.
         if is_generic_call {
+            // **M07.6**: also check trait bounds against the inferred concrete
+            // types. Resolution: look up the fn_binding's per-param bounds.
+            if let Some(bounds_list) = self.fn_type_param_bounds.get(&id).cloned() {
+                for (tp_name, bound_traits) in &bounds_list {
+                    let concrete = match local_subst.get(tp_name) {
+                        Some(t) => t.clone(),
+                        None => continue,
+                    };
+                    let concrete_name = concrete.name();
+                    for trait_name in bound_traits {
+                        let key = (trait_name.clone(), concrete_name.clone());
+                        if !self.trait_impls.impls.contains_key(&key) {
+                            return Err(ParseError {
+                                message: format!(
+                                    "the trait bound `{concrete_name}: {trait_name}` is not satisfied"
+                                ),
+                                span: call_span,
+                            });
+                        }
+                    }
+                }
+            }
             let subst_entries: Vec<(String, Ty)> = local_subst.into_iter().collect();
             self.types.call_substs.insert(call_span, subst_entries);
         }

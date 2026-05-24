@@ -226,6 +226,9 @@ pub fn lex(file: FileId, source_map: &SourceMap) -> Result<Vec<Token>, ParseErro
                 "struct" => TokenKind::Struct,
                 "impl" => TokenKind::Impl,
                 "self" => TokenKind::SelfKw,
+                // **M07.6**: trait decl + impl-for syntax keywords.
+                "trait" => TokenKind::Trait,
+                "for" => TokenKind::For,
                 _ => TokenKind::Ident(s.to_owned()),
             };
             tokens.push(Token {

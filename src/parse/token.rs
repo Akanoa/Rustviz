@@ -48,6 +48,10 @@ pub enum TokenKind {
     /// **M07.4**: `self` keyword (only valid as the first parameter of an
     /// impl-block fn — `self`, `&self`, `&mut self`).
     SelfKw,
+    /// **M07.6**: `trait` keyword (top-level item).
+    Trait,
+    /// **M07.6**: `for` keyword (`impl Trait for Type` syntax).
+    For,
 
     /// `+`
     Plus,
@@ -143,6 +147,8 @@ impl TokenKind {
             Self::Struct => "`struct`",
             Self::Impl => "`impl`",
             Self::SelfKw => "`self`",
+            Self::Trait => "`trait`",
+            Self::For => "`for`",
             Self::Plus => "`+`",
             Self::Minus => "`-`",
             Self::Star => "`*`",
