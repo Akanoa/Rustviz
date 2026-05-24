@@ -737,7 +737,7 @@ Acyclic. The drawn order is one valid topological sort. Edges from M03 to M05–
 ### M07.7 — Trait objects (`&dyn Trait`, vtables, dynamic dispatch)
 
 - **Kind**: feature (revision-style — adds dynamic dispatch to the polymorphism surface M07.6 established statically; closes the complete polymorphism story together with M07.5 + M07.6)
-- **Status**: planned
+- **Status**: shipped (commit `f603930`)
 - **Complexity**: XL (modules: 5+, bullets: 9, boundaries: 3 — fat-pointer Value variant, vtables panel UI, runtime dispatch event flow)
 - **Depends on**: M07.6
 - **Authority**: Rust language reference for trait objects + dynamic dispatch + vtables; M07.6's `TraitRegistry` + `TraitImplRegistry` as the foundation for vtable construction; M07.1's fat-pointer pattern (data ptr + length) generalized to (data ptr + vtable ptr); M07.2's static-memory region pattern reused for the vtables panel.
