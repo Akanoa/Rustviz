@@ -70,6 +70,14 @@ pub struct StateSnapshot {
     /// the heap and static-memory panels.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub vtables: Vec<VtableView>,
+    /// **M08**: per-thread stack columns. For single-threaded programs
+    /// (no `thread::spawn` events), this has a single entry (thread 0 =
+    /// main) carrying the same data as the legacy `frames` field —
+    /// visually identical to pre-M08 single-column rendering.
+    /// Empty `Vec` means single-threaded layout via the legacy `frames`
+    /// field (back-compat).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub threads: Vec<ThreadColumnView>,
     /// **M07.2**: present when the most recent event is `BytesCopy` (fired
     /// by `String::from` / `push_str`). The UI renders a transient orange
     /// dashed arrow from the source region to the destination heap block
@@ -157,6 +165,37 @@ pub struct DynView {
     pub vtable_addr: u32,
 }
 
+/// **M08**: one thread column in the stacks panel. For single-threaded
+/// programs (no `thread::spawn` events), `StateSnapshot.threads` has a
+/// single entry with id 0 (main) — visually identical to the pre-M08
+/// single-column rendering.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ThreadColumnView {
+    /// Thread id (0 = main).
+    pub thread_id: u32,
+    /// Human-readable label (`"main"` for thread 0; `"thread #N"` for spawned).
+    pub label: String,
+    /// Per-thread frame stack (innermost last, same as the pre-M08 single-
+    /// thread `FrameCardView` ordering).
+    pub frames: Vec<FrameCardView>,
+    /// `true` for the currently-executing thread; drives a visual emphasis.
+    pub is_current: bool,
+    /// Thread lifecycle status: Running / Joined / Ready / Parked (M08.1 only).
+    pub status: ThreadStatusView,
+}
+
+/// **M08**: thread lifecycle status for the column rendering.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ThreadStatusView {
+    /// Running or just unparked.
+    Running,
+    /// Body completed.
+    Joined,
+    /// Queued, never executed yet (between `thread::spawn` and first
+    /// `ThreadSwitch` into this thread).
+    Ready,
+}
+
 /// **M07.2**: one static-memory block. Holds raw bytes for a unique string
 /// literal. Persists for the trace's lifetime — there is no equivalent of
 /// `HeapFree` for static blocks.
@@ -242,6 +281,9 @@ pub enum ArrowKind {
     Mut,
     /// Ownership (`Box`/`Vec`/`String`) — black.
     Owning,
+    /// **M08**: `Arc<T>` shared-ownership — dashed purple. Multiple Arc
+    /// bindings can target the same heap addr; each gets its own arrow.
+    Arc,
 }
 
 /// **M07**: one heap allocation (live OR freed).
@@ -261,6 +303,12 @@ pub struct HeapView {
     /// **M07**: `true` if the block has been freed. Renderer shows a grayed
     /// "freed, ready to be reused" visual instead of removing the DOM element.
     pub freed: bool,
+    /// **M08**: present for `HeapObject::Arc` blocks — the current strong
+    /// refcount. Renders as a `[refs: N]` suffix on the heap-block addr
+    /// line. Updated on `ArcClone` (++) / `ArcDrop` (--). None for non-Arc
+    /// blocks; serde skip-if-none keeps existing snapshots byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refcount: Option<u32>,
 }
 
 /// One function-call frame's view.
@@ -487,10 +535,17 @@ impl Cursor {
         // the source slot row reveals the connection on demand.
         let mut arrows = arrows_from_borrows;
         for o in &world.owning {
+            // M08: Arc owning relationships render as dashed-purple
+            // arrows (ArrowKind::Arc); regular Box/Vec/String stay
+            // black (ArrowKind::Owning).
+            let arrow_kind = match o.kind {
+                OwningKind::Box => ArrowKind::Owning,
+                OwningKind::Arc => ArrowKind::Arc,
+            };
             arrows.push(ArrowView {
                 source_slot: o.source_slot,
                 target: ArrowTarget::Heap(o.target_heap),
-                kind: ArrowKind::Owning,
+                kind: arrow_kind,
                 len: None,
                 byte_offset: None,
                 byte_len: None,
@@ -506,12 +561,58 @@ impl Cursor {
             size: h.size,
             used: h.used,
             freed: h.freed,
+            refcount: h.refcount,
         }).collect::<Vec<HeapView>>();
         // M07.2: clone the static region for the snapshot. Static blocks
         // persist; this is just a read-only view.
         let static_region = world.static_region.clone();
         // M07.7: clone the vtables region (analog of static memory; persists).
         let vtables = world.vtables.clone();
+        // M08: build per-thread columns. For single-threaded programs
+        // (no thread::spawn events fired), thread_meta only has thread 0
+        // (or is empty — main is implicit) and all frames have thread_id
+        // == 0. The legacy `frames` field also carries the same data
+        // (main's frames) for full back-compat with M01-M07.7 JS rendering.
+        let current_thread_id = world.current_thread_id;
+        let mut thread_ids: Vec<u32> = vec![0];
+        for &id in world.thread_meta.keys() {
+            if !thread_ids.contains(&id) {
+                thread_ids.push(id);
+            }
+        }
+        // Single-threaded programs (no spawned threads + main is the
+        // implicit only thread): leave `threads` empty so JS falls back
+        // to the legacy single-column rendering via `frames`. This keeps
+        // M01-M07.7 visualizations byte-identical.
+        let threads: Vec<ThreadColumnView> = if thread_ids.len() == 1
+            && world.thread_meta.is_empty()
+        {
+            Vec::new()
+        } else {
+            thread_ids
+                .iter()
+                .map(|&tid| {
+                    let label = world.thread_meta.get(&tid)
+                        .map(|m| m.label.clone())
+                        .unwrap_or_else(|| if tid == 0 { "main".to_owned() } else { format!("thread #{tid}") });
+                    let status = world.thread_meta.get(&tid)
+                        .map(|m| m.status.clone())
+                        .unwrap_or(ThreadStatusView::Running);
+                    let frames: Vec<FrameCardView> = world.frames.iter()
+                        .filter(|f| f.thread_id == tid)
+                        .cloned()
+                        .map(|f| frame_to_view(f, current_frame_id))
+                        .collect();
+                    ThreadColumnView {
+                        thread_id: tid,
+                        label,
+                        frames,
+                        is_current: tid == current_thread_id,
+                        status,
+                    }
+                })
+                .collect()
+        };
         StateSnapshot {
             frames: world
                 .frames
@@ -526,6 +627,7 @@ impl Cursor {
             heap,
             static_region,
             vtables,
+            threads,
             pending_copy,
             pending_dispatch,
             position: self.position,
@@ -608,6 +710,22 @@ struct World {
     /// on VtableAlloc; never remove (vtables persist for the trace's
     /// lifetime).
     vtables: Vec<VtableView>,
+    /// **M08**: which thread is currently executing. Updated by
+    /// `MemEvent::ThreadSwitch`. Default 0 (main). New FrameInProgress
+    /// entries are tagged with this id so the snapshot groups frames
+    /// per-thread into ThreadColumnView entries.
+    current_thread_id: u32,
+    /// **M08**: thread metadata (label, status). Keyed by thread_id.
+    /// Built from `ThreadSpawn` / `ThreadJoin` events. Thread 0 (main)
+    /// is implicit (default label "main", status Running) — only
+    /// spawned threads + completed threads need explicit entries.
+    thread_meta: indexmap::IndexMap<u32, ThreadMeta>,
+}
+
+/// **M08**: per-thread metadata for the UI (label, lifecycle status).
+struct ThreadMeta {
+    label: String,
+    status: ThreadStatusView,
 }
 
 struct ActiveBorrowState {
@@ -660,15 +778,33 @@ struct HeapAllocState {
     /// just available for the allocator to reuse." Same pedagogy as M03.1's
     /// "stack slots persist in grayed frames until reused."
     freed: bool,
+    /// **M08**: Arc refcount when this heap object is `HeapObject::Arc`;
+    /// `None` for non-Arc blocks. Set by ArcClone/ArcDrop apply_event arms.
+    refcount: Option<u32>,
+}
+
+/// **M08**: ownership flavor for an `OwningState` entry. `Box` → black
+/// solid arrow (M07 behavior); `Arc` → dashed purple (post-M08 polish).
+#[derive(Copy, Clone, PartialEq)]
+enum OwningKind {
+    Box,
+    Arc,
 }
 
 struct OwningState {
     source_slot: u32,
     target_heap: u32,
+    kind: OwningKind,
 }
 
+#[derive(Clone)]
 struct FrameInProgress {
     frame_id: u32,
+    /// **M08**: which thread this frame belongs to. Defaults to 0 (main)
+    /// for single-threaded programs; spawned-thread frames carry their
+    /// owning thread's id. `state_snapshot` groups frames by this id
+    /// into `ThreadColumnView` entries.
+    thread_id: u32,
     fn_name: String,
     slots: Vec<LiveSlot>,
     /// M03.1: false after `FrameLeave`. The frame stays in `World.frames` so
@@ -684,6 +820,7 @@ struct FrameInProgress {
     enter_span: Span,
 }
 
+#[derive(Clone)]
 struct LiveSlot {
     slot_id: u32,
     name: String,
@@ -710,11 +847,19 @@ fn apply_event(world: &mut World, event: &MemEvent) {
             // this push — drop them. Real machine semantics: when main calls
             // add() twice, the second call writes over the first call's
             // freed-but-not-zeroed stack slot.
-            while world.frames.last().is_some_and(|f| !f.active) {
+            // M08: only collapse inactive frames belonging to the SAME
+            // thread (otherwise we'd wipe a quiescent thread's frame stack
+            // when a different thread spawns or enters a new frame).
+            while world
+                .frames
+                .last()
+                .is_some_and(|f| !f.active && f.thread_id == world.current_thread_id)
+            {
                 world.frames.pop();
             }
             world.frames.push(FrameInProgress {
                 frame_id: frame_id.0,
+                thread_id: world.current_thread_id,
                 fn_name: fn_name.clone(),
                 slots: Vec::new(),
                 active: true,
@@ -896,6 +1041,20 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                 world.owning.push(OwningState {
                     source_slot: slot_id.0,
                     target_heap: addr.0,
+                    kind: OwningKind::Box,
+                });
+                String::new() // empty value cell — arrow says it all
+            } else if let Value::Arc { addr } = value {
+                // **M08**: Arc bindings get a dashed-purple arrow (hover-only
+                // per Rule 1) to the shared heap allocation. Multiple Arc
+                // bindings can target the same addr; each registers its own
+                // owning relationship so each slot gets its own arrow. The
+                // refcount on the heap block conveys the share count.
+                world.owning.retain(|o| o.source_slot != slot_id.0);
+                world.owning.push(OwningState {
+                    source_slot: slot_id.0,
+                    target_heap: addr.0,
+                    kind: OwningKind::Arc,
                 });
                 String::new() // empty value cell — arrow says it all
             } else if matches!(value, Value::Slice { .. }) {
@@ -1010,6 +1169,7 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                     world.owning.push(OwningState {
                         source_slot: slot_id.0,
                         target_heap: addr.0,
+                        kind: OwningKind::Box,
                     });
                     Some(DynView {
                         data_label,
@@ -1129,6 +1289,14 @@ fn apply_event(world: &mut World, event: &MemEvent) {
         }
         // **M07**: heap events.
         MemEvent::HeapAlloc { addr, size, used, ty_name, fragment_of, split_remainder, .. } => {
+            // **M08**: detect Arc blocks via the eval-side display
+            // string (`Arc<T> = v [refs: 1]`). Newly-allocated Arcs start
+            // at refcount 1; subsequent ArcClone/ArcDrop events mutate.
+            let refcount = if ty_name.starts_with("Arc<") {
+                Some(1)
+            } else {
+                None
+            };
             let new_state = HeapAllocState {
                 addr: addr.0,
                 ty_name: ty_name.clone(),
@@ -1136,6 +1304,7 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                 size: *size,
                 used: *used,
                 freed: fragment_of.is_some(),
+                refcount,
             };
             let inserted_at = if let Some(parent) = fragment_of {
                 // (Legacy path) Fragment: insert immediately after the parent
@@ -1171,6 +1340,7 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                     size: *frag_size,
                     used: 0,
                     freed: true,
+                    refcount: None,
                 };
                 world.heap.insert(inserted_at + 1, frag);
             }
@@ -1181,6 +1351,13 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                     h.size = *new_size;
                     h.used = *new_used;
                     h.display = new_display.clone();
+                    // **M08**: extract refcount from `[refs: N]` suffix in
+                    // the Arc display string updated by `refresh_arc_display`.
+                    // For non-Arc reallocs the suffix is absent → leave
+                    // refcount unchanged.
+                    if let Some(rc) = parse_refcount_suffix(new_display) {
+                        h.refcount = Some(rc);
+                    }
                 }
             } else {
                 if let Some(h) = world.heap.iter_mut().find(|h| h.addr == from.0 && !h.freed) {
@@ -1193,6 +1370,7 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                     size: *new_size,
                     used: *new_used,
                     freed: false,
+                    refcount: None,
                 });
                 // Update owning relationships from `from` to `to`.
                 for o in world.owning.iter_mut() {
@@ -1247,19 +1425,61 @@ fn apply_event(world: &mut World, event: &MemEvent) {
         // The remaining variants don't modify world state. `Note` surfaces via
         // `note_to_status`; `BytesCopy` surfaces via `pending_copy` on the
         // most-recent-event side path.
+        // **M08**: thread lifecycle + scheduler events.
+        MemEvent::ThreadSpawn { thread_id, .. } => {
+            world.thread_meta.insert(*thread_id, ThreadMeta {
+                label: format!("thread #{thread_id}"),
+                status: ThreadStatusView::Ready,
+            });
+        }
+        MemEvent::ThreadSwitch { thread_id, .. } => {
+            world.current_thread_id = thread_id.0;
+            // Newly-current thread transitions from Ready to Running on
+            // first switch-in.
+            if let Some(meta) = world.thread_meta.get_mut(&thread_id.0) {
+                if matches!(meta.status, ThreadStatusView::Ready) {
+                    meta.status = ThreadStatusView::Running;
+                }
+            }
+        }
+        MemEvent::ThreadJoin { thread_id, .. } => {
+            if let Some(meta) = world.thread_meta.get_mut(thread_id) {
+                meta.status = ThreadStatusView::Joined;
+            }
+        }
+        // **M08**: Arc refcount transitions. The actual refcount value comes
+        // from the eval-side `refresh_arc_display` HeapRealloc (which carries
+        // the new `[refs: N]` suffix). Here we just ensure the slot owns no
+        // stale state and let the HeapRealloc arm pick up the count update.
+        // ArcDrop also marks the source slot's owning relationship for removal
+        // — actual HeapFree (when count reaches 0) is a separate event.
+        MemEvent::ArcClone { .. } | MemEvent::ArcDrop { .. } => {
+            // No direct state mutation: the count value is conveyed via
+            // HeapRealloc.display (parsed in the HeapRealloc arm above);
+            // owning-arrow lifecycle stays driven by SlotWrite of Value::Arc
+            // and slot-overwrite/scope-exit on Arc bindings.
+        }
         MemEvent::SlotMove { .. }
         | MemEvent::LockAcquire { .. }
         | MemEvent::LockRelease { .. }
-        | MemEvent::ArcClone { .. }
-        | MemEvent::ArcDrop { .. }
-        | MemEvent::ThreadSpawn { .. }
-        | MemEvent::ThreadJoin { .. }
         | MemEvent::ThreadPark { .. }
         | MemEvent::Note { .. }
         | MemEvent::BytesCopy { .. } => {
-            // No world-state change.
+            // No world-state change. Phase 5 (US3) wires
+            // LockAcquire/LockRelease/ThreadPark into the mutex-display
+            // + parked-thread machinery (deferred to M08.1 per the
+            // simplified scheduler — no contention in M08 v1).
         }
     }
+}
+
+/// **M08**: parse the `[refs: N]` suffix from an Arc heap-block display
+/// string. Returns `Some(N)` when present; `None` for non-Arc displays.
+fn parse_refcount_suffix(display: &str) -> Option<u32> {
+    let start = display.rfind("[refs: ")?;
+    let end = display[start..].find(']')?;
+    let n_str = &display[start + 7..start + end];
+    n_str.trim().parse().ok()
 }
 
 fn frame_to_view(frame: FrameInProgress, current_frame_id: Option<u32>) -> FrameCardView {
@@ -1373,6 +1593,9 @@ fn value_size_bytes_ui(v: &Value) -> u32 {
         }
         // M07.7: trait-object fat pointers — 16 bytes (data ptr + vtable ptr).
         Value::DynRef { .. } | Value::BoxDyn { .. } => 16,
+        // M08: concurrency primitives — pointer-sized bindings.
+        Value::Arc { .. } | Value::Mutex { .. } | Value::MutexGuard { .. } => 8,
+        Value::JoinHandle { .. } => 4,
     }
 }
 
@@ -1405,6 +1628,9 @@ fn ty_size_bytes_ui(ty: &Ty) -> u32 {
         Ty::Param(_) => 0,
         // M07.7: trait-object types — 16 bytes (fat pointer).
         Ty::DynRef { .. } | Ty::BoxDyn { .. } => 16,
+        // M08: concurrency primitives — pointer-sized.
+        Ty::Arc(_) | Ty::Mutex(_) | Ty::MutexGuard(_) => 8,
+        Ty::JoinHandle => 4,
     }
 }
 
@@ -1493,6 +1719,11 @@ fn render_value(value: &Value) -> String {
         Value::BoxDyn { addr, trait_name, vtable } => {
             format!("Box<dyn {trait_name}> {{ data: heap[{}], vtable: #{} }}", addr.0, vtable.0)
         }
+        // M08: concurrency primitives — fallback renders for notes / debug.
+        Value::Arc { addr } => format!("Arc→heap[{}]", addr.0),
+        Value::Mutex { addr } => format!("Mutex→heap[{}]", addr.0),
+        Value::MutexGuard { addr } => format!("MutexGuard→heap[{}]", addr.0),
+        Value::JoinHandle { thread_id } => format!("JoinHandle(#{})", thread_id.0),
     }
 }
 
@@ -1518,6 +1749,7 @@ fn event_span(event: &MemEvent) -> Span {
         | MemEvent::StaticAlloc { span, .. }
         | MemEvent::BytesCopy { span, .. }
         | MemEvent::VtableAlloc { span, .. }
+        | MemEvent::ThreadSwitch { span, .. }
         | MemEvent::BorrowShared { span, .. }
         | MemEvent::BorrowMut { span, .. }
         | MemEvent::BorrowEnd { span, .. }

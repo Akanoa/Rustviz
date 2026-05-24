@@ -56,6 +56,8 @@ pub enum TokenKind {
     Dyn,
     /// **M07.7**: `as` keyword (`&p as &dyn Show`).
     As,
+    /// **M08**: `move` keyword (`thread::spawn(move || { ... })`).
+    Move,
 
     /// `+`
     Plus,
@@ -155,6 +157,7 @@ impl TokenKind {
             Self::For => "`for`",
             Self::Dyn => "`dyn`",
             Self::As => "`as`",
+            Self::Move => "`move`",
             Self::Plus => "`+`",
             Self::Minus => "`-`",
             Self::Star => "`*`",

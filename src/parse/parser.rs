@@ -781,6 +781,34 @@ impl Parser {
     }
 
     fn parse_atom(&mut self) -> Result<Expr, ParseError> {
+        // **M08**: closure expression at atom-position.
+        //   `move || { body }` — `Move` keyword followed by `||` followed by block.
+        //   `|| { body }`      — bare `||` (atom-position; the binary-op `OrOr`
+        //                        path runs AFTER parse_atom returns, so this
+        //                        position is grammar-distinct).
+        // No closure params in M08 — only the empty `||` form.
+        if self.at(&TokenKind::Move) {
+            let kw = self.bump();
+            // `||` is the empty closure-param list (the existing OrOr token).
+            self.expect(&TokenKind::OrOr, "`||` (empty closure params)")?;
+            let body = self.parse_block()?;
+            let body_span = body.span;
+            return Ok(Expr::Closure {
+                is_move: true,
+                body,
+                span: kw.span.merge(body_span),
+            });
+        }
+        if self.at(&TokenKind::OrOr) {
+            let pipe = self.bump();
+            let body = self.parse_block()?;
+            let body_span = body.span;
+            return Ok(Expr::Closure {
+                is_move: false,
+                body,
+                span: pipe.span.merge(body_span),
+            });
+        }
         // **M07.3**: array literal `[e1, e2, ..., eN]`. Detected at the
         // atom level (before any other atom rule fires) — the existing
         // postfix `[` rule for `expr[i]` indexing runs in `parse_expr`

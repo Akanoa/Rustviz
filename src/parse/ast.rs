@@ -464,6 +464,17 @@ pub enum Expr {
         /// Span from `inner` start through `target_ty`'s end.
         span: Span,
     },
+    /// **M08**: closure expression `|| { body }` or `move || { body }`.
+    /// No-arg only in M08. The only typeck-valid position is the single
+    /// argument to `thread::spawn(closure)` — other positions reject.
+    Closure {
+        /// `true` for `move ||`, `false` for plain `||`.
+        is_move: bool,
+        /// Body block.
+        body: Block,
+        /// Span from `move`/`||` through body's closing `}`.
+        span: Span,
+    },
 }
 
 /// **M07.4**: one field initializer inside a struct literal.
@@ -500,7 +511,8 @@ impl Expr {
             | Self::ArrayLit { span, .. }
             | Self::StructLit { span, .. }
             | Self::FieldAccess { span, .. }
-            | Self::Cast { span, .. } => *span,
+            | Self::Cast { span, .. }
+            | Self::Closure { span, .. } => *span,
             Self::StrLit(_, s) => *s,
             Self::Block(b) => b.span,
         }

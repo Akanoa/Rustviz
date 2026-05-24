@@ -84,8 +84,16 @@ struct Evaluator<'a> {
     vtable_addrs: HashMap<(String, String), crate::event::VtableAddr>,
     /// **M07.7**: monotonic counter for vtable addresses.
     next_vtable_addr: u32,
-    /// Call stack — innermost frame last.
-    frames: Vec<Frame>,
+    /// **M08**: per-thread state. IndexMap preserves spawn order. Always
+    /// contains `ThreadId(0)` (main). Spawned threads get ids 1, 2, … in
+    /// spawn order. Replaces the old single-thread `frames: Vec<Frame>`.
+    threads: indexmap::IndexMap<crate::event::ThreadId, ThreadState<'a>>,
+    /// **M08**: which thread is currently executing. The `frames()` /
+    /// `frames_mut()` helpers route through this id into `threads`.
+    current_thread_id: crate::event::ThreadId,
+    /// **M08**: monotonic counter for ThreadIds.
+    #[allow(dead_code)] // populated by later M08 tasks (thread::spawn).
+    next_thread_id: u32,
     next_slot_id: u32,
     next_frame_id: u32,
     /// **M06**: monotonic counter for borrow ids.
@@ -176,6 +184,22 @@ enum HeapObject {
         bytes: String,
         capacity: usize,
     },
+    /// **M08**: shared-ownership boxed value. `strong_count` is incremented
+    /// by `Arc::clone`, decremented at scope-exit drop of an Arc binding.
+    /// The block is freed only when count reaches 0.
+    #[allow(dead_code)] // fields populated by later M08 tasks (Arc eval).
+    Arc {
+        value: Box<Value>,
+        strong_count: u32,
+    },
+    /// **M08**: lock-protected boxed value. `holder` is `Some(tid)` while
+    /// the mutex is held; `waiters` is a FIFO queue of parked threads.
+    #[allow(dead_code)] // fields populated by later M08 tasks (Mutex eval).
+    Mutex {
+        value: Box<Value>,
+        holder: Option<crate::event::ThreadId>,
+        waiters: Vec<crate::event::ThreadId>,
+    },
 }
 
 /// **M07.5**: substitute `Ty::Param(name)` occurrences in `ty` with the
@@ -212,6 +236,11 @@ fn apply_subst_ty(ty: &Ty, subst: &std::collections::HashMap<String, Ty>) -> Ty 
         // M07.7: trait-object types — `trait_name` is a String, no inner
         // type to substitute. Return as-is.
         Ty::DynRef { .. } | Ty::BoxDyn { .. } => ty.clone(),
+        // M08: concurrency primitives — recurse on inner for Arc/Mutex/MutexGuard.
+        Ty::Arc(inner) => Ty::Arc(Box::new(apply_subst_ty(inner, subst))),
+        Ty::Mutex(inner) => Ty::Mutex(Box::new(apply_subst_ty(inner, subst))),
+        Ty::MutexGuard(inner) => Ty::MutexGuard(Box::new(apply_subst_ty(inner, subst))),
+        Ty::JoinHandle => ty.clone(),
     }
 }
 
@@ -250,6 +279,12 @@ fn ty_size_bytes(ty: &Ty) -> u32 {
         // vtable ptr). Box<dyn> stack-side is also 16 bytes (the Box wrapper
         // IS the fat pointer for dyn).
         Ty::DynRef { .. } | Ty::BoxDyn { .. } => 16,
+        // M08: concurrency primitives — Arc/Mutex bindings are pointer-sized
+        // (8 bytes on 64-bit); the heap object holds the actual T + metadata.
+        // MutexGuard is also 8 bytes (one ptr to the mutex). JoinHandle is
+        // a thread-id wrapper (4 bytes; pedagogical approximation).
+        Ty::Arc(_) | Ty::Mutex(_) | Ty::MutexGuard(_) => 8,
+        Ty::JoinHandle => 4,
     }
 }
 
@@ -284,6 +319,9 @@ fn value_size_bytes(v: &Value) -> u32 {
         }
         // M07.7: trait-object fat pointers — 16 bytes (data ptr + vtable ptr).
         Value::DynRef { .. } | Value::BoxDyn { .. } => 16,
+        // M08: concurrency primitives — see ty_size_bytes for rationale.
+        Value::Arc { .. } | Value::Mutex { .. } | Value::MutexGuard { .. } => 8,
+        Value::JoinHandle { .. } => 4,
     }
 }
 
@@ -301,7 +339,69 @@ fn heap_object_bytes(obj: &HeapObject) -> (u32, u32) {
         HeapObject::Str { bytes, capacity } => {
             (*capacity as u32, bytes.len() as u32)
         }
+        // **M08**: Arc carries an inner value + refcount.
+        // Total bytes = inner size + 4 (count); used = same (no spare capacity).
+        HeapObject::Arc { value, .. } => {
+            let s = value_size_bytes(value) + 4;
+            (s, s)
+        }
+        // **M08**: Mutex carries an inner value + lock state (Option<ThreadId>).
+        // Total bytes = inner size + 8 (state metadata); used = same.
+        HeapObject::Mutex { value, .. } => {
+            let s = value_size_bytes(value) + 8;
+            (s, s)
+        }
     }
+}
+
+/// **M08**: per-thread execution state. Holds the thread's frame stack,
+/// scheduler status, and (for spawned threads) the pre-queued closure
+/// body + captures to run when the scheduler first switches in.
+struct ThreadState<'a> {
+    /// Call stack — innermost frame last.
+    frames: Vec<Frame>,
+    /// Current scheduler status.
+    #[allow(dead_code)] // populated by later M08 tasks (scheduler).
+    status: ThreadStatus,
+    /// Pre-queued closure body + captures, populated at `thread::spawn`
+    /// and consumed when the scheduler first switches into this thread.
+    /// `None` after the body has started executing.
+    #[allow(dead_code)] // populated by later M08 tasks (thread::spawn).
+    queued_body: Option<QueuedBody<'a>>,
+}
+
+/// **M08**: thread scheduler status.
+#[allow(dead_code)] // variants populated by later M08 tasks (scheduler).
+#[derive(Debug, Clone)]
+enum ThreadStatus {
+    /// Currently executing (matches `Evaluator.current_thread_id`).
+    Running,
+    /// Closure body queued, not yet started.
+    Ready,
+    /// Parked on a mutex, waiting to acquire the lock.
+    Parked { lock: crate::event::HeapAddr },
+    /// Parked waiting for another thread's body to complete.
+    JoinWait { target: crate::event::ThreadId },
+    /// Body completed; ready to be joined.
+    Done,
+}
+
+/// **M08**: pre-queued closure body + captures for a spawned thread.
+#[allow(dead_code)] // fields populated by later M08 tasks (thread::spawn).
+struct QueuedBody<'a> {
+    body: &'a ast::Block,
+    /// Captured bindings: (BindingId from spawning scope, name, value, type)
+    /// tuples — snapshotted at `thread::spawn` from the spawning thread's
+    /// locals. The BindingId is the ORIGINAL binding's id from the
+    /// spawning scope; `closure_captures` records these so the closure
+    /// body's `Expr::Ident` uses resolve to the same BindingIds. In the
+    /// spawned thread's frame stack, each capture becomes a LocalSlot
+    /// keyed by this same BindingId — `lookup_local_value(binding_id)`
+    /// then finds the captured value seamlessly.
+    captures: Vec<(BindingId, String, Value, Ty)>,
+    /// Span of the closure expression — used for the spawned thread's
+    /// initial FrameEnter span.
+    span: Span,
 }
 
 struct Frame {
@@ -445,7 +545,21 @@ impl<'a> Evaluator<'a> {
             trait_methods,
             vtable_addrs: HashMap::new(),
             next_vtable_addr: 0,
-            frames: Vec::new(),
+            // M08: initialize with main thread (id 0). Main starts as
+            // `Running` since it begins executing immediately. Spawned
+            // threads (id 1, 2, …) are added by `eval_path_call`'s
+            // `thread::spawn` arm and start as `Ready`.
+            threads: {
+                let mut m = indexmap::IndexMap::new();
+                m.insert(crate::event::ThreadId(0), ThreadState {
+                    frames: Vec::new(),
+                    status: ThreadStatus::Running,
+                    queued_body: None,
+                });
+                m
+            },
+            current_thread_id: crate::event::ThreadId(0),
+            next_thread_id: 1,
             next_slot_id: 0,
             next_frame_id: 0,
             next_borrow_id: 0,
@@ -474,6 +588,287 @@ impl<'a> Evaluator<'a> {
         let id = crate::event::BorrowId(self.next_borrow_id);
         self.next_borrow_id += 1;
         id
+    }
+
+    /// **M08**: refresh the display string for a HeapObject::Arc after a
+    /// refcount change. Reads current strong_count + value, builds the
+    /// `Arc<T> = v [refs: N]` text, emits a HeapRealloc (from==to) so
+    /// the UI's heap-block label updates at this cursor step. Mirrors
+    /// the existing M07 vec_push in-place-update pattern.
+    fn refresh_arc_display(&mut self, addr: crate::event::HeapAddr, span: Span) {
+        let (display, size) = if let Some(HeapObject::Arc { value, strong_count }) =
+            self.heap.objects.get(&addr)
+        {
+            let inner_ty_name = match value.as_ref() {
+                Value::Int { kind, .. } => kind.name().to_owned(),
+                Value::Float { kind, .. } => kind.name().to_owned(),
+                Value::Bool(_) => "bool".to_owned(),
+                _ => "?".to_owned(),
+            };
+            let value_str = render_value_for_note(value);
+            let display = format!("Arc<{inner_ty_name}> = {value_str} [refs: {strong_count}]");
+            let size = value_size_bytes(value) + 4;
+            (display, size)
+        } else {
+            return;
+        };
+        self.events.push(MemEvent::HeapRealloc {
+            from: addr,
+            to: addr,
+            new_size: size,
+            new_used: size,
+            new_display: display,
+            span,
+        });
+    }
+
+    /// **M08**: read access to the current thread's frame stack. Panics
+    /// if `current_thread_id` is missing from `threads` (invariant
+    /// violation — the scheduler should always keep this consistent).
+    fn frames(&self) -> &Vec<Frame> {
+        &self.threads.get(&self.current_thread_id)
+            .expect("current_thread_id present in threads (M08 invariant)")
+            .frames
+    }
+
+    /// **M08**: mutable access to the current thread's frame stack.
+    /// All existing single-thread code paths route through this helper
+    /// after the M08 refactor; the multi-thread scheduler updates
+    /// `current_thread_id` at switch points.
+    fn frames_mut(&mut self) -> &mut Vec<Frame> {
+        &mut self.threads.get_mut(&self.current_thread_id)
+            .expect("current_thread_id present in threads (M08 invariant)")
+            .frames
+    }
+
+    /// **M08**: emit `MemEvent::ThreadSwitch` AND update `current_thread_id`.
+    /// Called whenever the cooperative scheduler picks a different thread.
+    /// No-op (no event emitted) if `target` already equals the current id.
+    fn switch_to(&mut self, target: crate::event::ThreadId, switch_span: Span) {
+        if self.current_thread_id == target {
+            return;
+        }
+        self.events.push(MemEvent::ThreadSwitch {
+            thread_id: target,
+            span: switch_span,
+        });
+        self.current_thread_id = target;
+    }
+
+    /// **M08 v1 simplified**: acquire a mutex. M08 v1 ships without real
+    /// thread parking — spawned threads run inline at join (see `join_thread`)
+    /// — so contention scenarios don't park, they simply acquire in
+    /// scheduler order. A genuine parked-thread visual (with cross-thread
+    /// blocking) is a follow-up enhancement (planned as M08.1).
+    fn mutex_lock(
+        &mut self,
+        addr: crate::event::HeapAddr,
+        span: Span,
+    ) -> Value {
+        let current = self.current_thread_id;
+        let obj = self.heap.objects.get_mut(&addr)
+            .expect("mutex_lock: heap object present");
+        match obj {
+            HeapObject::Mutex { holder, .. } => {
+                if holder.is_some() {
+                    // M08 v1 limitation: contention doesn't park (would
+                    // need async/continuations). Panic with clear message
+                    // — should be unreachable in well-formed M08 v1 samples
+                    // (all M08 samples lock in non-contending order due to
+                    // join-runs-spawned-inline behavior).
+                    panic!(
+                        "mutex_lock: M08 v1 doesn't support parking; sample exercises real contention which is deferred to M08.1"
+                    );
+                }
+                *holder = Some(current);
+            }
+            _ => panic!("mutex_lock: heap object is not Mutex"),
+        }
+        self.events.push(MemEvent::LockAcquire { addr, span });
+        self.refresh_mutex_display(addr, span);
+        Value::MutexGuard { addr }
+    }
+
+    /// **M08 v1 simplified**: scheduler-driven join. If target is `Ready`
+    /// (queued), switch to target, run it to completion inline, switch
+    /// back. If target is `Done`, just emit ThreadJoin and return.
+    /// This synchronous "run-target-inline" model avoids the
+    /// continuation/async complexity required for true parked-thread
+    /// scheduling. The trade-off: no contention parking pedagogy in M08
+    /// v1 — deferred to M08.1.
+    fn join_thread(&mut self, target: crate::event::ThreadId, span: Span) {
+        // Already done? Quick path.
+        if matches!(self.threads.get(&target).map(|t| &t.status), Some(ThreadStatus::Done)) {
+            self.events.push(MemEvent::ThreadJoin { thread_id: target.0, span });
+            return;
+        }
+        // Switch to target, run its body to completion, then return.
+        let from = self.current_thread_id;
+        self.switch_to(target, span);
+        self.run_queued_thread_to_done(target);
+        self.switch_to(from, span);
+        self.events.push(MemEvent::ThreadJoin { thread_id: target.0, span });
+    }
+
+    /// **M08 v1**: run a `Ready` thread's queued body to completion. Emits
+    /// FrameEnter + captures, evaluates the body, drops scopes, emits
+    /// FrameLeave, marks the thread `Done`. The thread MUST be the
+    /// current thread (caller switches before invoking).
+    fn run_queued_thread_to_done(&mut self, tid: crate::event::ThreadId) {
+        // Only handle Ready threads.
+        if !matches!(self.threads.get(&tid).map(|t| &t.status), Some(ThreadStatus::Ready)) {
+            return;
+        }
+        // Take the queued body BEFORE setting up the frame (start_queued_thread
+        // consumes the Option). Need a body reference for eval after start.
+        let body_ref: &'a ast::Block = match self.threads.get(&tid).and_then(|t| t.queued_body.as_ref()) {
+            Some(qb) => qb.body,
+            None => return, // body already taken — shouldn't happen
+        };
+        // Materialize frame + captures.
+        self.start_queued_thread(tid);
+        // Evaluate the body.
+        let _ = self.eval_fn_body(body_ref);
+        // Drop the body scope (start_queued_thread pushed an outer scope
+        // before the captures; eval_fn_body pushed an inner scope for the
+        // body's lets; eval_fn_body does NOT drop its scope at the end of
+        // execution per the M06 contract).
+        let body_close_span = closing_brace_span(body_ref.span);
+        // eval_fn_body emits no drops; we need to drop both scopes (body inner + frame outer).
+        self.drop_current_scope(body_close_span);
+        self.drop_current_scope(body_close_span);
+        // Emit FrameLeave.
+        let frame_id = self.threads.get(&tid)
+            .and_then(|t| t.frames.last())
+            .map(|f| f.frame_id);
+        if let Some(fid) = frame_id {
+            self.events.push(MemEvent::FrameLeave {
+                frame_id: fid,
+                return_value: Value::Unit,
+                span: body_close_span,
+            });
+        }
+        // Pop frame + mark Done.
+        if let Some(ts) = self.threads.get_mut(&tid) {
+            ts.frames.pop();
+            ts.status = ThreadStatus::Done;
+        }
+    }
+
+    /// **M08**: refresh the display string for a HeapObject::Mutex after a
+    /// holder change. Similar to refresh_arc_display but for Mutex's
+    /// `[locked by #N]` suffix.
+    fn refresh_mutex_display(&mut self, addr: crate::event::HeapAddr, span: Span) {
+        let (display, size) = if let Some(HeapObject::Mutex { value, holder, .. }) =
+            self.heap.objects.get(&addr)
+        {
+            let inner_ty_name = match value.as_ref() {
+                Value::Int { kind, .. } => kind.name().to_owned(),
+                Value::Float { kind, .. } => kind.name().to_owned(),
+                Value::Bool(_) => "bool".to_owned(),
+                _ => "?".to_owned(),
+            };
+            let value_str = render_value_for_note(value);
+            let lock_suffix = match holder {
+                Some(tid) => format!(" [locked by #{}]", tid.0),
+                None => String::new(),
+            };
+            let display = format!("Mutex<{inner_ty_name}> = {value_str}{lock_suffix}");
+            let size = value_size_bytes(value) + 8;
+            (display, size)
+        } else {
+            return;
+        };
+        self.events.push(MemEvent::HeapRealloc {
+            from: addr,
+            to: addr,
+            new_size: size,
+            new_used: size,
+            new_display: display,
+            span,
+        });
+    }
+
+    /// **M08**: scheduler — pick the next thread that can run. Scans
+    /// `threads` IndexMap in spawn order (FIFO), picks the first one with
+    /// status `Ready` (queued, not yet started) or `Running` (just
+    /// unparked or unblocked). Returns `None` if all threads are blocked
+    /// (deadlock — caller decides whether to panic or proceed).
+    /// **Note**: unused in M08 v1's join-runs-target-inline model. Kept
+    /// for the future M08.1 (parking) extension.
+    #[allow(dead_code)]
+    fn schedule_next_ready(&self) -> Option<crate::event::ThreadId> {
+        for (tid, ts) in &self.threads {
+            if matches!(ts.status, ThreadStatus::Ready | ThreadStatus::Running) {
+                return Some(*tid);
+            }
+        }
+        None
+    }
+
+    /// **M08**: start a `Ready` thread — emit `FrameEnter` for the closure
+    /// body, emit per-capture `SlotAlloc` + `SlotWrite`, push a fresh
+    /// frame + outer scope, transition status to `Running`. Called by
+    /// `switch_to` when the target thread is in `Ready` state and has
+    /// a `queued_body`.
+    fn start_queued_thread(&mut self, tid: crate::event::ThreadId) {
+        // Take the queued body + captures (drops Option to None).
+        let queued = {
+            let ts = self.threads.get_mut(&tid)
+                .expect("start_queued_thread: target thread present");
+            ts.queued_body.take()
+        };
+        let Some(queued) = queued else { return; };
+        // Allocate a fresh frame_id for the closure body.
+        let frame_id = self.alloc_frame_id();
+        // Emit FrameEnter using a synthetic name for closures.
+        let fn_name = format!("<closure thread #{}>", tid.0);
+        self.events.push(MemEvent::FrameEnter {
+            frame_id,
+            fn_name,
+            span: queued.span,
+        });
+        // Push the frame + outer scope into the target thread's frame stack.
+        {
+            let ts = self.threads.get_mut(&tid).unwrap();
+            ts.frames.push(Frame {
+                frame_id,
+                scopes: vec![Scope {
+                    locals: Vec::new(),
+                    borrows: Vec::new(),
+                    heap_allocs: Vec::new(),
+                }],
+            });
+            ts.status = ThreadStatus::Running;
+        }
+        // Emit per-capture SlotAlloc + SlotWrite. Each capture becomes a
+        // LocalSlot in the closure's outer scope, keyed by the ORIGINAL
+        // BindingId so the closure body's `Expr::Ident` uses (which the
+        // resolver mapped to those outer BindingIds) lookup the captured
+        // slot via the standard `lookup_local_value(binding_id)` path.
+        for (cap_binding, cap_name, cap_value, cap_ty) in queued.captures {
+            let slot_id = self.alloc_slot_id();
+            self.events.push(MemEvent::SlotAlloc {
+                slot_id,
+                name: cap_name.clone(),
+                ty: cap_ty,
+                span: queued.span,
+            });
+            self.events.push(MemEvent::SlotWrite {
+                slot_id,
+                value: cap_value.clone(),
+                span: queued.span,
+            });
+            let ts = self.threads.get_mut(&tid).unwrap();
+            let scope = ts.frames.last_mut().unwrap().scopes.last_mut().unwrap();
+            scope.locals.push(LocalSlot {
+                binding_id: cap_binding,
+                slot_id,
+                value: cap_value,
+                decl_span: queued.span,
+            });
+            let _ = cap_name; // recorded in SlotAlloc event
+        }
     }
 
     /// **M07**: allocate a HeapAddr. Always increments — used for realloc's
@@ -632,7 +1027,7 @@ impl<'a> Evaluator<'a> {
         });
         // Track this alloc for HeapFree on scope exit.
         if let Some(scope) = self
-            .frames
+            .frames_mut()
             .last_mut()
             .and_then(|f| f.scopes.last_mut())
         {
@@ -683,7 +1078,7 @@ impl<'a> Evaluator<'a> {
         // intentionally unused here so callers control the messaging.
         let _ = (kind_label, old_cap, new_cap);
         // Update scope tracking: `from` is gone; `to` is the new owned addr.
-        for frame in self.frames.iter_mut() {
+        for frame in self.frames_mut().iter_mut() {
             for scope in frame.scopes.iter_mut() {
                 for h in scope.heap_allocs.iter_mut() {
                     if *h == from {
@@ -698,7 +1093,7 @@ impl<'a> Evaluator<'a> {
         // a separate SlotWrite would just create a redundant cursor step
         // with no visible change (the slot value cell is empty for
         // heap-owning bindings anyway — the black arrow is the visual).
-        for frame in self.frames.iter_mut() {
+        for frame in self.frames_mut().iter_mut() {
             for scope in frame.scopes.iter_mut() {
                 for local in scope.locals.iter_mut() {
                     match &mut local.value {
@@ -719,7 +1114,7 @@ impl<'a> Evaluator<'a> {
         // pedagogy is identical to single-element borrows (just at slice
         // granularity).
         let mut dangling: Vec<Span> = Vec::new();
-        for frame in self.frames.iter() {
+        for frame in self.frames().iter() {
             for scope in frame.scopes.iter() {
                 for local in scope.locals.iter() {
                     let dangles = match local.value {
@@ -822,7 +1217,7 @@ impl<'a> Evaluator<'a> {
     }
 
     fn lookup_local_value(&self, binding_id: BindingId) -> Option<Value> {
-        let frame = self.frames.last()?;
+        let frame = self.frames().last()?;
         for scope in frame.scopes.iter().rev() {
             for local in scope.locals.iter().rev() {
                 if local.binding_id == binding_id {
@@ -878,7 +1273,7 @@ impl<'a> Evaluator<'a> {
         if self.halted {
             return Value::Unit;
         }
-        if self.frames.len() >= RECURSION_LIMIT {
+        if self.frames().len() >= RECURSION_LIMIT {
             self.emit_runtime_error(
                 format!("recursion depth exceeded ({RECURSION_LIMIT} frames)"),
                 call_span,
@@ -915,7 +1310,7 @@ impl<'a> Evaluator<'a> {
         });
 
         // Push the frame with an outer (param) scope.
-        self.frames.push(Frame {
+        self.frames_mut().push(Frame {
             frame_id,
             scopes: vec![Scope { locals: Vec::new(), borrows: Vec::new(), heap_allocs: Vec::new() }],
         });
@@ -985,7 +1380,7 @@ impl<'a> Evaluator<'a> {
                 span: decl_span,
             });
             let _ = name; // already in the SlotAlloc event; not needed in LocalSlot
-            self.frames
+            self.frames_mut()
                 .last_mut()
                 .expect("frame just pushed")
                 .scopes
@@ -1026,7 +1421,7 @@ impl<'a> Evaluator<'a> {
         // Non-unit returns (any tail expr or non-Unit value) still fire
         // so M03's snapshots and the caller-side `→ value` annotation
         // continue to work.
-        let is_entry_frame = self.frames.len() == 1;
+        let is_entry_frame = self.frames().len() == 1;
         let skip_return = is_entry_frame
             && decl.body.tail.is_none()
             && matches!(body_value, Value::Unit);
@@ -1054,7 +1449,7 @@ impl<'a> Evaluator<'a> {
         self.drop_current_scope(closing_brace_span(decl.span));
 
         // Pop the frame and emit FrameLeave.
-        let frame = self.frames.pop().expect("frame still active");
+        let frame = self.frames_mut().pop().expect("frame still active");
         self.events.push(MemEvent::FrameLeave {
             frame_id: frame.frame_id,
             return_value: body_value.clone(),
@@ -1068,7 +1463,7 @@ impl<'a> Evaluator<'a> {
 
     fn drop_current_scope(&mut self, end_span: Span) {
         let scope = self
-            .frames
+            .frames_mut()
             .last_mut()
             .expect("frame active")
             .scopes
@@ -1101,6 +1496,55 @@ impl<'a> Evaluator<'a> {
                 .get(&local.binding_id)
                 .map(|d| d.name.clone())
                 .unwrap_or_else(|| format!("slot{}", local.slot_id.0));
+            // **M08**: Arc gets count-aware Drop — decrement first, only
+            // emit HeapFree when count reaches 0. MutexGuard releases the
+            // lock (LockRelease) WITHOUT freeing the underlying Mutex
+            // allocation (that's a separate Drop on the Mutex/Arc binding).
+            // Handle these BEFORE the unconditional-free heap_addr branch.
+            match &local.value {
+                Value::Arc { addr } => {
+                    let addr = *addr;
+                    let new_count = {
+                        let obj = self.heap.objects.get_mut(&addr);
+                        match obj {
+                            Some(HeapObject::Arc { strong_count, .. }) => {
+                                if *strong_count > 0 { *strong_count -= 1; }
+                                *strong_count
+                            }
+                            _ => 0, // shouldn't happen
+                        }
+                    };
+                    self.events.push(MemEvent::ArcDrop { addr, span: end_span });
+                    self.refresh_arc_display(addr, end_span);
+                    if new_count == 0 {
+                        self.events.push(MemEvent::Note {
+                            kind: NoteKind::Info,
+                            message: format!(
+                                "`{name}` goes out of scope: last Arc reference dropped, refcount → 0, freeing heap addr {}",
+                                addr.0,
+                            ),
+                            span: end_span,
+                        });
+                        self.free_heap(addr, end_span);
+                    }
+                    let _ = ty;
+                    continue;
+                }
+                Value::MutexGuard { addr } => {
+                    let addr = *addr;
+                    // Clear the holder + emit LockRelease. No HeapFree —
+                    // the mutex's underlying allocation stays alive (owned
+                    // by the Mutex/Arc binding, not the guard).
+                    if let Some(HeapObject::Mutex { holder, .. }) = self.heap.objects.get_mut(&addr) {
+                        *holder = None;
+                    }
+                    self.events.push(MemEvent::LockRelease { addr, span: end_span });
+                    self.refresh_mutex_display(addr, end_span);
+                    let _ = ty;
+                    continue;
+                }
+                _ => {}
+            }
             // Detect heap-owning current value (the slot's current Value).
             let heap_addr = match &local.value {
                 Value::Box { addr } | Value::Vec { addr } | Value::String { addr } => Some(*addr),
@@ -1108,6 +1552,9 @@ impl<'a> Evaluator<'a> {
                 // persists (analog of M07.2 static memory); only the data
                 // allocation gets freed at drop.
                 Value::BoxDyn { addr, .. } => Some(*addr),
+                // **M08**: `Mutex<T>` direct heap binding (not wrapped in Arc).
+                // Same lifecycle as Box: drop frees the allocation.
+                Value::Mutex { addr } => Some(*addr),
                 _ => None,
             };
             if let Some(addr) = heap_addr {
@@ -1119,6 +1566,7 @@ impl<'a> Evaluator<'a> {
                     Value::Vec { .. } => "Vec",
                     Value::String { .. } => "String",
                     Value::BoxDyn { .. } => "Box<dyn>",
+                    Value::Mutex { .. } => "Mutex",
                     _ => unreachable!(),
                 };
                 self.events.push(MemEvent::Note {
@@ -1149,11 +1597,11 @@ impl<'a> Evaluator<'a> {
     /// **M06**: evaluate a function body without dropping its scope. The
     /// caller (call_fn) is responsible for dropping the scope after emitting
     /// ReturnValue, so BorrowEnd events appear in the correct order.
-    fn eval_fn_body(&mut self, block: &ast::Block) -> Value {
+    fn eval_fn_body(&mut self, block: &'a ast::Block) -> Value {
         if self.halted {
             return Value::Unit;
         }
-        self.frames
+        self.frames_mut()
             .last_mut()
             .expect("frame active")
             .scopes
@@ -1174,12 +1622,12 @@ impl<'a> Evaluator<'a> {
         }
     }
 
-    fn eval_block(&mut self, block: &ast::Block) -> Value {
+    fn eval_block(&mut self, block: &'a ast::Block) -> Value {
         if self.halted {
             return Value::Unit;
         }
         // Push a new lexical scope for the block.
-        self.frames
+        self.frames_mut()
             .last_mut()
             .expect("frame active")
             .scopes
@@ -1208,7 +1656,7 @@ impl<'a> Evaluator<'a> {
         tail_value
     }
 
-    fn eval_stmt(&mut self, stmt: &ast::Stmt) {
+    fn eval_stmt(&mut self, stmt: &'a ast::Stmt) {
         let result = self.eval_stmt_inner(stmt);
         // **M06.1**: flush any deferred Notes (e.g. from deref-read) AFTER
         // the statement's main effects, so the explanatory message and the
@@ -1220,7 +1668,7 @@ impl<'a> Evaluator<'a> {
         let _ = result;
     }
 
-    fn eval_stmt_inner(&mut self, stmt: &ast::Stmt) {
+    fn eval_stmt_inner(&mut self, stmt: &'a ast::Stmt) {
         if self.halted {
             return;
         }
@@ -1280,7 +1728,7 @@ impl<'a> Evaluator<'a> {
                     value: value.clone(),
                     span: let_stmt.span,
                 });
-                self.frames
+                self.frames_mut()
                     .last_mut()
                     .expect("frame active")
                     .scopes
@@ -1427,7 +1875,7 @@ impl<'a> Evaluator<'a> {
     /// the call stack. Panics if not found (typeck guarantees the slot's
     /// existence during the assignment's lifetime).
     fn update_slot_value(&mut self, slot_id: SlotId, value: Value) {
-        for frame in self.frames.iter_mut().rev() {
+        for frame in self.frames_mut().iter_mut().rev() {
             for scope in frame.scopes.iter_mut().rev() {
                 for local in scope.locals.iter_mut().rev() {
                     if local.slot_id == slot_id {
@@ -1444,7 +1892,7 @@ impl<'a> Evaluator<'a> {
     /// stack. Used by `Expr::Deref` rvalue evaluation. Returns `None` if not
     /// found.
     fn lookup_slot_value(&self, slot_id: SlotId) -> Option<Value> {
-        for frame in self.frames.iter().rev() {
+        for frame in self.frames().iter().rev() {
             for scope in frame.scopes.iter().rev() {
                 for local in scope.locals.iter().rev() {
                     if local.slot_id == slot_id {
@@ -1456,7 +1904,7 @@ impl<'a> Evaluator<'a> {
         None
     }
 
-    fn eval_expr(&mut self, expr: &ast::Expr) -> Value {
+    fn eval_expr(&mut self, expr: &'a ast::Expr) -> Value {
         if self.halted {
             return Value::Unit;
         }
@@ -1655,7 +2103,7 @@ impl<'a> Evaluator<'a> {
                     MemEvent::BorrowShared { borrow_id, target, span: *span }
                 };
                 self.events.push(event);
-                self.frames
+                self.frames_mut()
                     .last_mut()
                     .expect("frame active")
                     .scopes
@@ -1845,6 +2293,14 @@ impl<'a> Evaluator<'a> {
             // its Value::Ref, intern the vtable for the target's concrete
             // type, build Value::DynRef. typeck has already verified the
             // cast's validity (`T: Trait`).
+            // **M08**: closure expressions never reach `eval_expr` as a
+            // free-standing value — they're handled inline by
+            // `eval_path_call` when seen as the `thread::spawn` argument.
+            // Typeck rejects standalone closure expressions, so this arm
+            // is unreachable in well-formed programs.
+            ast::Expr::Closure { .. } => {
+                panic!("eval_expr: standalone Expr::Closure — typeck should reject closures outside thread::spawn");
+            }
             ast::Expr::Cast { inner, target_ty, span } => {
                 let v = self.eval_expr(inner);
                 if self.halted { return Value::Unit; }
@@ -1939,7 +2395,7 @@ impl<'a> Evaluator<'a> {
     fn eval_path_call(
         &mut self,
         segments: &[String],
-        args: &[ast::Expr],
+        args: &'a [ast::Expr],
         span: Span,
     ) -> Value {
         let seg_strs: Vec<&str> = segments.iter().map(|s| s.as_str()).collect();
@@ -2036,6 +2492,131 @@ impl<'a> Evaluator<'a> {
                 });
                 Value::String { addr }
             }
+            // **M08**: `Arc::new(v)` — allocate `HeapObject::Arc` with
+            // strong_count = 1. Returns `Value::Arc { addr }`.
+            ["Arc", "new"] => {
+                let v = self.eval_expr(&args[0]);
+                if self.halted { return Value::Unit; }
+                let inner_size = value_size_bytes(&v);
+                let inner_ty_name = match &v {
+                    Value::Int { kind, .. } => kind.name().to_owned(),
+                    Value::Float { kind, .. } => kind.name().to_owned(),
+                    Value::Bool(_) => "bool".to_owned(),
+                    _ => "?".to_owned(),
+                };
+                let value_str = render_value_for_note(&v);
+                let display = format!("Arc<{inner_ty_name}> = {value_str} [refs: 1]");
+                let addr = self.alloc_heap(
+                    HeapObject::Arc { value: Box::new(v), strong_count: 1 },
+                    display,
+                    inner_size + 4, // inner + 4 bytes refcount metadata
+                    span,
+                );
+                Value::Arc { addr }
+            }
+            // **M08**: `Arc::clone(&a)` — eval inner, expect Value::Ref
+            // pointing at the Arc binding's slot; lookup the slot's
+            // Value::Arc; increment refcount; emit ArcClone; return a new
+            // Value::Arc carrying the SAME addr (shared ownership).
+            ["Arc", "clone"] => {
+                let v = self.eval_expr(&args[0]);
+                if self.halted { return Value::Unit; }
+                let addr = match v {
+                    Value::Ref { target: crate::event::Pointee::Slot(slot_id), .. } => {
+                        match self.lookup_slot_value(slot_id) {
+                            Some(Value::Arc { addr }) => addr,
+                            other => panic!(
+                                "Arc::clone target slot does not hold Value::Arc: {other:?}"
+                            ),
+                        }
+                    }
+                    _ => panic!("Arc::clone arg must be &Arc<T>"),
+                };
+                // Increment refcount in the heap object.
+                if let Some(HeapObject::Arc { strong_count, .. }) = self.heap.objects.get_mut(&addr) {
+                    *strong_count += 1;
+                } else {
+                    panic!("Arc::clone: heap object missing or not Arc at {addr:?}");
+                }
+                self.events.push(MemEvent::ArcClone { addr, span });
+                // Refresh the heap object's display string with the new refcount.
+                self.refresh_arc_display(addr, span);
+                Value::Arc { addr }
+            }
+            // **M08**: `Mutex::new(v)` — allocate `HeapObject::Mutex` with
+            // holder = None (free). Returns `Value::Mutex { addr }`.
+            ["Mutex", "new"] => {
+                let v = self.eval_expr(&args[0]);
+                if self.halted { return Value::Unit; }
+                let inner_size = value_size_bytes(&v);
+                let inner_ty_name = match &v {
+                    Value::Int { kind, .. } => kind.name().to_owned(),
+                    Value::Float { kind, .. } => kind.name().to_owned(),
+                    Value::Bool(_) => "bool".to_owned(),
+                    _ => "?".to_owned(),
+                };
+                let value_str = render_value_for_note(&v);
+                let display = format!("Mutex<{inner_ty_name}> = {value_str}");
+                let addr = self.alloc_heap(
+                    HeapObject::Mutex {
+                        value: Box::new(v),
+                        holder: None,
+                        waiters: Vec::new(),
+                    },
+                    display,
+                    inner_size + 8, // inner + 8 bytes lock-state metadata
+                    span,
+                );
+                Value::Mutex { addr }
+            }
+            // **M08**: `thread::spawn(closure)` — collect captures from
+            // closure_captures + current bindings, enqueue the new thread
+            // with status `Ready`, emit `ThreadSpawn`. Does NOT switch.
+            ["thread", "spawn"] => {
+                let (is_move, body, closure_span) = match &args[0] {
+                    ast::Expr::Closure { is_move, body, span } => (*is_move, body, *span),
+                    _ => panic!("typeck should reject non-closure arg to thread::spawn"),
+                };
+                let _ = is_move; // typeck already verified is_move == true
+                // Build the captures: for each BindingId in closure_captures,
+                // look up its current value + type.
+                let cap_bindings: Vec<BindingId> = self
+                    .resolution
+                    .closure_captures
+                    .get(&closure_span)
+                    .cloned()
+                    .unwrap_or_default();
+                let mut captures: Vec<(BindingId, String, Value, Ty)> = Vec::new();
+                for bid in cap_bindings {
+                    let decl = self.resolution.bindings.get(&bid)
+                        .expect("capture binding resolved");
+                    let name = decl.name.clone();
+                    let value = self.lookup_local_value(bid)
+                        .expect("captured binding has a value in spawning thread");
+                    let ty = self.lookup_var_ty(bid)
+                        .expect("captured binding has a Ty after typeck");
+                    captures.push((bid, name, value, ty));
+                }
+                // Allocate a fresh ThreadId.
+                let new_tid = crate::event::ThreadId(self.next_thread_id);
+                self.next_thread_id += 1;
+                // Insert the queued ThreadState.
+                self.threads.insert(new_tid, ThreadState {
+                    frames: Vec::new(),
+                    status: ThreadStatus::Ready,
+                    queued_body: Some(QueuedBody {
+                        body,
+                        captures,
+                        span: closure_span,
+                    }),
+                });
+                // Emit ThreadSpawn (current thread continues — no switch).
+                self.events.push(MemEvent::ThreadSpawn {
+                    thread_id: new_tid.0,
+                    span,
+                });
+                Value::JoinHandle { thread_id: new_tid }
+            }
             _ => {
                 // **M07.4**: user-defined associated function. Look up the
                 // FnDecl, evaluate args, enter a new frame. No `self`.
@@ -2083,9 +2664,9 @@ impl<'a> Evaluator<'a> {
     /// **M07**: evaluate a method call (Vec::push, Vec::len, String::push_str).
     fn eval_method_call(
         &mut self,
-        receiver: &ast::Expr,
+        receiver: &'a ast::Expr,
         name: &str,
-        args: &[ast::Expr],
+        args: &'a [ast::Expr],
         span: Span,
     ) -> Value {
         let recv = self.eval_expr(receiver);
@@ -2095,6 +2676,34 @@ impl<'a> Evaluator<'a> {
                 let arg_v = self.eval_expr(&args[0]);
                 if self.halted { return Value::Unit; }
                 self.vec_push(*addr, arg_v, span);
+                Value::Unit
+            }
+            // **M08**: `mutex.lock()` — acquires the lock if free, OR parks
+            // the current thread + switches scheduler-side if held.
+            (Value::Mutex { addr }, "lock") => {
+                self.mutex_lock(*addr, span)
+            }
+            // **M08**: Arc auto-deref for method dispatch — `arc_of_mutex.lock()`.
+            // Read the Arc's HeapObject, inspect the inner Value, recursively
+            // dispatch as if the receiver were that inner Value. Only matters
+            // for `.lock()` in M08 (no other Arc-wrapped types appear).
+            (Value::Arc { addr }, "lock") => {
+                let inner_addr = match self.heap.objects.get(addr) {
+                    Some(HeapObject::Arc { value, .. }) => match value.as_ref() {
+                        Value::Mutex { addr: m_addr } => *m_addr,
+                        other => panic!(
+                            "Arc<T>::lock requires inner Mutex; got {:?}", other
+                        ),
+                    },
+                    _ => panic!("Value::Arc addr not found in heap"),
+                };
+                self.mutex_lock(inner_addr, span)
+            }
+            // **M08**: `handle.join()` — switch to the joined thread if not
+            // yet done, run it, return. Returns unit.
+            (Value::JoinHandle { thread_id }, "join") => {
+                let target = *thread_id;
+                self.join_thread(target, span);
                 Value::Unit
             }
             (Value::Vec { addr }, "len") => {
@@ -2601,9 +3210,9 @@ impl<'a> Evaluator<'a> {
     #[allow(clippy::too_many_arguments)]
     fn eval_slice_borrow(
         &mut self,
-        receiver: &ast::Expr,
-        start: Option<&ast::Expr>,
-        end: Option<&ast::Expr>,
+        receiver: &'a ast::Expr,
+        start: Option<&'a ast::Expr>,
+        end: Option<&'a ast::Expr>,
         mutable: bool,
         idx_span: Span,
         _range_span: Span,
@@ -2734,7 +3343,7 @@ impl<'a> Evaluator<'a> {
                 target,
                 span: borrow_span,
             });
-            self.frames
+            self.frames_mut()
                 .last_mut()
                 .expect("frame active")
                 .scopes
@@ -2764,7 +3373,7 @@ impl<'a> Evaluator<'a> {
         }
     }
 
-    fn eval_index(&mut self, receiver: &ast::Expr, index: &ast::Expr, span: Span) -> Value {
+    fn eval_index(&mut self, receiver: &'a ast::Expr, index: &'a ast::Expr, span: Span) -> Value {
         let recv = self.eval_expr(receiver);
         if self.halted { return Value::Unit; }
         let idx_v = self.eval_expr(index);
@@ -2805,7 +3414,7 @@ impl<'a> Evaluator<'a> {
 
     /// **M06.1**: look up the binding name of the slot with `slot_id`.
     fn lookup_slot_name(&self, slot_id: SlotId) -> Option<String> {
-        for frame in self.frames.iter().rev() {
+        for frame in self.frames().iter().rev() {
             for scope in frame.scopes.iter().rev() {
                 for local in &scope.locals {
                     if local.slot_id == slot_id {
@@ -2819,7 +3428,7 @@ impl<'a> Evaluator<'a> {
 
     /// **M06**: look up the SlotId of the local holding `binding_id`.
     fn lookup_local_slot(&self, binding_id: BindingId) -> Option<SlotId> {
-        for frame in self.frames.iter().rev() {
+        for frame in self.frames().iter().rev() {
             for scope in frame.scopes.iter().rev() {
                 for local in scope.locals.iter().rev() {
                     if local.binding_id == binding_id {
@@ -2846,8 +3455,8 @@ impl<'a> Evaluator<'a> {
     fn apply_binary(
         &mut self,
         op: ast::BinOp,
-        lhs_expr: &ast::Expr,
-        rhs_expr: &ast::Expr,
+        lhs_expr: &'a ast::Expr,
+        rhs_expr: &'a ast::Expr,
         span: Span,
     ) -> Value {
         use ast::BinOp::*;
@@ -3061,6 +3670,24 @@ fn heap_object_display(obj: &HeapObject) -> String {
                 bytes.len()
             )
         }
+        // **M08**: Arc display includes the strong refcount so the heap
+        // block annotation reads `Arc<i32> = 5 [refs: 2]` (refs suffix
+        // is added by the UI layer via HeapView.refcount; this string
+        // is the type + value portion only).
+        HeapObject::Arc { value, strong_count } => format!(
+            "Arc = {} [refs: {}]",
+            render_value_for_note(value),
+            strong_count,
+        ),
+        // **M08**: Mutex display shows the inner value; the `[locked by]`
+        // suffix is added UI-side via HeapView.mutex_holder.
+        HeapObject::Mutex { value, holder, .. } => {
+            let lock_suffix = match holder {
+                Some(tid) => format!(" [locked by #{}]", tid.0),
+                None => String::new(),
+            };
+            format!("Mutex = {}{}", render_value_for_note(value), lock_suffix)
+        }
     }
 }
 
@@ -3110,6 +3737,11 @@ fn render_value_for_note(value: &Value) -> String {
             if *mutable { format!("&mut dyn {trait_name}") } else { format!("&dyn {trait_name}") }
         }
         Value::BoxDyn { trait_name, .. } => format!("Box<dyn {trait_name}>"),
+        // M08: concurrency primitives — abstract renders for notes.
+        Value::Arc { addr } => format!("Arc → heap[{}]", addr.0),
+        Value::Mutex { addr } => format!("Mutex → heap[{}]", addr.0),
+        Value::MutexGuard { addr } => format!("MutexGuard → heap[{}]", addr.0),
+        Value::JoinHandle { thread_id } => format!("JoinHandle(#{})", thread_id.0),
     }
 }
 

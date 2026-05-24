@@ -58,6 +58,12 @@ pub struct Resolution {
     pub uses: IndexMap<Span, BindingId>,
     /// Maps each `BindingId` to its declaration metadata.
     pub bindings: IndexMap<BindingId, BindingDecl>,
+    /// **M08**: for each `Expr::Closure` (keyed by span), the list of
+    /// captured bindings — bindings used inside the closure body that
+    /// resolve to enclosing-scope declarations (not inside-the-closure
+    /// `let` bindings). Drives eval's `move` capture snapshot at
+    /// `thread::spawn`. Empty for closures with no captures.
+    pub closure_captures: IndexMap<Span, Vec<BindingId>>,
 }
 
 /// Resolve all identifier uses in `program` to `BindingId`s.
@@ -319,6 +325,29 @@ impl Resolver {
             // type carries a trait name that resolves at typeck time (not a
             // value-level binding).
             ast::Expr::Cast { inner, .. } => self.resolve_expr(inner)?,
+            // **M08**: closure body — captures = bindings used inside the body
+            // whose declarations live OUTSIDE the closure's own scope. We
+            // record `next_id` before pushing the closure scope; any binding
+            // with id < that boundary is from an enclosing scope. Any
+            // resolved `use` inserted during the body walk that points to
+            // such a binding is a capture.
+            ast::Expr::Closure { body, span, .. } => {
+                let pre_id_boundary = self.next_id;
+                let pre_uses_len = self.resolution.uses.len();
+                // Push a closure scope and resolve the body.
+                self.push_scope();
+                self.resolve_block(body)?;
+                self.pop_scope();
+                // Walk the uses inserted during the body walk; capture those
+                // pointing at bindings declared before the closure entered.
+                let mut captures: Vec<BindingId> = Vec::new();
+                for (_use_span, bid) in self.resolution.uses.iter().skip(pre_uses_len) {
+                    if bid.0 < pre_id_boundary && !captures.contains(bid) {
+                        captures.push(*bid);
+                    }
+                }
+                self.resolution.closure_captures.insert(*span, captures);
+            }
             ast::Expr::Binary { lhs, rhs, .. } => {
                 self.resolve_expr(lhs)?;
                 self.resolve_expr(rhs)?;

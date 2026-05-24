@@ -2085,4 +2085,172 @@ mod tests {
         ));
         assert!(v_write, "expected v = 2_i32 (1 * 2)");
     }
+
+    // ─── M08 / US1: thread::spawn + .join() ───────────────────────────────
+
+    /// Basic spawn + join: `let h = thread::spawn(move || { let x = 5; }); h.join();`
+    /// — ThreadSpawn event fires for thread 1; ThreadSwitch into thread 1
+    /// at join; thread 1's closure body emits SlotAlloc+SlotWrite for x = 5;
+    /// FrameLeave for the closure; ThreadSwitch back to main; ThreadJoin.
+    #[test]
+    fn run_pipeline_thread_spawn() {
+        let source = "fn main() { let h = thread::spawn(move || { let x = 5; }); h.join(); }\n";
+        let events = run_pipeline(source).expect("thread::spawn compiles");
+        let spawn_count = events.iter().filter(|e| matches!(e,
+            crate::MemEvent::ThreadSpawn { thread_id: 1, .. }
+        )).count();
+        assert_eq!(spawn_count, 1, "expected exactly one ThreadSpawn for thread 1");
+        let switch_to_1 = events.iter().any(|e| matches!(e,
+            crate::MemEvent::ThreadSwitch { thread_id, .. }
+                if thread_id.0 == 1
+        ));
+        assert!(switch_to_1, "expected ThreadSwitch into thread 1");
+        let x_write = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite {
+                value: crate::Value::Int { kind: crate::typeck::IntKind::I32, bits: 5 },
+                ..
+            }
+        ));
+        assert!(x_write, "expected x = 5 SlotWrite from spawned thread");
+        let join_event = events.iter().any(|e| matches!(e,
+            crate::MemEvent::ThreadJoin { thread_id: 1, .. }
+        ));
+        assert!(join_event, "expected ThreadJoin for thread 1");
+    }
+
+    /// Closure outside thread::spawn → typeck error.
+    #[test]
+    fn run_pipeline_closure_outside_spawn() {
+        let source = "fn main() { let f = move || { let x = 5; }; }\n";
+        let err = run_pipeline(source).expect_err("standalone closure should be rejected");
+        assert_eq!(err.stage, CompileStage::Typeck);
+        assert!(
+            err.message.contains("closures") && err.message.contains("thread::spawn"),
+            "expected closure-position error: got `{}`",
+            err.message
+        );
+    }
+
+    /// Non-move closure → typeck error.
+    #[test]
+    fn run_pipeline_non_move_closure() {
+        let source = "fn main() { thread::spawn(|| { let x = 5; }); }\n";
+        let err = run_pipeline(source).expect_err("non-move closure should be rejected");
+        assert_eq!(err.stage, CompileStage::Typeck);
+        assert!(
+            err.message.contains("move"),
+            "expected `move` requirement error: got `{}`",
+            err.message
+        );
+    }
+
+    // ─── M08 / US2: Arc::new + Arc::clone + ArcDrop ───────────────────────
+
+    /// `let a = Arc::new(5); let b = Arc::clone(&a);` — HeapAlloc fires for
+    /// the Arc; SlotWrite of Value::Arc for both a and b; ArcClone fires;
+    /// scope-exit ArcDrop events; HeapFree only when refcount reaches 0.
+    #[test]
+    fn run_pipeline_arc_clone() {
+        let source = "fn main() { let a = Arc::new(5); { let b = Arc::clone(&a); } }\n";
+        let events = run_pipeline(source).expect("Arc clone compiles");
+        let alloc_count = events.iter().filter(|e| matches!(e,
+            crate::MemEvent::HeapAlloc { .. }
+        )).count();
+        assert_eq!(alloc_count, 1, "expected exactly one HeapAlloc for the Arc");
+        let arc_clone_count = events.iter().filter(|e| matches!(e,
+            crate::MemEvent::ArcClone { .. }
+        )).count();
+        assert_eq!(arc_clone_count, 1, "expected exactly one ArcClone event");
+        let arc_drop_count = events.iter().filter(|e| matches!(e,
+            crate::MemEvent::ArcDrop { .. }
+        )).count();
+        assert_eq!(arc_drop_count, 2, "expected two ArcDrop events (one per binding)");
+        let free_count = events.iter().filter(|e| matches!(e,
+            crate::MemEvent::HeapFree { .. }
+        )).count();
+        assert_eq!(free_count, 1, "expected exactly one HeapFree (at refcount 0)");
+        let a_arc_write = events.iter().any(|e| matches!(e,
+            crate::MemEvent::SlotWrite { value: crate::Value::Arc { .. }, .. }
+        ));
+        assert!(a_arc_write, "expected SlotWrite of Value::Arc for a");
+    }
+
+    /// Arc dropping at scope exit decrements refcount; the inner block's
+    /// `b` drop should NOT trigger HeapFree (count still 1). `a`'s drop at
+    /// main's close DOES trigger HeapFree.
+    #[test]
+    fn run_pipeline_arc_drop_decrement() {
+        let source = "fn main() { let a = Arc::new(5); { let b = Arc::clone(&a); } }\n";
+        let events = run_pipeline(source).expect("compiles");
+        // Find the events in order and check the b-drop (first ArcDrop) doesn't
+        // produce HeapFree, but the a-drop (second ArcDrop) does.
+        let mut first_drop_seen = false;
+        let mut free_before_second_drop = 0;
+        let mut second_drop_seen = false;
+        for e in &events {
+            match e {
+                crate::MemEvent::ArcDrop { .. } => {
+                    if !first_drop_seen { first_drop_seen = true; }
+                    else { second_drop_seen = true; }
+                }
+                crate::MemEvent::HeapFree { .. } => {
+                    if !second_drop_seen { free_before_second_drop += 1; }
+                }
+                _ => {}
+            }
+        }
+        assert!(first_drop_seen && second_drop_seen, "expected two ArcDrop events");
+        assert_eq!(free_before_second_drop, 0,
+            "no HeapFree should fire before the second (last) ArcDrop");
+    }
+
+    // ─── M08 / US4: Arc<Mutex<T>> headline (no-contention) ───────────────
+
+    /// Canonical pattern. M08 v1 doesn't model true contention (mutex_lock
+    /// panics on real parking — deferred to M08.1), so the sample is
+    /// shaped so locks acquire serially: main locks/unlocks in its own
+    /// scope, then `h.join()` runs the spawned thread which locks/unlocks
+    /// independently. Validates: 2 Arc bindings (m + m2) share the same
+    /// heap addr; refcount transitions 1 → 2 → 1 → 0; mutex acquired +
+    /// released twice (once per thread); ThreadJoin fires.
+    #[test]
+    fn run_pipeline_arc_mutex() {
+        let source = "fn main() { let m = Arc::new(Mutex::new(0)); let m2 = Arc::clone(&m); let h = thread::spawn(move || { let g = m2.lock(); }); { let g = m.lock(); }; h.join(); }\n";
+        let events = run_pipeline(source).expect("Arc<Mutex<T>> compiles");
+        let alloc_count = events.iter().filter(|e| matches!(e, crate::MemEvent::HeapAlloc { .. })).count();
+        assert_eq!(alloc_count, 2, "expected 2 HeapAllocs (Mutex + Arc)");
+        let arc_clone = events.iter().any(|e| matches!(e, crate::MemEvent::ArcClone { .. }));
+        assert!(arc_clone, "expected ArcClone");
+        let lock_acquires = events.iter().filter(|e| matches!(e, crate::MemEvent::LockAcquire { .. })).count();
+        let lock_releases = events.iter().filter(|e| matches!(e, crate::MemEvent::LockRelease { .. })).count();
+        assert_eq!(lock_acquires, 2, "expected 2 LockAcquire events (main + spawned)");
+        assert_eq!(lock_releases, 2, "expected 2 LockRelease events");
+        let thread_join = events.iter().any(|e| matches!(e, crate::MemEvent::ThreadJoin { .. }));
+        assert!(thread_join, "expected ThreadJoin");
+    }
+
+    // ─── M08 / cross-cutting: deterministic event ordering ────────────────
+
+    /// Same source → byte-identical event stream across two runs.
+    /// FR-013/SC-010: catches scheduler non-determinism if introduced.
+    #[test]
+    fn run_pipeline_determinism() {
+        let source = "fn main() { let m = Arc::new(Mutex::new(0)); let m2 = Arc::clone(&m); let h = thread::spawn(move || { let g = m2.lock(); }); { let g = m.lock(); }; h.join(); }\n";
+        let run1 = run_pipeline(source).expect("run 1 compiles");
+        let run2 = run_pipeline(source).expect("run 2 compiles");
+        assert_eq!(run1, run2, "M08 event stream must be deterministic across runs");
+    }
+
+    /// `Arc::clone(&5)` (i32 isn't Arc) → typeck error.
+    #[test]
+    fn run_pipeline_arc_clone_non_arc() {
+        let source = "fn main() { let n = 5; let a = Arc::clone(&n); }\n";
+        let err = run_pipeline(source).expect_err("Arc::clone on non-Arc should be rejected");
+        assert_eq!(err.stage, CompileStage::Typeck);
+        assert!(
+            err.message.contains("Arc"),
+            "expected Arc-shape error: got `{}`",
+            err.message
+        );
+    }
 }

@@ -245,6 +245,21 @@ pub enum Ty {
         /// Trait the Box exposes.
         trait_name: String,
     },
+    /// **M08**: shared-ownership heap pointer — `Arc<T>`. Multiple Arc
+    /// bindings share one heap object; refcount lives in the heap object.
+    /// Distinct from `Ty::Box(_)` (unique ownership) — Arc allows N owners.
+    Arc(Box<Ty>),
+    /// **M08**: lock-protected heap value — `Mutex<T>`. The lock state lives
+    /// in the heap object. Accessing the inner value requires `.lock()`
+    /// which returns a `MutexGuard<T>`.
+    Mutex(Box<Ty>),
+    /// **M08**: lock guard returned by `mutex.lock()`. Carries the protected
+    /// type for `*guard` deref. Scope-exit Drop emits `LockRelease`.
+    MutexGuard(Box<Ty>),
+    /// **M08**: `thread::spawn`'s return value. M08 doesn't model the
+    /// closure's return type (always unit in M08 samples). Calling `.join()`
+    /// on a `JoinHandle` returns `Ty::Unit`.
+    JoinHandle,
 }
 
 impl Ty {
@@ -294,6 +309,11 @@ impl Ty {
                 }
             }
             Self::BoxDyn { trait_name } => format!("Box<dyn {trait_name}>"),
+            // M08: concurrency primitives.
+            Self::Arc(inner) => format!("Arc<{}>", inner.name()),
+            Self::Mutex(inner) => format!("Mutex<{}>", inner.name()),
+            Self::MutexGuard(inner) => format!("MutexGuard<{}>", inner.name()),
+            Self::JoinHandle => "JoinHandle".to_owned(),
         }
     }
 
@@ -328,6 +348,9 @@ impl Ty {
             Self::DynRef { mutable: false, .. } => true,
             Self::DynRef { mutable: true, .. } => false,
             Self::BoxDyn { .. } => false,
+            // M08: concurrency primitives — heap-owning / lock-resource,
+            // none Copy.
+            Self::Arc(_) | Self::Mutex(_) | Self::MutexGuard(_) | Self::JoinHandle => false,
         }
     }
 }
@@ -818,6 +841,11 @@ impl<'a> Typechecker<'a> {
             // M07.7: trait-object types — trait_name is a String, no inner
             // type to substitute.
             Ty::DynRef { .. } | Ty::BoxDyn { .. } => ty.clone(),
+            // M08: concurrency primitives — recurse on inner.
+            Ty::Arc(inner) => Ty::Arc(Box::new(self.apply_subst_with(inner, sub))),
+            Ty::Mutex(inner) => Ty::Mutex(Box::new(self.apply_subst_with(inner, sub))),
+            Ty::MutexGuard(inner) => Ty::MutexGuard(Box::new(self.apply_subst_with(inner, sub))),
+            Ty::JoinHandle => ty.clone(),
         }
     }
 
@@ -1550,6 +1578,13 @@ impl<'a> Typechecker<'a> {
                             span: *deref_span,
                         });
                     }
+                    // **M08**: `*guard = val;` writes through a MutexGuard.
+                    // The guard is the only acceptable mutable proxy for
+                    // mutex contents.
+                    Ty::MutexGuard(target) => {
+                        self.types.expr_types.insert(*deref_span, (*target).clone());
+                        *target
+                    }
                     other => {
                         return Err(ParseError {
                             message: format!(
@@ -1827,6 +1862,8 @@ impl<'a> Typechecker<'a> {
                     Ty::Ref { inner: target, .. } => Ok(*target),
                     // M07: `*b` where b: Box<T> also derefs to T (auto-deref simplification).
                     Ty::Box(inner) => Ok(*inner),
+                    // **M08**: `*guard` where guard: MutexGuard<T> derefs to T.
+                    Ty::MutexGuard(inner) => Ok(*inner),
                     other => Err(ParseError {
                         message: format!(
                             "cannot dereference value of type `{}`; expected a reference",
@@ -1915,6 +1952,14 @@ impl<'a> Typechecker<'a> {
             ast::Expr::Cast { inner, target_ty, span } => {
                 self.typecheck_cast(inner, target_ty, *span)
             }
+            // **M08**: free-standing closure expression — rejected. Closures
+            // are only valid as the `thread::spawn` argument (handled inline
+            // by `typecheck_path_call`). Any other position errors with the
+            // M08-specific message.
+            ast::Expr::Closure { span, .. } => Err(ParseError {
+                message: "closures are only supported as `thread::spawn` arguments in M08".into(),
+                span: *span,
+            }),
         }
     }
 
@@ -2474,6 +2519,106 @@ impl<'a> Typechecker<'a> {
                 }
                 Ok(Ty::String)
             }
+            // **M08**: `Arc::new(v) -> Arc<T>` — inner T from arg.
+            ["Arc", "new"] => {
+                if args.len() != 1 {
+                    return Err(ParseError {
+                        message: format!("Arc::new takes 1 arg, found {}", args.len()),
+                        span: call_span,
+                    });
+                }
+                let arg_ty = self.typecheck_expr(&args[0])?;
+                Ok(Ty::Arc(Box::new(arg_ty)))
+            }
+            // **M08**: `Arc::clone(&a) -> Arc<T>` — arg must be `&Arc<T>`;
+            // return matches the inner Arc's payload type.
+            ["Arc", "clone"] => {
+                if args.len() != 1 {
+                    return Err(ParseError {
+                        message: format!("Arc::clone takes 1 arg, found {}", args.len()),
+                        span: call_span,
+                    });
+                }
+                let arg_ty = self.typecheck_expr(&args[0])?;
+                match &arg_ty {
+                    Ty::Ref { inner, .. } => match inner.as_ref() {
+                        Ty::Arc(t) => Ok(Ty::Arc(t.clone())),
+                        other => Err(ParseError {
+                            message: format!(
+                                "Arc::clone expects `&Arc<T>`, found `&{}`",
+                                other.name()
+                            ),
+                            span: args[0].span(),
+                        }),
+                    },
+                    other => Err(ParseError {
+                        message: format!(
+                            "Arc::clone expects `&Arc<T>`, found `{}`",
+                            other.name()
+                        ),
+                        span: args[0].span(),
+                    }),
+                }
+            }
+            // **M08**: `Mutex::new(v) -> Mutex<T>` — inner T from arg.
+            ["Mutex", "new"] => {
+                if args.len() != 1 {
+                    return Err(ParseError {
+                        message: format!("Mutex::new takes 1 arg, found {}", args.len()),
+                        span: call_span,
+                    });
+                }
+                let arg_ty = self.typecheck_expr(&args[0])?;
+                Ok(Ty::Mutex(Box::new(arg_ty)))
+            }
+            // **M08**: `thread::spawn(closure) -> JoinHandle`. The arg must
+            // be an `Expr::Closure { is_move: true, .. }` per FR-001 (only
+            // `move` closures are supported). The closure body is typechecked
+            // inline here — captures get their types from the enclosing scope
+            // (via Resolution.closure_captures + binding_types).
+            ["thread", "spawn"] => {
+                if args.len() != 1 {
+                    return Err(ParseError {
+                        message: format!("thread::spawn takes 1 arg, found {}", args.len()),
+                        span: call_span,
+                    });
+                }
+                match &args[0] {
+                    ast::Expr::Closure { is_move, body, span: closure_span } => {
+                        if !*is_move {
+                            return Err(ParseError {
+                                message: "thread::spawn requires a `move` closure in M08 (borrowing captures across thread boundaries is out of scope)".into(),
+                                span: *closure_span,
+                            });
+                        }
+                        // Typecheck the body — captures already have their
+                        // bindings recorded in `binding_types` from the
+                        // enclosing scope's resolve pass; body's local lets
+                        // get fresh types as it walks.
+                        let body_ty = self.typecheck_block(body)?;
+                        // M08 simplification: closures returning unit only
+                        // (no return type modeling on JoinHandle).
+                        if body_ty != Ty::Unit {
+                            return Err(ParseError {
+                                message: format!(
+                                    "thread::spawn closure body must return `()` in M08, found `{}`",
+                                    body_ty.name()
+                                ),
+                                span: *closure_span,
+                            });
+                        }
+                        // Record the closure's typecheck-side type (useful
+                        // for future eval lookups, though eval reads it
+                        // structurally from the AST).
+                        self.types.expr_types.insert(*closure_span, Ty::JoinHandle);
+                        Ok(Ty::JoinHandle)
+                    }
+                    other => Err(ParseError {
+                        message: "thread::spawn expects a `move` closure argument".into(),
+                        span: other.span(),
+                    }),
+                }
+            }
             _ => {
                 // **M07.4**: fall through to user-defined associated functions.
                 let key: Vec<String> = segments.to_vec();
@@ -2570,6 +2715,30 @@ impl<'a> Typechecker<'a> {
                 }
                 Ok(Ty::Int(IntKind::U64))
             }
+            // **M08**: `Mutex::lock(&self) -> MutexGuard<T>`.
+            (Ty::Mutex(inner), "lock") => {
+                if !args.is_empty() {
+                    return Err(ParseError {
+                        message: "Mutex::lock takes no args".into(),
+                        span,
+                    });
+                }
+                Ok(Ty::MutexGuard(inner.clone()))
+            }
+            // **M08**: `JoinHandle::join(self) -> ()`.
+            (Ty::JoinHandle, "join") => {
+                if !args.is_empty() {
+                    return Err(ParseError {
+                        message: "JoinHandle::join takes no args".into(),
+                        span,
+                    });
+                }
+                Ok(Ty::Unit)
+            }
+            // **M08**: auto-deref through `Arc<T>` for method dispatch —
+            // `arc.method()` dispatches on T. So `arc_of_mutex.lock()`
+            // recursively dispatches as `mutex.lock()`.
+            (Ty::Arc(inner), _) => self.typecheck_method_call(inner, name, args, span),
             (Ty::String, "push_str") => {
                 if args.len() != 1 {
                     return Err(ParseError {
@@ -3485,6 +3654,9 @@ fn ty_contains_param(ty: &Ty) -> bool {
         // M07.7: trait-object types carry a trait_name (String), not an inner
         // Ty. Never contain Ty::Param.
         Ty::DynRef { .. } | Ty::BoxDyn { .. } => false,
+        // M08: concurrency primitives — recurse on inner.
+        Ty::Arc(i) | Ty::Mutex(i) | Ty::MutexGuard(i) => ty_contains_param(i),
+        Ty::JoinHandle => false,
     }
 }
 
@@ -3564,6 +3736,9 @@ fn ty_from_ast(t: &ast::Type) -> Result<Ty, ParseError> {
                 "bool" => Ok(Ty::Bool),
                 // **M07**: `String` as a bare path (no generics).
                 "String" => Ok(Ty::String),
+                // **M08**: `JoinHandle` as a bare path (rarely annotated;
+                // typeck mostly produces it from `thread::spawn` return type).
+                "JoinHandle" => Ok(Ty::JoinHandle),
                 other => Err(ParseError {
                     message: format!("unknown type `{other}`"),
                     span: *span,
@@ -3583,6 +3758,10 @@ fn ty_from_ast(t: &ast::Type) -> Result<Ty, ParseError> {
             match segments[0].as_str() {
                 "Box" => Ok(Ty::Box(Box::new(inner))),
                 "Vec" => Ok(Ty::Vec(Box::new(inner))),
+                // **M08**: concurrency wrappers.
+                "Arc" => Ok(Ty::Arc(Box::new(inner))),
+                "Mutex" => Ok(Ty::Mutex(Box::new(inner))),
+                "MutexGuard" => Ok(Ty::MutexGuard(Box::new(inner))),
                 other => Err(ParseError {
                     message: format!("unknown generic type `{other}`"),
                     span: *span,

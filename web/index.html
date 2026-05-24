@@ -89,6 +89,9 @@
         <option value="m07_7_dyn_param">Dyn parameter (M07.7)</option>
         <option value="m07_7_box_dyn">Box&lt;dyn&gt; (M07.7)</option>
         <option value="m07_7_static_vs_dyn">Static vs dyn (M07.7)</option>
+        <option value="m08_thread_spawn">Thread spawn (M08)</option>
+        <option value="m08_arc_clone">Arc clone (M08)</option>
+        <option value="m08_arc_mutex">Arc&lt;Mutex&gt; (M08)</option>
       </select>
     </header>
 
@@ -146,6 +149,13 @@
           <!-- M07.7: orange arrowhead for trait-object dispatch arrows
                (the dashed "vtable indirection" arrow at a method-call step). -->
           <marker id="arrow-head-vtable" viewBox="0 0 10 10" refX="9" refY="5"
+                  markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse"
+                  orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="context-stroke" />
+          </marker>
+          <!-- M08: purple arrowhead for Arc shared-ownership arrows
+               (dashed-purple, hover-only). -->
+          <marker id="arrow-head-arc" viewBox="0 0 10 10" refX="9" refY="5"
                   markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse"
                   orient="auto-start-reverse">
             <path d="M0,0 L10,5 L0,10 z" fill="context-stroke" />

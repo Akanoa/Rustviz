@@ -232,6 +232,8 @@ pub fn lex(file: FileId, source_map: &SourceMap) -> Result<Vec<Token>, ParseErro
                 // **M07.7**: trait-object + cast keywords.
                 "dyn" => TokenKind::Dyn,
                 "as" => TokenKind::As,
+                // **M08**: `move` for `thread::spawn(move || { ... })`.
+                "move" => TokenKind::Move,
                 _ => TokenKind::Ident(s.to_owned()),
             };
             tokens.push(Token {

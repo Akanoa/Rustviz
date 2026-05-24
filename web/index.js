@@ -138,8 +138,72 @@ function el(tag, attrs = {}, ...children) {
 function render(state) {
   // Stacks panel: rebuild from scratch.
   const stacksEl = document.getElementById("stacks");
-  stacksEl.replaceChildren();
-  for (const frame of state.frames) {
+  // **M08**: multi-thread routing — when `state.threads` is non-empty,
+  // build a horizontal flex container with one `<div class="thread-column">`
+  // child per ThreadColumnView. Each column gets the existing per-frame
+  // rendering inside it. For single-threaded programs (state.threads is
+  // empty), fall back to the legacy single-column rendering via state.frames
+  // — visually identical to pre-M08 M01-M07.7 behavior.
+  const multiThread = state.threads && state.threads.length > 0;
+  let columnEls = new Map(); // thread_id -> column el
+  if (multiThread) {
+    // Reuse the same `.thread-columns` container across renders. New
+    // columns slide in (.thread-new triggers animation); existing ones
+    // just refresh their per-frame contents. This avoids the every-step
+    // flicker that full DOM rebuild caused.
+    let columnsContainer = stacksEl.querySelector(":scope > .thread-columns");
+    if (!columnsContainer) {
+      stacksEl.replaceChildren();
+      columnsContainer = el("div", { class: "thread-columns" });
+      stacksEl.appendChild(columnsContainer);
+    }
+    const seenIds = new Set();
+    for (const t of state.threads) {
+      seenIds.add(t.thread_id);
+      // Find-or-create the column for this thread id.
+      let col = columnsContainer.querySelector(`.thread-column[data-thread-id="${t.thread_id}"]`);
+      const isNew = !col;
+      if (isNew) {
+        col = el("div", { class: "thread-column thread-new" });
+        col.setAttribute("data-thread-id", String(t.thread_id));
+        const header = el("div", { class: "thread-header", text: t.label });
+        col.appendChild(header);
+        columnsContainer.appendChild(col);
+        // Remove .thread-new after the animation completes so re-renders
+        // don't re-trigger the slide-in.
+        col.addEventListener("animationend", () => col.classList.remove("thread-new"), { once: true });
+      } else {
+        // Update header label in case it changed (e.g. "thread #1" → "main").
+        const headerEl = col.querySelector(":scope > .thread-header");
+        if (headerEl && headerEl.textContent !== t.label) headerEl.textContent = t.label;
+      }
+      // Reset status classes (mutually exclusive).
+      col.classList.toggle("thread-current", !!t.is_current);
+      col.classList.toggle("thread-joined", t.status === "Joined");
+      col.classList.toggle("thread-ready", t.status === "Ready");
+      // Clear frame cards (keep header). Frames re-rendered below per
+      // iteration.
+      [...col.children].forEach((c) => {
+        if (!c.classList.contains("thread-header")) c.remove();
+      });
+      columnEls.set(t.thread_id, col);
+    }
+    // Remove stale columns (rewind past spawn).
+    [...columnsContainer.children].forEach((c) => {
+      const tid = Number(c.getAttribute("data-thread-id"));
+      if (!seenIds.has(tid)) c.remove();
+    });
+  } else {
+    // Single-thread path: legacy full-rebuild (no DOM-cache needed since
+    // there's only one implicit column).
+    stacksEl.replaceChildren();
+  }
+  // Iterate over the frames. Multi-thread: route each frame to its column
+  // via state.threads[i].frames. Single-thread: route to stacksEl as before.
+  const allFrames = multiThread
+    ? state.threads.flatMap((t) => t.frames.map((f) => ({ frame: f, thread_id: t.thread_id })))
+    : state.frames.map((f) => ({ frame: f, thread_id: 0 }));
+  for (const { frame, thread_id } of allFrames) {
     // M03.1 styling states (mutually-exclusive for grayed/current):
     //   • `frame-grayed`: frame has returned (active === false); slots area
     //     at reduced opacity, name muted with strikethrough.
@@ -284,7 +348,15 @@ function render(state) {
       slotGrid.appendChild(row);
     }
     card.appendChild(slotGrid);
-    stacksEl.appendChild(card);
+    // M08: route the frame card to the correct destination — its thread's
+    // column when multi-thread, the stacks panel directly otherwise.
+    if (multiThread) {
+      const col = columnEls.get(thread_id);
+      if (col) col.appendChild(card);
+      else stacksEl.appendChild(card); // defensive fallback
+    } else {
+      stacksEl.appendChild(card);
+    }
   }
 
   // Editor span highlight (yellow, most-recent event).
@@ -332,6 +404,17 @@ function render(state) {
   // listing the trait's methods. Persists for the trace's lifetime,
   // same as static memory (content-deduplicated by `(trait, type)`).
   renderVtables(state.vtables || []);
+  // **Post-M08 polish**: auto-collapse empty STATIC + VTABLES panels so
+  // they don't hog screen space for non-static / non-trait-object
+  // programs (especially relevant for multi-thread layouts).
+  const staticEl = document.getElementById("static");
+  if (staticEl) {
+    staticEl.classList.toggle("panel-empty", (state.static_region || []).length === 0);
+  }
+  const vtablesEl = document.getElementById("vtables");
+  if (vtablesEl) {
+    vtablesEl.classList.toggle("panel-empty", (state.vtables || []).length === 0);
+  }
 
   // M06.1 → M07: render arrows LAST, after the status bar AND heap have
   // taken their final layout. Use requestAnimationFrame so the browser has
@@ -493,8 +576,14 @@ function renderArrows(arrows) {
     path.setAttribute("d", d);
     const cls = a.kind === "Mut" ? "arrow-mut"
               : a.kind === "Owning" ? "arrow-owning"
+              : a.kind === "Arc" ? "arrow-arc"
               : "arrow-shared";
     path.setAttribute("class", cls);
+    // M08: Arc arrows use the dedicated purple marker so the head color
+    // matches the dashed-purple stroke.
+    if (a.kind === "Arc") {
+      path.setAttribute("marker-end", "url(#arrow-head-arc)");
+    }
     // **M07.2**: add an invisible wider "hit-target" path with the same
     // geometry, appended BEFORE the visible path so the visible line
     // stays on top visually. SVG `pointer-events: stroke` uses the actual
@@ -1087,8 +1176,23 @@ function renderHeap(heap) {
       heapElements.set(h.addr, box);
     }
     box.setAttribute("data-heap-addr", String(h.addr));
-    box.querySelector(".heap-addr").textContent =
+    const addrEl = box.querySelector(".heap-addr");
+    addrEl.textContent =
       h.freed ? `heap #${h.addr} (freed, ${h.size}B)` : `heap #${h.addr} (${h.size}B)`;
+    // M08: append a `[refs: N]` purple suffix on Arc heap blocks. Updated
+    // from `state.heap[i].refcount` (set by apply_event's ArcClone/ArcDrop
+    // path via the HeapRealloc display-string parser).
+    let refSpan = addrEl.querySelector(".heap-refcount");
+    if (h.refcount !== undefined && h.refcount !== null) {
+      if (!refSpan) {
+        refSpan = document.createElement("span");
+        refSpan.className = "heap-refcount";
+        addrEl.appendChild(refSpan);
+      }
+      refSpan.textContent = `[refs: ${h.refcount}]`;
+    } else if (refSpan) {
+      refSpan.remove();
+    }
     // **M07.1**: for Vec displays (format: `Vec [e0, e1, ...] (cap=N, len=N)`),
     // segment each element into a `<span data-elem-idx="i">` so the slice
     // hover handler can light up the elements covered by `[elem_start,

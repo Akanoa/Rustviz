@@ -137,6 +137,7 @@ Ok {
                 },
             },
         },
+        closure_captures: {},
     },
     types: TypeMap {
         expr_types: {

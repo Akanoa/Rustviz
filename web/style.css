@@ -566,6 +566,85 @@ main > section:last-child {
   gap: 0.5rem;
 }
 
+/* **M08**: multi-thread layout. When `state.threads` is non-empty,
+   `renderStacks` builds a `.thread-columns` container as the only child
+   of `#stacks`, with one `.thread-column` per live thread. Each column
+   keeps the existing `flex-direction: column-reverse` rule so frames
+   inside a column behave like the pre-M08 single-column rendering
+   (frames anchored to the BOTTOM, innermost frame on top). The
+   `align-items: stretch` on the row container forces each column to
+   fill the full height — without it, columns size to content and
+   frames appear at the TOP rather than anchored to the bottom. */
+#stacks .thread-columns {
+  display: flex;
+  flex-direction: row;
+  gap: 0.75rem;
+  align-items: stretch;
+  overflow-x: auto;
+  height: 100%;
+}
+
+.thread-column {
+  flex: 1 1 0;
+  min-width: 240px;
+  max-width: 360px;
+  display: flex;
+  flex-direction: column-reverse; /* innermost frame on top (pre-M08 behavior) */
+  gap: 0.5rem;
+  padding: 0.5rem;
+  border: 1px dashed transparent;
+  border-radius: 4px;
+}
+
+/* M08: only animate on first appearance. JS adds .thread-new for one
+   render after creating the column DOM, then removes on animationend. */
+.thread-column.thread-new {
+  animation: thread-slide-in 280ms ease-out;
+}
+
+.thread-column .thread-header {
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 0.2rem 0;
+  border-bottom: 1px dashed var(--border);
+  /* The column uses `flex-direction: column-reverse`, which reverses the
+     flex MAIN AXIS: first DOM child renders at the BOTTOM, last at the
+     TOP. To put the header at the visual TOP we need it to be the LAST
+     item in flex order — set `order: 99` (any value > frames' default 0)
+     to push it to the END of flex order, which equals the TOP with
+     column-reverse. */
+  order: 99;
+}
+
+.thread-column.thread-current .thread-header {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  font-weight: 600;
+}
+
+.thread-column.thread-joined {
+  opacity: 0.5;
+  filter: grayscale(0.4);
+}
+
+.thread-column.thread-ready {
+  opacity: 0.7;
+}
+
+@keyframes thread-slide-in {
+  from {
+    transform: translateX(30%);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
 /* **M07.2**: static-memory region (read-only data segment). Holds blocks
    for string literals; persists for the whole trace. Visually distinct
    from heap — gray gradient background + muted gray byte-cells. */
@@ -577,6 +656,31 @@ main > section:last-child {
   gap: 0.5rem;
   min-height: 60px;
   flex: 0.6; /* narrower than stacks/heap — literals are typically small */
+}
+
+/* **Post-M08**: auto-collapse STATIC + VTABLES panels when they have no
+   content. Frees screen real estate for the more-interactive stacks +
+   heap panels (especially relevant for multi-thread programs that need
+   horizontal room). JS toggles `.panel-empty` based on snapshot state. */
+#static.panel-empty,
+#vtables.panel-empty {
+  flex: 0 0 28px;
+  padding: 0.4rem;
+  overflow: hidden;
+  min-height: 0;
+}
+
+#static.panel-empty .static-label,
+#vtables.panel-empty .vtables-label {
+  margin: 0;
+  white-space: nowrap;
+  font-size: 9px;
+  opacity: 0.4;
+}
+
+#static.panel-empty > *:not(.static-label),
+#vtables.panel-empty > *:not(.vtables-label) {
+  display: none;
 }
 
 #static .static-label {
@@ -750,6 +854,25 @@ main > section:last-child {
   font-family: ui-monospace, SFMono-Regular, monospace;
   font-size: 10px;
   font-weight: 600;
+}
+
+/* **M08**: Arc shared-ownership arrows. Dashed purple to distinguish
+   from black owning (Box) and blue/red borrows. Hover-only per the
+   post-M07.7 arrow-viz rule (see [[feedback-arrow-viz-rules]]). */
+.arrow-arc {
+  stroke: #8a4fb4;
+  stroke-width: 2;
+  stroke-dasharray: 4 3;
+  fill: none;
+}
+
+/* **M08**: refcount suffix on Arc heap blocks. Small muted text appended
+   to the heap-block addr line. */
+.heap-box .heap-refcount {
+  font-size: 9px;
+  color: #8a4fb4;
+  font-weight: 600;
+  margin-left: 0.3rem;
 }
 
 #heap {

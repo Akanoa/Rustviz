@@ -58,6 +58,12 @@ pub struct StaticAddr(pub u32);
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct VtableAddr(pub u32);
 
+/// **M08**: identifier for an evaluator thread. The main thread is always
+/// `ThreadId(0)`; spawned threads get ids 1, 2, … in spawn order.
+/// Monotonic; never reused. Analog of `VtableAddr` from M07.7.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub struct ThreadId(pub u32);
+
 /// A runtime value held in a stack slot.
 ///
 /// **M03.2**: integer and float variants unified to `{ kind, bits|value }` form
@@ -175,6 +181,32 @@ pub enum Value {
         /// The trait this dyn-Box exposes.
         trait_name: String,
     },
+    /// **M08**: shared-ownership heap pointer. Multiple `Value::Arc` instances
+    /// may carry the same `addr`; the `HeapObject::Arc` at that addr stores
+    /// the refcount. Cloning produces another `Value::Arc { addr }` and
+    /// increments the count; dropping decrements.
+    Arc {
+        /// Heap address of the shared allocation.
+        addr: HeapAddr,
+    },
+    /// **M08**: lock-protected heap value. Carries the heap address; the
+    /// `HeapObject::Mutex` at that addr stores the inner value + lock holder.
+    Mutex {
+        /// Heap address of the lock-protected allocation.
+        addr: HeapAddr,
+    },
+    /// **M08**: lock guard returned by `mutex.lock()`. Scope-exit Drop emits
+    /// `LockRelease` for the held mutex (and unparks the first waiter).
+    MutexGuard {
+        /// Heap address of the mutex the guard holds.
+        addr: HeapAddr,
+    },
+    /// **M08**: handle returned by `thread::spawn(closure)`. Calling
+    /// `.join()` waits for the spawned thread to complete.
+    JoinHandle {
+        /// The spawned thread's id.
+        thread_id: ThreadId,
+    },
     /// **M07.1**: slice value — a fat pointer (target + length) into a heap
     /// allocation. Sibling of `Value::Ref` (not an extension); slices carry
     /// extra `len` metadata and live in the same active-borrow registry, so
@@ -236,6 +268,12 @@ impl Value {
             Self::DynRef { mutable: false, .. } => "&dyn",
             Self::DynRef { mutable: true, .. } => "&mut dyn",
             Self::BoxDyn { .. } => "Box<dyn>",
+            // **M08**: concurrency primitives. Ty layer renders the
+            // full `Arc<T>` / `Mutex<T>` / `MutexGuard<T>` form.
+            Self::Arc { .. } => "Arc",
+            Self::Mutex { .. } => "Mutex",
+            Self::MutexGuard { .. } => "MutexGuard",
+            Self::JoinHandle { .. } => "JoinHandle",
         }
     }
 }
@@ -434,6 +472,19 @@ pub enum MemEvent {
         /// resolution in the lexer).
         bytes: String,
         /// Source location of the literal that first interned this content.
+        span: Span,
+    },
+    /// **M08**: the cooperative scheduler switched the current thread.
+    /// Subsequent SlotAlloc/SlotWrite/FrameEnter/etc. events belong to
+    /// this thread until the next `ThreadSwitch` fires. Initial state
+    /// (cursor 0) implies thread 0 (main) is current — no leading
+    /// `ThreadSwitch` needed for single-threaded programs.
+    ThreadSwitch {
+        /// The thread that is now current.
+        thread_id: ThreadId,
+        /// Source location of the operation that caused the switch
+        /// (e.g. the `lock()` call site for park-driven switches,
+        /// `join()` for join-driven, body close brace for completion).
         span: Span,
     },
     /// **M07.7**: a vtable was allocated in the VTABLES region. Fires
