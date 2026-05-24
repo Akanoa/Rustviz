@@ -683,7 +683,7 @@ Acyclic. The drawn order is one valid topological sort. Edges from M03 to M05–
 ### M07.6 — Traits (declarations, impls, static dispatch via bounds)
 
 - **Kind**: feature (revision-style — adds polymorphism to the user-defined-types surface; turns M07.5's `T` into a useful constraint mechanism via `T: Trait` bounds)
-- **Status**: planned
+- **Status**: shipped (commit `9d0defa`)
 - **Complexity**: XL (modules: 5+, bullets: 10, boundaries: 3)
 - **Depends on**: M07.5 (generics — `T: Trait` bound is the headline payoff)
 - **Authority**: Rust language reference for trait declarations + inherent impls + trait bounds; CLAUDE.md › Pedagogical goal — traits ARE Rust's polymorphism mechanism; without them the language feels half-built after M07.4 introduces user types.
