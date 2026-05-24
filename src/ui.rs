@@ -479,6 +479,12 @@ impl Cursor {
             })
             .collect::<Vec<ArrowView>>();
         // M07: owning arrows (black) from world.owning.
+        // **Post-M07.7 polish**: owning arrows are hover-only — consistent
+        // with the fat-pointer data arrows (also hover-only) and with
+        // calling-convention `&self` borrows from M07.4 (also hover-only).
+        // The type column (`b : Box<i32>`) conveys "this owns heap memory";
+        // the heap panel shows the target block independently. Hovering
+        // the source slot row reveals the connection on demand.
         let mut arrows = arrows_from_borrows;
         for o in &world.owning {
             arrows.push(ArrowView {
@@ -490,7 +496,7 @@ impl Cursor {
                 byte_len: None,
                 elem_start: None,
                 field_label: None,
-                hover_only: false,
+                hover_only: true,
             });
         }
         let heap = world.heap.iter().map(|h| HeapView {
@@ -791,7 +797,10 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                         // Slice borrows don't carry field labels — slicing
                         // a struct field isn't an M07.4 path.
                         field_label: None,
-                        hover_only: false,
+                        // Post-M07.7 polish: all borrow / slice / owning
+                        // arrows are hover-only by default. See the matching
+                        // BorrowShared/BorrowMut arms.
+                        hover_only: true,
                     });
                 }
             }
@@ -821,13 +830,11 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                     } else {
                         Some(format!(".{}", field_path.join(".")))
                     };
-                    // M07.4: method self-receivers landed in a slot named
-                    // `self`. Mark the arrow as hover-only so it stays
-                    // hidden by default — the borrow is calling-convention,
-                    // and an always-on arrow added visual noise to the
-                    // method-call visualization.
-                    let dest_name = lookup_slot_name(&world.frames, slot_id.0);
-                    let is_self = dest_name.as_deref() == Some("self");
+                    // Post-M07.7 polish: lazy-materialized borrow arrows
+                    // (field borrows, self-receiver borrows, etc.) are
+                    // hover-only by default. Consistent with M06's
+                    // BorrowShared/BorrowMut handlers and owning arrows.
+                    let _ = lookup_slot_name;
                     world.borrows.push(ActiveBorrowState {
                         borrow_id: borrow_id.0,
                         source_slot: Some(slot_id.0),
@@ -838,7 +845,7 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                         slice_byte_len: None,
                         slice_elem_start: None,
                         field_label,
-                        hover_only: is_self,
+                        hover_only: true,
                     });
                 }
             }
@@ -1088,7 +1095,13 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                 slice_byte_len: None,
                 slice_elem_start: None,
                 field_label: None,
-                hover_only: false,
+                // Post-M07.7 polish: all arrows hover-only by default.
+                // The borrow's existence is visible from the source slot's
+                // type column + the target's identity in the heap/slot
+                // panel; hovering the source reveals the connection on
+                // demand. Matches owning + dispatch + slice + dyn data
+                // arrows — every arrow flavor is reveal-on-hover now.
+                hover_only: true,
             });
         }
         MemEvent::BorrowMut { borrow_id, target, .. } => {
@@ -1107,7 +1120,8 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                 slice_byte_len: None,
                 slice_elem_start: None,
                 field_label: None,
-                hover_only: false,
+                // Post-M07.7: see BorrowShared.
+                hover_only: true,
             });
         }
         MemEvent::BorrowEnd { borrow_id, .. } => {
