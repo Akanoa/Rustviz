@@ -155,4 +155,9 @@ Contributions and bug reports welcome via GitHub issues.
 
 ## License
 
-MIT OR Apache-2.0.
+Dual-licensed under either of:
+
+- [MIT License](LICENSE-MIT)
+- [Apache License 2.0](LICENSE-APACHE)
+
+at your option.
