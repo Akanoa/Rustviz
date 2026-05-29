@@ -36,6 +36,9 @@
   <body>
     <header>
       <h1>rustviz</h1>
+      <!-- 020-foldable-resizable-panels: escape-hatch reset for the layout
+           state. Clears localStorage + animates panels back to defaults. -->
+      <button id="btn-reset-layout" type="button" aria-label="Reset panel layout">⟲ Reset</button>
       <label for="sample-selector">Sample:</label>
       <select id="sample-selector">
         <option value="m03_arithmetic">Arithmetic</option>
@@ -96,24 +99,62 @@
     </header>
 
     <main>
-      <section id="editor" aria-label="source code"></section>
-      <section id="stacks" aria-label="stacks panel"></section>
-      <!-- M07.2: static memory region (read-only data segment). Holds
-           one block per unique string-literal content; persists for the
-           trace's lifetime. -->
-      <section id="static" aria-label="static memory">
-        <header class="static-label">static memory (RO)</header>
-      </section>
-      <section id="heap" aria-label="heap panel"></section>
+      <!-- 020-foldable-resizable-panels: each panel is wrapped in a `.panel`
+           container with a header bar (title + fold button). The existing
+           `<section id="...">` stays inside, keeping its existing JS hooks
+           and inner CSS. `.panel-divider` elements between adjacent panels
+           are drag-resize handles. Order: Editor → Stacks → Heap → VTables
+           → Static (auto-collapsing panels on the right edge). -->
+      <div class="panel" data-panel="editor">
+        <div class="panel-header">
+          <span class="panel-title">EDITOR</span>
+          <button class="panel-fold-btn" aria-expanded="true" aria-label="Fold editor panel">−</button>
+        </div>
+        <section id="editor" aria-label="source code"></section>
+      </div>
+      <div class="panel-divider" role="separator" aria-orientation="vertical" data-divider-between="editor,stacks" tabindex="-1"></div>
+      <div class="panel" data-panel="stacks">
+        <div class="panel-header">
+          <span class="panel-title">STACKS</span>
+          <button class="panel-fold-btn" aria-expanded="true" aria-label="Fold stacks panel">−</button>
+        </div>
+        <section id="stacks" aria-label="stacks panel"></section>
+      </div>
+      <div class="panel-divider" role="separator" aria-orientation="vertical" data-divider-between="stacks,heap" tabindex="-1"></div>
+      <div class="panel" data-panel="heap">
+        <div class="panel-header">
+          <span class="panel-title">HEAP</span>
+          <button class="panel-fold-btn" aria-expanded="true" aria-label="Fold heap panel">−</button>
+        </div>
+        <section id="heap" aria-label="heap panel"></section>
+      </div>
+      <div class="panel-divider" role="separator" aria-orientation="vertical" data-divider-between="heap,vtables" tabindex="-1"></div>
       <!-- M07.7: VTABLES panel (read-only, persists for trace lifetime).
            Holds one box per unique `(trait, type)` pair — content-
            deduplicated like static memory. Each box lists the trait's
-           methods with their dispatch-target labels. Sits between HEAP
-           and STATIC MEMORY per research R-015 — the conceptual flow is
-           stack → heap → vtables → static. -->
-      <section id="vtables" aria-label="vtables panel">
-        <header class="vtables-label">vtables</header>
-      </section>
+           methods with their dispatch-target labels. -->
+      <div class="panel" data-panel="vtables">
+        <div class="panel-header">
+          <span class="panel-title">VTABLES</span>
+          <button class="panel-fold-btn" aria-expanded="true" aria-label="Fold vtables panel">−</button>
+        </div>
+        <section id="vtables" aria-label="vtables panel">
+          <header class="vtables-label">vtables</header>
+        </section>
+      </div>
+      <div class="panel-divider" role="separator" aria-orientation="vertical" data-divider-between="vtables,static" tabindex="-1"></div>
+      <!-- M07.2: static memory region (read-only data segment). Holds
+           one block per unique string-literal content; persists for the
+           trace's lifetime. -->
+      <div class="panel" data-panel="static">
+        <div class="panel-header">
+          <span class="panel-title">STATIC</span>
+          <button class="panel-fold-btn" aria-expanded="true" aria-label="Fold static panel">−</button>
+        </div>
+        <section id="static" aria-label="static memory">
+          <header class="static-label">static memory (RO)</header>
+        </section>
+      </div>
       <!-- M06: SVG arrow overlay drawn above all panels. pointer-events:none
            so clicks pass through to the underlying panels. M07 adds a black
            marker for owning arrows (Box/Vec/String -> heap). -->

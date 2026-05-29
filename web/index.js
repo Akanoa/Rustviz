@@ -116,7 +116,388 @@ let player = null;
 let playInterval = null;
 let debounceTimer = null;
 
+// **020**: most recent snapshot, cached so the SVG arrow/overlay paths can
+// be re-rendered when the layout changes (panel fold/unfold transition end,
+// drag-resize, reset) without re-running the WASM pipeline.
+let lastSnapshot = null;
+let redrawScheduled = false;
+
 const DEBOUNCE_MS = 300;
+
+// ─── 020: panel layout (fold + drag-resize + persistence) ─────────────────
+//
+// Manages per-panel fold/width state with `localStorage` persistence under
+// a versioned key. The schema is documented in
+// `specs/020-foldable-resizable-panels/contracts/layout-storage-schema.md`.
+//
+// Three sources of fold/width influence the rendered CSS class set:
+//   1. user fold     → `.is-folded`            (highest priority; wins)
+//   2. user override → `.is-user-overridden`   (user explicitly unfolded an
+//                                               otherwise-empty panel)
+//   3. auto-collapse → `.panel-empty`          (set by renderUi based on
+//                                               snapshot content)
+// CSS subordinates (2)+(3) to (1) via `:not(...)` selectors. JS only sets
+// the user classes; the auto-collapse class is owned by renderUi.
+
+const STORAGE_KEY = "rustviz.panel-layout.v1";
+const MIN_WIDTH_PX = 120;
+
+const DEFAULT_LAYOUT = Object.freeze({
+  version: 1,
+  panels: {
+    editor:  { folded: false, width_pct: 25, user_override: false },
+    stacks:  { folded: false, width_pct: 30, user_override: false },
+    heap:    { folded: false, width_pct: 25, user_override: false },
+    vtables: { folded: false, width_pct: 10, user_override: false },
+    static:  { folded: false, width_pct: 10, user_override: false },
+  },
+});
+
+let layoutState = loadLayout();
+
+function defaults() {
+  return structuredClone(DEFAULT_LAYOUT);
+}
+
+function clampWidth(pct) {
+  return Math.max(5, Math.min(95, pct));
+}
+
+function getPanelEl(id) {
+  return document.querySelector(`.panel[data-panel="${id}"]`);
+}
+
+function loadLayout() {
+  let raw = null;
+  try {
+    raw = localStorage.getItem(STORAGE_KEY);
+  } catch (_) {
+    // Storage disabled (private mode etc). Silent fall-back to defaults.
+    return defaults();
+  }
+  if (raw === null) return defaults();
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (_) {
+    console.warn(`rustviz: ${STORAGE_KEY} failed to parse — using defaults`);
+    return defaults();
+  }
+  if (!parsed || parsed.version !== 1 || typeof parsed.panels !== "object") {
+    console.warn(`rustviz: ${STORAGE_KEY} unrecognized shape — using defaults`);
+    return defaults();
+  }
+  // Per-panel merge with defaults — missing entries / bad types fall back.
+  const merged = defaults();
+  for (const id of Object.keys(merged.panels)) {
+    const p = parsed.panels[id];
+    if (!p || typeof p !== "object") continue;
+    const dst = merged.panels[id];
+    if (typeof p.folded === "boolean") dst.folded = p.folded;
+    if (typeof p.width_pct === "number" && isFinite(p.width_pct)) {
+      dst.width_pct = clampWidth(p.width_pct);
+    }
+    if (typeof p.user_override === "boolean") dst.user_override = p.user_override;
+  }
+  return merged;
+}
+
+function saveLayout() {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(layoutState));
+  } catch (_) {
+    // Silent — feature still works for the session.
+  }
+}
+
+// Apply the in-memory layoutState to the DOM. Idempotent — re-running
+// after every render keeps the persisted state authoritative (re-folds
+// the editor after a transient unfold on parse error, etc.).
+//
+// **Sizing model**: `width_pct` is used as a `flex-grow` proportional
+// share (NOT a literal percentage of `<main>`). Each panel takes
+// `width_pct / sum_of_visible_grows` of the row width remaining after
+// sliver panels (28px each via `flex-basis: 28px !important`) and
+// dividers (6px each) are subtracted. Sums to 100 by convention but
+// drag-resize can produce non-100 sums if a panel's share is mutated
+// without compensating elsewhere — the proportional model handles that.
+function applyLayoutState() {
+  for (const id of Object.keys(layoutState.panels)) {
+    const el = getPanelEl(id);
+    if (!el) continue;
+    const state = layoutState.panels[id];
+    el.style.flexGrow = state.width_pct;
+    // flex-basis stays at the CSS default `0` so panels are sized purely
+    // by flex-grow. The sliver CSS rule overrides with `flex-basis: 28px`.
+    el.style.flexBasis = "";
+    el.classList.toggle("is-folded", state.folded === true);
+    el.classList.toggle("is-user-overridden", state.user_override === true);
+    const btn = el.querySelector(".panel-fold-btn");
+    if (btn) {
+      btn.setAttribute("aria-expanded", state.folded ? "false" : "true");
+    }
+  }
+}
+
+// ─── 020: fold / unfold handlers ─────────────────────────────────────────
+
+function foldPanel(id) {
+  const el = getPanelEl(id);
+  if (!el) return;
+  // The persisted `width_pct` is a flex-grow share, already kept in sync
+  // by drag-resize (T021) and reset (T023). No re-capture needed — the
+  // panel's share-of-layout doesn't change when it folds; only its
+  // visibility does.
+  layoutState.panels[id].folded = true;
+  // Refolding revokes any prior user_override — the user is now saying
+  // "this panel should be hidden, regardless of content".
+  layoutState.panels[id].user_override = false;
+  saveLayout();
+  applyLayoutState();
+  // The CSS transition animates flex-grow/flex-basis; the transitionend
+  // listener wired in main() will redraw arrows at the FINAL coords. For
+  // the initial paint (mid-transition), arrows draw at intermediate
+  // positions — acceptable since transitionend fixes it within 120ms.
+}
+
+function unfoldPanel(id) {
+  const el = getPanelEl(id);
+  if (!el) return;
+  layoutState.panels[id].folded = false;
+  // If the panel was being auto-collapsed (`.panel-empty`), set the user
+  // override so it stays unfolded across sample switches.
+  if (el.classList.contains("panel-empty")) {
+    layoutState.panels[id].user_override = true;
+  }
+  saveLayout();
+  applyLayoutState();
+  // The CSS transition animates flex-grow/flex-basis; the transitionend
+  // listener wired in main() will redraw arrows at the FINAL coords. For
+  // the initial paint (mid-transition), arrows draw at intermediate
+  // positions — acceptable since transitionend fixes it within 120ms.
+}
+
+function onFoldBtnClick(ev) {
+  ev.stopPropagation(); // prevent the .panel sliver-click handler from re-firing
+  const panelEl = ev.currentTarget.closest(".panel");
+  if (!panelEl) return;
+  const id = panelEl.dataset.panel;
+  if (layoutState.panels[id].folded) {
+    unfoldPanel(id);
+  } else {
+    foldPanel(id);
+  }
+}
+
+function onSliverClick(ev) {
+  const panelEl = ev.currentTarget;
+  // Only act when in sliver mode — full panels don't get click-to-unfold.
+  // Both user-fold and auto-collapse render as slivers; both unfold here.
+  const isSliver =
+    panelEl.classList.contains("is-folded") ||
+    (panelEl.classList.contains("panel-empty") &&
+      !panelEl.classList.contains("is-user-overridden"));
+  if (!isSliver) return;
+  const id = panelEl.dataset.panel;
+  unfoldPanel(id);
+}
+
+function wireFoldHandlers() {
+  document.querySelectorAll(".panel-fold-btn").forEach((btn) => {
+    btn.addEventListener("click", onFoldBtnClick);
+  });
+  document.querySelectorAll(".panel").forEach((p) => {
+    p.addEventListener("click", onSliverClick);
+  });
+}
+
+// Transient unfold of the editor when a parse error fires. Does NOT mutate
+// `layoutState.panels.editor.folded` — the next successful parse re-runs
+// `applyLayoutState()` and the editor re-folds per the user's preference.
+function ensureEditorVisible() {
+  const el = getPanelEl("editor");
+  if (!el || !el.classList.contains("is-folded")) return;
+  el.classList.remove("is-folded");
+  // Re-apply the persisted share so the panel reclaims its full width.
+  // The next successful render's applyLayoutState() will re-fold per
+  // the persisted state — `layoutState.panels.editor.folded` stays true.
+  el.style.flexGrow = layoutState.panels.editor.width_pct;
+  el.style.flexBasis = "";
+  // Force a redraw after the transition completes.
+  scheduleRedrawOverlays();
+}
+
+// ─── 020: drag-resize handlers ──────────────────────────────────────────
+
+// Drag context (module-level so move/up can read it; one drag at a time).
+let dragCtx = null;
+
+function onDividerDown(ev) {
+  const divider = ev.currentTarget;
+  const between = divider.dataset.dividerBetween;
+  if (!between) return;
+  const [leftId, rightId] = between.split(",");
+  const leftEl = getPanelEl(leftId);
+  const rightEl = getPanelEl(rightId);
+  if (!leftEl || !rightEl) return;
+  // Skip if either adjacent panel is in sliver mode — the divider is
+  // hidden via CSS, but a stray pointerdown shouldn't kick off a drag.
+  const isSliver = (el) =>
+    el.classList.contains("is-folded") ||
+    (el.classList.contains("panel-empty") &&
+      !el.classList.contains("is-user-overridden"));
+  if (isSliver(leftEl) || isSliver(rightEl)) return;
+
+  ev.preventDefault();
+  try {
+    divider.setPointerCapture(ev.pointerId);
+  } catch (_) {
+    // Older browsers may not support pointer capture — fall back to
+    // listening on window in `pointermove`/`pointerup` instead.
+  }
+
+  dragCtx = {
+    divider,
+    leftEl,
+    rightEl,
+    leftId,
+    rightId,
+    startX: ev.clientX,
+    // **Sizing model**: `width_pct` is a flex-grow share. The conversion
+    // factor `pctPerPx` (= share / px at drag-start) lets us translate
+    // mouse-delta in pixels into a corresponding share-delta. Computed
+    // ONCE on pointerdown so the live drag math is just multiplication.
+    startLeftPct: layoutState.panels[leftId].width_pct,
+    startRightPct: layoutState.panels[rightId].width_pct,
+    startLeftPx: leftEl.getBoundingClientRect().width,
+    startRightPx: rightEl.getBoundingClientRect().width,
+    pointerId: ev.pointerId,
+  };
+  divider.classList.add("is-dragging");
+  document.body.classList.add("is-resizing");
+  divider.addEventListener("pointermove", onDividerMove);
+  divider.addEventListener("pointerup", onDividerUp);
+  divider.addEventListener("pointercancel", onDividerUp);
+}
+
+function onDividerMove(ev) {
+  if (!dragCtx) return;
+  const totalPx = dragCtx.startLeftPx + dragCtx.startRightPx;
+  const totalPct = dragCtx.startLeftPct + dragCtx.startRightPct;
+  if (totalPx <= 0 || totalPct <= 0) return;
+  // 1 px = (totalPct / totalPx) share-units within the two adjacent panels'
+  // shared coordinate system. Drag stays inside that local system — other
+  // panels' shares are untouched.
+  const pctPerPx = totalPct / totalPx;
+  const deltaPx = ev.clientX - dragCtx.startX;
+  const deltaPct = deltaPx * pctPerPx;
+  let leftPct = dragCtx.startLeftPct + deltaPct;
+  let rightPct = dragCtx.startRightPct - deltaPct;
+  // 120px floor expressed in share-units.
+  const minPct = MIN_WIDTH_PX * pctPerPx;
+  if (leftPct < minPct) {
+    leftPct = minPct;
+    rightPct = totalPct - leftPct;
+  } else if (rightPct < minPct) {
+    rightPct = minPct;
+    leftPct = totalPct - rightPct;
+  }
+  dragCtx.leftEl.style.flexGrow = leftPct;
+  dragCtx.rightEl.style.flexGrow = rightPct;
+  // Live arrow redraw: slot/heap-box viewport positions shift during the
+  // drag, so the SVG paths must be recomputed every frame. rAF-coalesced
+  // to one redraw per paint.
+  scheduleRedrawOverlays();
+}
+
+function onDividerUp(ev) {
+  if (!dragCtx) return;
+  const { divider, leftEl, rightEl, leftId, rightId } = dragCtx;
+  // The inline flex-grow values were updated during pointermove. Persist
+  // them as the new width_pct shares (clamped to [5, 95]).
+  const leftPct = clampWidth(parseFloat(leftEl.style.flexGrow));
+  const rightPct = clampWidth(parseFloat(rightEl.style.flexGrow));
+  if (isFinite(leftPct) && isFinite(rightPct)) {
+    layoutState.panels[leftId].width_pct = leftPct;
+    layoutState.panels[rightId].width_pct = rightPct;
+    saveLayout();
+    leftEl.style.flexGrow = leftPct;
+    rightEl.style.flexGrow = rightPct;
+  }
+
+  divider.classList.remove("is-dragging");
+  document.body.classList.remove("is-resizing");
+  try {
+    divider.releasePointerCapture(dragCtx.pointerId);
+  } catch (_) {}
+  divider.removeEventListener("pointermove", onDividerMove);
+  divider.removeEventListener("pointerup", onDividerUp);
+  divider.removeEventListener("pointercancel", onDividerUp);
+  dragCtx = null;
+  // Final-position redraw after pointerup — ensures the arrows match the
+  // settled layout even if the last pointermove was a few ms back.
+  redrawOverlays();
+}
+
+function wireDragHandlers() {
+  document.querySelectorAll(".panel-divider").forEach((d) => {
+    d.addEventListener("pointerdown", onDividerDown);
+  });
+}
+
+// ─── 020: reset ──────────────────────────────────────────────────────────
+
+function resetLayout() {
+  try {
+    localStorage.removeItem(STORAGE_KEY);
+  } catch (_) {}
+  layoutState = defaults();
+  applyLayoutState();
+}
+
+function wireResetButton() {
+  const btn = document.getElementById("btn-reset-layout");
+  if (btn) btn.addEventListener("click", resetLayout);
+}
+
+// Re-render the SVG overlays (arrows + copy + dispatch) using the cached
+// snapshot. Called when the layout shifts (fold/unfold transition end,
+// drag-resize, reset, panel auto-collapse) so arrow source/target positions
+// stay accurate without re-running the WASM pipeline.
+function redrawOverlays() {
+  if (!lastSnapshot) return;
+  renderArrows(lastSnapshot.arrows || []);
+  renderCopyArrow(lastSnapshot.pending_copy || null);
+  renderDispatchArrow(lastSnapshot.pending_dispatch || null);
+}
+
+// rAF-coalesced version — multiple scheduleRedraw() calls inside one frame
+// collapse to a single redraw on the next paint. Used during live drag.
+function scheduleRedrawOverlays() {
+  if (redrawScheduled) return;
+  redrawScheduled = true;
+  requestAnimationFrame(() => {
+    redrawScheduled = false;
+    redrawOverlays();
+  });
+}
+
+// `transition: flex-basis 120ms, flex-grow 120ms` on `.panel` animates
+// fold/unfold + reset + auto-collapse layout shifts. The arrows drawn at
+// the START of the transition use mid-animation slot positions and look
+// stuck once the transition completes. Listen for `transitionend` on
+// `<main>` (bubbles up from any .panel child) and redraw with final coords.
+function wireLayoutChangeRedraw() {
+  const main = document.querySelector("main");
+  if (!main) return;
+  main.addEventListener("transitionend", (ev) => {
+    if (ev.target && ev.target.classList && ev.target.classList.contains("panel")) {
+      if (ev.propertyName === "flex-basis" || ev.propertyName === "flex-grow") {
+        redrawOverlays();
+      }
+    }
+  });
+}
 
 // ─── DOM helpers ──────────────────────────────────────────────────────────
 
@@ -136,6 +517,9 @@ function el(tag, attrs = {}, ...children) {
 // ─── render(state) — apply a StateSnapshot to the DOM ─────────────────────
 
 function render(state) {
+  // **020**: cache for redrawOverlays() — fold/drag/reset triggers a redraw
+  // using this snapshot without rerunning the WASM pipeline.
+  lastSnapshot = state;
   // Stacks panel: rebuild from scratch.
   const stacksEl = document.getElementById("stacks");
   // **M08**: multi-thread routing — when `state.threads` is non-empty,
@@ -425,14 +809,30 @@ function render(state) {
   // **Post-M08 polish**: auto-collapse empty STATIC + VTABLES panels so
   // they don't hog screen space for non-static / non-trait-object
   // programs (especially relevant for multi-thread layouts).
+  // **020-foldable-resizable-panels**: the `panel-empty` class moves to
+  // the `.panel` wrapper (not the inner `<section>`) so the new
+  // `.panel.panel-empty:not(.is-folded):not(.is-user-overridden)` CSS
+  // selectors can subordinate auto-collapse to explicit user state.
   const staticEl = document.getElementById("static");
   if (staticEl) {
-    staticEl.classList.toggle("panel-empty", (state.static_region || []).length === 0);
+    const wrapper = staticEl.closest(".panel");
+    if (wrapper) {
+      wrapper.classList.toggle("panel-empty", (state.static_region || []).length === 0);
+    }
   }
   const vtablesEl = document.getElementById("vtables");
   if (vtablesEl) {
-    vtablesEl.classList.toggle("panel-empty", (state.vtables || []).length === 0);
+    const wrapper = vtablesEl.closest(".panel");
+    if (wrapper) {
+      wrapper.classList.toggle("panel-empty", (state.vtables || []).length === 0);
+    }
   }
+
+  // **020**: re-apply persisted layout state at the end of every successful
+  // render. This re-folds the editor after a transient unfold from a parse
+  // error (per ensureEditorVisible) and is a cheap idempotent op
+  // (5 elements, class toggles + inline flex-basis).
+  applyLayoutState();
 
   // M06.1 → M07: render arrows LAST, after the status bar AND heap have
   // taken their final layout. Use requestAnimationFrame so the browser has
@@ -450,6 +850,11 @@ function render(state) {
 // M05 / US2: render a compile error. Underline the span, show the message
 // in the status bar, disable playback controls.
 function renderError(error) {
+  // **020**: ensure the editor is visible when surfacing a parse error,
+  // even if the user previously folded it. Transient — the next successful
+  // render's applyLayoutState() re-applies the user's fold preference.
+  ensureEditorVisible();
+
   // Editor underline at the error span.
   editorView.dispatch({ effects: setError.of({ start: error.span.start, end: error.span.end }) });
 
@@ -471,6 +876,75 @@ function renderError(error) {
   setControlsEnabled(false);
 }
 
+// **020**: when an arrow's source or target element lives inside a panel
+// that's collapsed to a sliver (heap/static/vtables auto-collapse or user
+// fold), the inner section has `display: none` and `getBoundingClientRect()`
+// returns `{0,0,0,0}`. The arrow path would then land at the viewport's
+// top-left, drawing a long diagonal line off-screen. Walk up to the nearest
+// visible ancestor — typically the `.panel` wrapper, which stays at the
+// sliver's screen position — so the arrow points at the SLIVER itself.
+// Semantically: "your object is in this collapsed region; expand to inspect".
+function getEffectiveRect(el) {
+  const rect = el.getBoundingClientRect();
+  if (rect.width > 0 || rect.height > 0) return rect;
+  let ancestor = el.parentElement;
+  while (ancestor) {
+    const r = ancestor.getBoundingClientRect();
+    if (r.width > 0 || r.height > 0) return r;
+    ancestor = ancestor.parentElement;
+  }
+  return rect;
+}
+
+// **020**: if `el` is a descendant of a panel that's currently collapsed to
+// a sliver (`.is-folded` or auto-`.panel-empty`), return the panel id (e.g.
+// `"heap"`); otherwise null. Used by arrow renderers to ELIDE the path —
+// instead of drawing a long line to a collapsed sliver, render a small
+// `→ heap` label next to the source. Much cleaner pedagogically: the long
+// arrow is visual noise; the label invites "expand to inspect".
+function getCollapsedPanelId(el) {
+  let ancestor = el.parentElement;
+  while (ancestor) {
+    if (ancestor.classList && ancestor.classList.contains("panel")) {
+      const isSliver =
+        ancestor.classList.contains("is-folded") ||
+        (ancestor.classList.contains("panel-empty") &&
+          !ancestor.classList.contains("is-user-overridden"));
+      return isSliver ? (ancestor.dataset.panel || null) : null;
+    }
+    ancestor = ancestor.parentElement;
+  }
+  return null;
+}
+
+// Create a "virtual target" — a small HTML label positioned above the source
+// slot's row — and return it so the caller can redirect the SVG arrow's
+// target to point at it. This lets the existing arrow-drawing code render
+// a normal SVG path that ends at the label instead of the real (collapsed)
+// heap-box. Result: same arrow visual vocabulary as when heap is open,
+// with the label standing in for the (currently hidden) heap.
+function makeElidedTarget(srcEl, kindClass, targetPanelId) {
+  const host = (srcEl.closest && srcEl.closest(".slot-row")) || srcEl;
+  // Dedup any stale virtual target on this row.
+  for (const old of host.querySelectorAll(":scope > .elision-virtual-target")) {
+    old.remove();
+  }
+  const virt = document.createElement("div");
+  virt.className = `elision-virtual-target ${kindClass}`;
+  virt.textContent = `→ ${targetPanelId}`;
+  host.appendChild(virt);
+  return virt;
+}
+
+// Stale-elision sweep: remove virtual-target labels from previous renders.
+// Called at the start of `renderArrows` (before the new render emits its
+// own virtuals) — same lifecycle as the SVG overlay clearing.
+function clearElisionHints() {
+  for (const el of document.querySelectorAll(".elision-virtual-target")) {
+    el.remove();
+  }
+}
+
 // **M06 → M07**: render arrows for both borrows and ownership. Each ArrowView
 // has source_slot (always a slot id), target (Slot(id) | Heap(addr)), and
 // kind (Shared | Mut | Owning). Targets are queried via data-slot-id or
@@ -482,6 +956,10 @@ function renderArrows(arrows) {
   for (const child of [...overlay.children]) {
     if (child.tagName.toLowerCase() !== "defs") overlay.removeChild(child);
   }
+  // **020**: stale elision-hint sweep — HTML hints live OUTSIDE the SVG
+  // overlay (inside slot rows) so the overlay clear above doesn't touch
+  // them. Remove all hints; the renderers below re-emit fresh ones.
+  clearElisionHints();
   if (!arrows || arrows.length === 0) return;
 
   const overlayBox = overlay.getBoundingClientRect();
@@ -533,8 +1011,24 @@ function renderArrows(arrows) {
       targetIsHeap = true; // reuse the "enter from above" routing
     }
     if (!srcEl || !tgtEl) continue;
-    const src = srcEl.getBoundingClientRect();
-    const tgt = tgtEl.getBoundingClientRect();
+    const src = getEffectiveRect(srcEl);
+    // **020**: if the arrow's target is inside a collapsed panel, replace
+    // tgtEl with a "virtual target" label rendered into the source slot's
+    // row, then let the normal arrow-drawing code below route a real SVG
+    // path to that label. Reuses the same routing / styling / per-kind
+    // class that the unfolded case uses.
+    let elisionVirt = null;
+    const collapsedTarget = getCollapsedPanelId(tgtEl);
+    if (collapsedTarget) {
+      const kindClass = a.kind === "Mut" ? "arrow-mut"
+                      : a.kind === "Owning" ? "arrow-owning"
+                      : a.kind === "Arc" ? "arrow-arc"
+                      : "arrow-shared";
+      elisionVirt = makeElidedTarget(srcEl, kindClass, collapsedTarget);
+      tgtEl = elisionVirt;
+      targetIsHeap = true; // route as "enter from above" (heap-style)
+    }
+    const tgt = getEffectiveRect(tgtEl);
 
     // Per-arrow distribution at source end (co-sourced arrows space out
     // vertically across the source slot's height).
@@ -591,6 +1085,18 @@ function renderArrows(arrows) {
       d = `M${x1},${y1 + globalNudge} H${gutterX} V${y2} H${x2}`;
     }
 
+    // **020**: for elision arrows, override the L-routed path with a clean
+    // straight vertical from source slot UP to just below the virtual
+    // target's bottom edge. Arrowhead ends up at the label's bottom,
+    // pointing UP into the label (approach from below) — matches the
+    // user's pedagogical preference: the line "leads up to the label
+    // saying which collapsed panel holds the real target".
+    if (elisionVirt) {
+      const virtRect = getEffectiveRect(elisionVirt);
+      const y2v = virtRect.bottom - overlayBox.top + 4; // 4px gap from arrowhead tip to label border
+      d = `M${x1},${y1} V${y2v}`;
+    }
+
     path.setAttribute("d", d);
     const cls = a.kind === "Mut" ? "arrow-mut"
               : a.kind === "Owning" ? "arrow-owning"
@@ -601,6 +1107,22 @@ function renderArrows(arrows) {
     // matches the dashed-purple stroke.
     if (a.kind === "Arc") {
       path.setAttribute("marker-end", "url(#arrow-head-arc)");
+    }
+    // **020**: elision arrows + their virt label are hidden by default,
+    // revealed on slot-row hover (implicit-relationship convention).
+    if (elisionVirt) {
+      path.classList.add("arrow-elision");
+      const slotRow = (srcEl.closest && srcEl.closest(".slot-row")) || srcEl;
+      const onEnter = () => {
+        path.classList.add("elision-visible");
+        elisionVirt.classList.add("elision-visible");
+      };
+      const onLeave = () => {
+        path.classList.remove("elision-visible");
+        elisionVirt.classList.remove("elision-visible");
+      };
+      slotRow.addEventListener("mouseenter", onEnter);
+      slotRow.addEventListener("mouseleave", onLeave);
     }
     // **M07.2**: add an invisible wider "hit-target" path with the same
     // geometry, appended BEFORE the visible path so the visible line
@@ -840,8 +1362,13 @@ function renderCopyArrow(pendingCopy) {
   if (!srcEl || !tgtEl) return;
 
   const overlayBox = overlay.getBoundingClientRect();
-  const src = srcEl.getBoundingClientRect();
-  const tgt = tgtEl.getBoundingClientRect();
+  // **020**: redirect to virtual target if target panel is collapsed.
+  const collapsedTarget = getCollapsedPanelId(tgtEl);
+  if (collapsedTarget) {
+    tgtEl = makeElidedTarget(srcEl, "arrow-copy", collapsedTarget);
+  }
+  const src = getEffectiveRect(srcEl);
+  const tgt = getEffectiveRect(tgtEl);
 
   // Route: a direct angled line from the source's right edge to the
   // target's left edge. Curved (quadratic bezier) for a "flowing" feel.
@@ -937,12 +1464,15 @@ function renderDispatchArrow(pendingDispatch) {
   if (!vtableCell || !frameCard) return;
 
   const overlayBox = overlay.getBoundingClientRect();
-  const dst = frameCard.getBoundingClientRect();
-
-  // Anchor the arrow source at the SLOT NAME element (same anchor as
-  // borrow arrows) so dispatch arrows share the visual vocabulary of
-  // other arrows in the panel — they all "leave the slot from the left".
-  const slotNameSrc = slotEl.getBoundingClientRect();
+  // **020**: redirect to virtual target if dispatch target's frame card is
+  // in a collapsed panel.
+  let dstEl = frameCard;
+  const collapsedTarget = getCollapsedPanelId(frameCard);
+  if (collapsedTarget) {
+    dstEl = makeElidedTarget(slotEl, "arrow-vtable", collapsedTarget);
+  }
+  const slotNameSrc = getEffectiveRect(slotEl);
+  const dst = getEffectiveRect(dstEl);
 
   // Right-angle path through a dedicated left gutter wider than the
   // borrow gutter (24px) so dispatch arrows don't overlap any borrow
@@ -1415,6 +1945,16 @@ async function main() {
   player = new Player("");
 
   wireControls();
+
+  // **020-foldable-resizable-panels**: wire fold buttons, drag-resize
+  // dividers, and the Reset button. Apply the loaded layout state to the
+  // DOM once at startup; subsequent render() calls re-apply on every
+  // successful pipeline run.
+  wireFoldHandlers();
+  wireDragHandlers();
+  wireResetButton();
+  wireLayoutChangeRedraw();
+  applyLayoutState();
 
   // Load the first sample by default.
   await loadSample(SAMPLES[0].id);
