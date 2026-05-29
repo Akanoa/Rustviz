@@ -77,11 +77,161 @@ main {
   position: relative; /* anchor for the absolute-positioned SVG overlay */
 }
 
-main > section {
+/* 020-foldable-resizable-panels: each top-level panel is wrapped in a
+   `<div class="panel" data-panel="...">` container. The container drives
+   the horizontal flex layout (replacing the legacy `main > section { flex:1 }`
+   rules); the inner `<section>` keeps its existing id-scoped CSS for content
+   layout (slot grids, heap-cell strips, etc.). */
+.panel {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+  border-right: 1px solid var(--border);
+  /* **Proportional sizing via flex-grow.** `flex-basis: 0` + `flex-shrink: 0`
+     means each panel takes ZERO baseline width and grows by `flex-grow` units
+     to share the remaining row width. When a panel collapses to a sliver
+     (`.is-folded` or auto-collapsed), its `flex-grow: 0` makes the OTHER
+     panels' grow values absorb the freed space proportionally — no rigid
+     percentages, no empty right-edge gap when panels collapse. */
+  flex-shrink: 0;
+  flex-basis: 0;
+  /* Smooth fold/unfold + reset animations. Suppressed during a live drag
+     via `body.is-resizing .panel { transition: none }`. */
+  transition: flex-basis 120ms ease-out, flex-grow 120ms ease-out;
+}
+
+.panel:last-child {
+  border-right: none;
+}
+
+.panel > section {
   flex: 1;
   min-width: 0;
+  min-height: 0;
   overflow: auto;
-  border-right: 1px solid var(--border);
+  /* The legacy `main > section { border-right: 1px solid }` rule moved up
+     to `.panel`; sections inside a panel must not double-paint the border. */
+  border-right: none;
+}
+
+/* Default proportional widths. They're flex-grow values, NOT percentages —
+   they represent each panel's SHARE of total layout. Sum is 100 by
+   convention so a single value also reads as "approximate percent". When
+   any panel slivers (grow→0), the remaining panels' grows redistribute. */
+.panel[data-panel="editor"]  { flex-grow: 25; }
+.panel[data-panel="stacks"]  { flex-grow: 30; }
+.panel[data-panel="heap"]    { flex-grow: 25; }
+.panel[data-panel="vtables"] { flex-grow: 10; }
+.panel[data-panel="static"]  { flex-grow: 10; }
+
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.3rem 0.5rem;
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  border-bottom: 1px solid var(--border);
+  /* The header sits above the `<section>` content; don't shrink. */
+  flex: 0 0 auto;
+}
+
+.panel-title {
+  font-family: ui-monospace, SFMono-Regular, monospace;
+}
+
+.panel-fold-btn {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 12px;
+  line-height: 1;
+}
+
+.panel-fold-btn:hover {
+  background: var(--frame-bg);
+  color: var(--text);
+  border-color: var(--border);
+}
+
+#btn-reset-layout {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 2px 8px;
+  font-size: 11px;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+#btn-reset-layout:hover {
+  background: var(--frame-bg);
+  color: var(--text);
+}
+
+/* 020-foldable-resizable-panels: drag-resize divider between adjacent
+   panels. 6px hit-target with a 1px centered line; thickens + accent
+   color on hover and active drag. */
+.panel-divider {
+  flex: 0 0 6px;
+  cursor: col-resize;
+  background: transparent;
+  position: relative;
+  /* No transition on flex-basis: the divider itself never resizes; only
+     hover-recoloring of the inner pseudo-element animates. */
+}
+
+.panel-divider::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 1px;
+  background: var(--border);
+  transform: translateX(-50%);
+  transition: background 120ms ease-out, width 120ms ease-out;
+}
+
+.panel-divider:hover::before,
+.panel-divider.is-dragging::before {
+  background: var(--accent);
+  width: 3px;
+}
+
+/* Hide dividers adjacent to a folded panel — the sliver is a click-target
+   for unfold, and a divider in between would be confusing. Uses CSS
+   sibling + `:has()` for the both-sides cases. `:has()` is in all
+   modern Chromium / Firefox / Safari (2023+). */
+.panel.is-folded + .panel-divider,
+.panel-divider:has(+ .panel.is-folded) {
+  display: none;
+}
+
+/* Same for the auto-collapse sliver. */
+.panel.panel-empty:not(.is-folded):not(.is-user-overridden) + .panel-divider,
+.panel-divider:has(+ .panel.panel-empty:not(.is-folded):not(.is-user-overridden)) {
+  display: none;
+}
+
+/* During an active drag, lock the global cursor + suppress text selection
+   so the user never sees the cursor flicker between col-resize and the
+   underlying panel's cursor when their pointer strays off the divider. */
+body.is-resizing {
+  cursor: col-resize !important;
+  user-select: none;
+}
+
+/* Suppress flex-basis animation during a live drag — otherwise every
+   mousemove kicks off a 120ms ease-out that lags behind the cursor. */
+body.is-resizing .panel {
+  transition: none !important;
 }
 
 /* M06: SVG overlay drawing borrow arrows. Absolutely positioned to overlap
@@ -182,6 +332,84 @@ main > section {
   user-select: none;
   pointer-events: none;
   animation: arrow-copy-fade-in 220ms ease-out;
+}
+
+/* **020-foldable-resizable-panels**: elided-arrow hint. Hidden by default,
+   revealed when the source slot row is hovered (matching the project's
+   "implicit relationship arrows reveal on hover" rule, see
+   `feedback_arrow_viz_rules` memory). The L-shaped connector to the
+   slot is drawn via `::before` / `::after` pseudo-elements — no SVG, so
+   the text rendering uses the browser's normal font hinting and stays
+   crisp at small sizes. Per-kind color via `currentColor` inheritance. */
+/* Virtual elision targets are placeholder labels rendered into the source
+   slot's row when the real target lives in a collapsed panel. The normal
+   SVG arrow code then draws a regular arrow pointing at the label — same
+   routing + styling vocabulary as when heap is open.
+
+   Positioning context lives on `.frame-card`, NOT `.slot-row`: in
+   single-thread mode slot-row uses `display: contents` and has no box,
+   so `position: relative` on it is a no-op. Frame-card always has a real
+   block-level box, giving a consistent containing block for the virt's
+   absolute positioning in both single- and multi-thread modes. */
+.frame-card {
+  position: relative;
+}
+
+.elision-virtual-target {
+  position: absolute;
+  /* 60px above the frame card's top — short enough to stay inside the
+     stacks panel, tall enough to be unmistakably "above" the slot. */
+  bottom: calc(100% + 60px);
+  /* Centered on the slot-name's x position (frame-card padding-left = 40px).
+     `translateX(-50%)` shifts the virt left by half its own width so its
+     center lands at left:40, matching where the SVG path's vertical line
+     sits (src.left). */
+  left: 40px;
+  transform: translateX(-50%);
+  background: rgba(255, 255, 255, 0.96);
+  border: 1.5px solid currentColor;
+  border-radius: 4px;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-weight: 600;
+  line-height: 1.2;
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 5;
+}
+
+/* Per-kind label color matches the SVG arrow color the regular code emits
+   for that kind. Dashed border for kinds whose normal arrow is dashed. */
+.elision-virtual-target.arrow-shared  { color: #2a6fa5; }
+.elision-virtual-target.arrow-mut     { color: #c62828; }
+.elision-virtual-target.arrow-owning  { color: #111; }
+.elision-virtual-target.arrow-arc     { color: #7a4eb5; border-style: dashed; }
+.elision-virtual-target.arrow-copy    { color: #b35f00; border-style: dashed; }
+.elision-virtual-target.arrow-vtable  { color: #b35f00; border-style: dashed; }
+
+/* Elision arrows + virtual targets are HIDDEN by default, REVEALED when
+   the source slot row is hovered. Matches the project's
+   `feedback_arrow_viz_rules` convention: implicit-relationship arrows
+   are hover-only; explicit ones are always-on. The relationship "slot's
+   Arc points to a heap-block currently in a collapsed panel" is implicit
+   — the user doesn't see the heap, so the arrow is contextual. */
+#arrow-overlay .arrow-elision {
+  opacity: 0;
+  transition: opacity 120ms ease-out;
+}
+#arrow-overlay .arrow-elision.elision-visible {
+  opacity: 1;
+}
+
+.elision-virtual-target {
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 120ms ease-out, visibility 120ms ease-out;
+}
+.elision-virtual-target.elision-visible {
+  opacity: 1;
+  visibility: visible;
 }
 
 /* **M07.2**: source-side highlight for bytes/chars covered by a transient
@@ -523,10 +751,6 @@ main > section {
   opacity: 1;
 }
 
-main > section:last-child {
-  border-right: none;
-}
-
 #editor {
   font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
   font-size: 13px;
@@ -712,32 +936,70 @@ main > section:last-child {
   flex-direction: column;
   gap: 0.5rem;
   min-height: 60px;
-  flex: 0.6; /* narrower than stacks/heap — literals are typically small */
+  /* 020-foldable-resizable-panels: the legacy `flex: 0.6` lived here when
+     `<section>` was the panel itself. The `.panel[data-panel="static"]`
+     wrapper now drives horizontal sizing — defaults to 10% in T004. */
 }
 
-/* **Post-M08**: auto-collapse STATIC + VTABLES panels when they have no
-   content. Frees screen real estate for the more-interactive stacks +
-   heap panels (especially relevant for multi-thread programs that need
-   horizontal room). JS toggles `.panel-empty` based on snapshot state. */
-#static.panel-empty,
-#vtables.panel-empty {
-  flex: 0 0 28px;
-  padding: 0.4rem;
+/* 020-foldable-resizable-panels: the post-M08 auto-collapse heuristic
+   becomes SUBORDINATE to explicit user state:
+     - `.panel.is-folded`              → user explicitly folded (sliver)
+     - `.panel.is-user-overridden`     → user explicitly unfolded an empty
+                                         panel (full width even when empty)
+     - `.panel.panel-empty`            → auto-collapse hint from renderUi()
+                                         based on snapshot content
+   The auto-collapse only fires when neither user-state class is present.
+   Both `.is-folded` and the auto-collapse render identically as a 28px
+   sliver. `flex-grow: 0` zeros the panel's share of leftover space; the
+   OTHER panels absorb the freed space proportionally to their own grow
+   values. No empty right-edge gap when STATIC + VTABLES collapse. */
+.panel.is-folded,
+.panel.panel-empty:not(.is-folded):not(.is-user-overridden) {
+  flex-grow: 0 !important;
+  flex-basis: 28px !important;
+  min-width: 28px;
   overflow: hidden;
-  min-height: 0;
+  cursor: pointer; /* whole sliver is click-target for unfold */
 }
 
-#static.panel-empty .static-label,
-#vtables.panel-empty .vtables-label {
-  margin: 0;
-  white-space: nowrap;
-  font-size: 9px;
-  opacity: 0.4;
+/* Vertical-text header in sliver mode. `writing-mode: vertical-rl` reads
+   bottom-to-top; the title is then rotated 180° so it reads top-to-bottom. */
+.panel.is-folded .panel-header,
+.panel.panel-empty:not(.is-folded):not(.is-user-overridden) .panel-header {
+  writing-mode: vertical-rl;
+  padding: 0.5rem 0;
+  justify-content: flex-start;
+  gap: 0.5rem;
+  border-bottom: none;
+  border-right: 1px dashed var(--border);
+  height: 100%;
 }
 
-#static.panel-empty > *:not(.static-label),
-#vtables.panel-empty > *:not(.vtables-label) {
-  display: none;
+.panel.is-folded .panel-title,
+.panel.panel-empty:not(.is-folded):not(.is-user-overridden) .panel-title {
+  transform: rotate(180deg);
+  font-size: 10px;
+  opacity: 0.6;
+}
+
+/* Hide content in sliver mode — only the vertical header strip shows.
+   `!important` needed because the inner sections have id-scoped rules
+   (`#heap { display: flex }`, `#static { display: flex }`,
+   `#vtables { display: flex }`) with higher specificity. Without
+   `!important` the section stays visible at 28px and `getBoundingClientRect`
+   on heap-box / static-block returns a non-empty rect, which breaks the
+   `getEffectiveRect` arrow fallback that depends on the descendant's
+   rect being zero. */
+.panel.is-folded > section,
+.panel.panel-empty:not(.is-folded):not(.is-user-overridden) > section {
+  display: none !important;
+}
+
+/* In USER fold mode, rotate the `−` glyph so it reads as a vertical bar
+   (signaling "I'm folded, click to expand"). Auto-collapse keeps the
+   original `−` to differentiate UX intent. */
+.panel.is-folded .panel-fold-btn {
+  transform: rotate(90deg);
 }
 
 #static .static-label {
@@ -799,7 +1061,8 @@ main > section:last-child {
   flex-direction: column;
   gap: 0.5rem;
   min-height: 60px;
-  flex: 0.6; /* narrower than stacks/heap */
+  /* 020-foldable-resizable-panels: legacy `flex: 0.6` removed; the
+     `.panel[data-panel="vtables"]` wrapper drives horizontal sizing. */
 }
 
 #vtables .vtables-label {
