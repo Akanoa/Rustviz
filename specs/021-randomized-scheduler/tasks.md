@@ -85,9 +85,9 @@ description: "Task list for the randomized (seeded) thread scheduler — replace
 
 - [ ] T019 [US1] Re-baseline existing M08 snapshot tests. Run `INSTA_UPDATE=always cargo test --test m08` (or `tests/m08*`). Inspect the updated `.snap` files. Confirm the new traces are PLAUSIBLE — closure runs some steps before main's join, no duplicate event sequences, lock acquire/release pairs match. Commit the re-snapped traces with a clear message: "M08 re-baseline post-021: scheduler now picks via seed=0; strict-deferred order replaced with cooperative random." T020 / T021 add new tests that don't rely on the specific trace shape.
 
-- [ ] T020 [US1] In `tests/m08_2.rs`, add `#[test] fn same_seed_determinism()`: run the M08 Arc<Mutex> sample through `pipeline::run(source, 42)` twice; assert the two event streams are bytewise-identical (`assert_eq!` on `Vec<MemEvent>`). Covers B-M082-1, SC-003.
+- [X] T020 [US1] In `tests/m08_2.rs`, add `#[test] fn same_seed_determinism()`: run the M08 Arc<Mutex> sample through `pipeline::run(source, 42)` twice; assert the two event streams are bytewise-identical (`assert_eq!` on `Vec<MemEvent>`). Covers B-M082-1, SC-003.
 
-- [ ] T021 [US1] In `tests/m08_2.rs`, add `#[test] fn single_thread_invariance()`: run an M01 sample (`let x = 42; let y = x + 1;`) through `pipeline::run(source, X)` for X in `[0, 1, 42, 4294967295]`; assert all four event streams are bytewise-identical. Covers B-M082-2, SC-002.
+- [X] T021 [US1] In `tests/m08_2.rs`, add `#[test] fn single_thread_invariance()`: run an M01 sample (`let x = 42; let y = x + 1;`) through `pipeline::run(source, X)` for X in `[0, 1, 42, 4294967295]`; assert all four event streams are bytewise-identical. Covers B-M082-2, SC-002.
 
 - [ ] T022 [US1] Run `cargo test` and confirm: 181 baseline tests pass; m08_2 target's `same_seed_determinism` + `single_thread_invariance` pass; M08 re-baseline snapshots are committed. Run `cd web && trunk serve` and confirm the M08 Arc<Mutex> sample renders interactively with the new interleaving.
 
@@ -105,17 +105,17 @@ description: "Task list for the randomized (seeded) thread scheduler — replace
 
 ### Implementation
 
-- [ ] T024 [US2] In `web/index.html`, add to the `<footer id="toolbar">` between `btn-play-pause` and `step-indicator`: `<label for="seed-input" class="seed-label">seed</label>` + `<input id="seed-input" type="number" min="0" max="4294967295" value="0" step="1" />`. Per contracts/seed-ui-contract.md.
+- [X] T024 [US2] In `web/index.html`, add to the `<footer id="toolbar">` between `btn-play-pause` and `step-indicator`: `<label for="seed-input" class="seed-label">seed</label>` + `<input id="seed-input" type="number" min="0" max="4294967295" value="0" step="1" />`. Per contracts/seed-ui-contract.md.
 
-- [ ] T025 [P] [US2] In `web/style.css`, add `.seed-label` (font ui-monospace, font-size 11px, color var(--muted), margin-left 1rem) + `#seed-input { width: 6em; padding: 2px 6px; font ui-monospace 12px; border: 1px solid var(--border); border-radius: 3px; background: white; }`. Per the styling contract.
+- [X] T025 [P] [US2] In `web/style.css`, add `.seed-label` (font ui-monospace, font-size 11px, color var(--muted), margin-left 1rem) + `#seed-input { width: 6em; padding: 2px 6px; font ui-monospace 12px; border: 1px solid var(--border); border-radius: 3px; background: white; }`. Per the styling contract.
 
-- [ ] T026 [US2] In `web/index.js`, add module-level `const SEED_DEBOUNCE_MS = 300; let seedDebounceTimer = null;` (currentSeed already added in T010). Add `wireSeedControls()` function and call it from `main()` after `wireControls()`. `wireSeedControls` attaches an `input` listener to `seed-input` that: clears `seedDebounceTimer`, sets a new timer for 300ms that parses `ev.target.value` as int, validates `0..=0xFFFFFFFF`, on invalid reverts `ev.target.value` to `String(currentSeed)` without re-running, on valid sets `currentSeed = raw` and calls `rerunWithSeed(raw)`.
+- [X] T026 [US2] In `web/index.js`, add module-level `const SEED_DEBOUNCE_MS = 300; let seedDebounceTimer = null;` (currentSeed already added in T010). Add `wireSeedControls()` function and call it from `main()` after `wireControls()`. `wireSeedControls` attaches an `input` listener to `seed-input` that: clears `seedDebounceTimer`, sets a new timer for 300ms that parses `ev.target.value` as int, validates `0..=0xFFFFFFFF`, on invalid reverts `ev.target.value` to `String(currentSeed)` without re-running, on valid sets `currentSeed = raw` and calls `rerunWithSeed(raw)`.
 
-- [ ] T027 [US2] In `web/index.js`, add `function rerunWithSeed(seed)`: gets current source from `editorView.state.doc.toString()`, calls `player.set_source(source, seed)`, parses JSON, calls `render(state)` on ok or `renderError(error)` on failure. Reuses the existing pipeline-error UX from T010.
+- [X] T027 [US2] In `web/index.js`, add `function rerunWithSeed(seed)`: gets current source from `editorView.state.doc.toString()`, calls `player.set_source(source, seed)`, parses JSON, calls `render(state)` on ok or `renderError(error)` on failure. Reuses the existing pipeline-error UX from T010.
 
-- [ ] T028 [US2] In `web/index.js`, in `render(state)`, sync `document.getElementById("seed-input").value = String(state.seed);` AFTER all other render work (so the input field always matches the rendered trace's seed — VR-SF2, B-UI-5). Also update `currentSeed = state.seed`.
+- [X] T028 [US2] In `web/index.js`, in `render(state)`, sync `document.getElementById("seed-input").value = String(state.seed);` AFTER all other render work (so the input field always matches the rendered trace's seed — VR-SF2, B-UI-5). Also update `currentSeed = state.seed`.
 
-- [ ] T029 [US2] In `web/index.js`, in `setControlsEnabled(enabled)`, also toggle `disabled` on `seed-input` (B-UI-9). Re-roll button is wired in Phase 5, not yet relevant.
+- [X] T029 [US2] In `web/index.js`, in `setControlsEnabled(enabled)`, also toggle `disabled` on `seed-input` (B-UI-9). Re-roll button is wired in Phase 5, not yet relevant.
 
 - [ ] T030 [US2] In `tests/m08_2.rs`, add `#[test] fn different_seed_divergence()`: run the M08 Arc<Mutex> sample through `pipeline::run(source, X)` for X in `0..100`; collect event streams; assert at least 80 of the 100 distinct from the seed=0 trace (SC-001, B-M082-3). Use bytewise comparison via `Vec<MemEvent>` equality.
 
@@ -133,13 +133,13 @@ description: "Task list for the randomized (seeded) thread scheduler — replace
 
 ### Implementation
 
-- [ ] T032 [US3] In `web/index.html`, add immediately after the `seed-input`: `<button id="btn-reroll-seed" type="button" aria-label="Generate new random seed" title="New random seed">🎲</button>`.
+- [X] T032 [US3] In `web/index.html`, add immediately after the `seed-input`: `<button id="btn-reroll-seed" type="button" aria-label="Generate new random seed" title="New random seed">🎲</button>`.
 
-- [ ] T033 [P] [US3] In `web/style.css`, add `#btn-reroll-seed { background: transparent; border: 1px solid var(--border); border-radius: 3px; padding: 2px 6px; font-size: 14px; cursor: pointer; line-height: 1; } #btn-reroll-seed:hover { background: var(--frame-bg); }`.
+- [X] T033 [P] [US3] In `web/style.css`, add `#btn-reroll-seed { background: transparent; border: 1px solid var(--border); border-radius: 3px; padding: 2px 6px; font-size: 14px; cursor: pointer; line-height: 1; } #btn-reroll-seed:hover { background: var(--frame-bg); }`.
 
-- [ ] T034 [US3] In `web/index.js`, extend `wireSeedControls()` to also attach a `click` listener on `btn-reroll-seed`. The handler clears `seedDebounceTimer`, generates `const fresh = Math.floor(Math.random() * 0x1_0000_0000);`, sets `document.getElementById("seed-input").value = String(fresh);`, sets `currentSeed = fresh;`, and calls `rerunWithSeed(fresh)` IMMEDIATELY (no debounce — B-UI-3).
+- [X] T034 [US3] In `web/index.js`, extend `wireSeedControls()` to also attach a `click` listener on `btn-reroll-seed`. The handler clears `seedDebounceTimer`, generates `const fresh = Math.floor(Math.random() * 0x1_0000_0000);`, sets `document.getElementById("seed-input").value = String(fresh);`, sets `currentSeed = fresh;`, and calls `rerunWithSeed(fresh)` IMMEDIATELY (no debounce — B-UI-3).
 
-- [ ] T035 [US3] In `web/index.js`, in `setControlsEnabled(enabled)`, also toggle `disabled` on `btn-reroll-seed` (B-UI-9).
+- [X] T035 [US3] In `web/index.js`, in `setControlsEnabled(enabled)`, also toggle `disabled` on `btn-reroll-seed` (B-UI-9).
 
 - [ ] T036 [US3] Manual QA for US3: click 🎲 three times in quick succession. Confirm: (a) seed input value visibly updates each click, (b) trace re-renders each click, (c) each re-render shows a (typically) different interleaving. Note one of the seeds (e.g., `1742368512`); manually enter it later and confirm reproducibility (B-UI-3, US3 acceptance scenario 2).
 

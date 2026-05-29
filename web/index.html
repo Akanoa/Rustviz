@@ -212,6 +212,13 @@
       <button id="btn-step-back" type="button" aria-label="step back">◀ Step Back</button>
       <button id="btn-play-pause" type="button" data-state="paused" aria-label="play">▶ Play</button>
       <button id="btn-step-forward" type="button" aria-label="step forward">Step Forward ▶</button>
+      <!-- 021-randomized-scheduler: seed input + re-roll button. Controls
+           the random seed used by the thread scheduler. Same seed → same
+           trace (deterministic). Different seed → different valid
+           interleaving when multiple threads are Ready. -->
+      <label for="seed-input" class="seed-label">seed</label>
+      <input id="seed-input" type="number" min="0" max="4294967295" value="0" step="1" />
+      <button id="btn-reroll-seed" type="button" aria-label="Generate new random seed" title="New random seed">🎲</button>
       <span id="step-indicator">0 / 0</span>
     </footer>
 
