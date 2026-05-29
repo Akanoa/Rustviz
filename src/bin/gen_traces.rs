@@ -74,7 +74,7 @@ fn process_one(
 
     // M05: use the consolidated pipeline runner. Same four stages as before,
     // wrapped in a single error type that carries the failing stage label.
-    let events = run_pipeline(&source).map_err(|e| {
+    let events = run_pipeline(&source, 0).map_err(|e| {
         format!("{:?} error: {} (at {:?})", e.stage, e.message, e.span)
     })?;
 

@@ -32,6 +32,10 @@ path = "tests/m02.rs"
 name = "m03"
 path = "tests/m03.rs"
 
+[[test]]
+name = "m08_2"
+path = "tests/m08_2.rs"
+
 [[bin]]
 name = "gen_traces"
 path = "src/bin/gen_traces.rs"

@@ -40,7 +40,7 @@ fn analyze_sample(name: &str) -> EvalResult {
         Ok(t) => t,
         Err(e) => return EvalResult::StaticErr(e),
     };
-    match evaluate(&program, &resolution, &types) {
+    match evaluate(&program, &resolution, &types, 0) {
         Ok(events) => EvalResult::Ok(events),
         Err(e) => EvalResult::StaticErr(e),
     }
@@ -73,7 +73,8 @@ fn event_span(event: &MemEvent) -> rustviz::Span {
         | MemEvent::ArcClone { span, .. }
         | MemEvent::ArcDrop { span, .. }
         | MemEvent::Note { span, .. }
-        | MemEvent::ReturnValue { span, .. } => *span,
+        | MemEvent::ReturnValue { span, .. }
+        | MemEvent::Deadlock { span, .. } => *span,
     }
 }
 

@@ -1394,3 +1394,46 @@ footer#toolbar button:disabled {
   color: var(--muted);
   font-variant-numeric: tabular-nums;
 }
+
+/* 021-randomized-scheduler: seed input + re-roll button. Lives in the
+   toolbar between the play controls and the step indicator. */
+.seed-label {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-size: 11px;
+  color: var(--muted);
+  margin-left: 1rem;
+}
+
+#seed-input {
+  width: 6em; /* fits 10-digit u32 max (4294967295) */
+  padding: 2px 6px;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-size: 12px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: white;
+}
+
+#seed-input:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+#btn-reroll-seed {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 2px 6px;
+  font-size: 14px;
+  cursor: pointer;
+  line-height: 1;
+}
+
+#btn-reroll-seed:hover {
+  background: var(--frame-bg);
+}
+
+#btn-reroll-seed:disabled {
+  opacity: 0.5;
+  cursor: default;
+}

@@ -122,6 +122,12 @@ let debounceTimer = null;
 let lastSnapshot = null;
 let redrawScheduled = false;
 
+// **M08.2 / 021**: seed used for thread scheduling. Default 0 on page load
+// (deterministic first impression). Updated by US2's seed input + US3's
+// re-roll button. Synced from state.seed on every successful render so the
+// JS in-memory value never drifts from what produced the visible trace.
+let currentSeed = 0;
+
 const DEBOUNCE_MS = 300;
 
 // ─── 020: panel layout (fold + drag-resize + persistence) ─────────────────
@@ -520,6 +526,18 @@ function render(state) {
   // **020**: cache for redrawOverlays() — fold/drag/reset triggers a redraw
   // using this snapshot without rerunning the WASM pipeline.
   lastSnapshot = state;
+  // **M08.2**: keep the in-memory `currentSeed` in sync with the trace
+  // that's currently rendered (single source of truth — VR-SF2). Also
+  // mirror it into the seed-input field if present so the displayed value
+  // always matches the seed that produced what the user is looking at.
+  if (typeof state.seed === "number") {
+    currentSeed = state.seed;
+    const seedInput = document.getElementById("seed-input");
+    if (seedInput && document.activeElement !== seedInput) {
+      // Avoid clobbering the input while the user is mid-typing.
+      seedInput.value = String(state.seed);
+    }
+  }
   // Stacks panel: rebuild from scratch.
   const stacksEl = document.getElementById("stacks");
   // **M08**: multi-thread routing — when `state.threads` is non-empty,
@@ -1807,9 +1825,67 @@ function renderHeap(heap) {
 }
 
 function setControlsEnabled(enabled) {
-  for (const id of ["btn-play-pause", "btn-step-back", "btn-step-forward"]) {
-    document.getElementById(id).disabled = !enabled;
+  for (const id of [
+    "btn-play-pause",
+    "btn-step-back",
+    "btn-step-forward",
+    // 021-randomized-scheduler: seed UI shares the playback-disabled state.
+    "seed-input",
+    "btn-reroll-seed",
+  ]) {
+    const el = document.getElementById(id);
+    if (el) el.disabled = !enabled;
   }
+}
+
+// ─── 021-randomized-scheduler: seed UI ───────────────────────────────────
+//
+// Wires the seed input (debounced) + re-roll button. The seed flows to
+// the WASM scheduler via `player.set_source(source, seed)`; the trace's
+// resulting state.seed is reflected back into the input on every render
+// so the displayed value is always the seed that actually produced what's
+// on screen.
+const SEED_DEBOUNCE_MS = 300;
+let seedDebounceTimer = null;
+
+function rerunWithSeed(seed) {
+  stopPlay();
+  const source = editorView.state.doc.toString();
+  const result = JSON.parse(player.set_source(source, seed));
+  if (result.ok) {
+    render(result.state);
+  } else {
+    renderError(result.error);
+  }
+}
+
+function wireSeedControls() {
+  const input = document.getElementById("seed-input");
+  const reroll = document.getElementById("btn-reroll-seed");
+  if (!input || !reroll) return;
+
+  input.addEventListener("input", (ev) => {
+    clearTimeout(seedDebounceTimer);
+    seedDebounceTimer = setTimeout(() => {
+      const raw = parseInt(ev.target.value, 10);
+      if (!Number.isFinite(raw) || raw < 0 || raw > 0xFFFFFFFF) {
+        // Invalid — revert to last good and don't re-run.
+        ev.target.value = String(currentSeed);
+        return;
+      }
+      if (raw === currentSeed) return; // no-op if unchanged
+      currentSeed = raw;
+      rerunWithSeed(raw);
+    }, SEED_DEBOUNCE_MS);
+  });
+
+  reroll.addEventListener("click", () => {
+    clearTimeout(seedDebounceTimer);
+    const fresh = Math.floor(Math.random() * 0x1_0000_0000);
+    input.value = String(fresh);
+    currentSeed = fresh;
+    rerunWithSeed(fresh);
+  });
 }
 
 // ─── M05: live pipeline + sample loading ──────────────────────────────────
@@ -1829,9 +1905,11 @@ function setEditorSource(source) {
 
 // US1: re-run the M01→M02→M03 pipeline on the current editor content and
 // render the result. Called by the debounced updateListener.
+// **M08.2**: passes currentSeed so the scheduler uses the same seed across
+// edits (sticky seed — user changes it explicitly via the seed input).
 function recompile(source) {
   stopPlay();
-  const result = JSON.parse(player.set_source(source));
+  const result = JSON.parse(player.set_source(source, currentSeed));
   if (result.ok) {
     render(result.state);
   } else {
@@ -1945,6 +2023,8 @@ async function main() {
   player = new Player("");
 
   wireControls();
+  // 021-randomized-scheduler: seed input + re-roll button.
+  wireSeedControls();
 
   // **020-foldable-resizable-panels**: wire fold buttons, drag-resize
   // dividers, and the Reset button. Apply the loaded layout state to the
