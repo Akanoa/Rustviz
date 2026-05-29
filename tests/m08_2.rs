@@ -24,6 +24,7 @@ const M03_ARITHMETIC: &str = include_str!("../web/samples/m03_arithmetic.rs");
 const M03_FN_CALL: &str = include_str!("../web/samples/m03_fn_call.rs");
 const M07_BOX: &str = include_str!("../web/samples/m07_box.rs");
 const M08_2_DEADLOCK: &str = include_str!("../web/samples/m08_2_deadlock.rs");
+const M08_2_COUNTER: &str = include_str!("../web/samples/m08_2_counter.rs");
 
 /// Same source + same seed → byte-identical event stream on every run.
 /// Covers B-M082-1, SC-003.
@@ -59,6 +60,26 @@ fn different_seed_divergence() {
     assert!(
         diverged_seeds > 0,
         "expected at least one of seeds 1..=20 to produce a trace different from seed=0; got {diverged_seeds} divergent seeds (the scheduler appears purely deterministic — multi-Ready picks may not be exercising the PRNG)"
+    );
+}
+
+/// Race-for-lock sample: two threads each try to lock the same Arc<Mutex>.
+/// The seed determines which thread acquires first; the other parks until
+/// the first releases. The trace MUST diverge widely across seeds (this
+/// is the strongest divergence signal — every Ready-set decision matters).
+#[test]
+fn counter_sample_diverges_across_seeds() {
+    let baseline = run_pipeline(M08_2_COUNTER, 0).expect("counter sample compiles");
+    let mut divergent = 0;
+    for seed in 1u32..=20 {
+        let trace = run_pipeline(M08_2_COUNTER, seed).expect("compiles");
+        if trace != baseline {
+            divergent += 1;
+        }
+    }
+    assert!(
+        divergent >= 10,
+        "expected ≥ 10 of 20 seeds to diverge from seed=0 on the counter-race sample; got {divergent}"
     );
 }
 
