@@ -103,6 +103,13 @@ struct Evaluator<'a> {
     /// containing stmt's SlotWrite (i.e. at the same cursor step where the
     /// new binding actually has the read value) rather than before.
     pending_notes: Vec<MemEvent>,
+    /// **Post-M08 polish**: spawned threads queued to run at the END of
+    /// the current statement (rather than inline at spawn time). Lets
+    /// the let-binding's `SlotAlloc h + SlotWrite h` for the JoinHandle
+    /// fire BEFORE the closure body runs, so `h: JoinHandle(#N)` is
+    /// visible in the spawning thread's frame at the spawn step.
+    /// Drained by `eval_stmt` after each statement completes.
+    pending_thread_runs: Vec<crate::event::ThreadId>,
     /// **M07**: heap state — live allocations indexed by HeapAddr.
     heap: HeapState,
     /// **M07**: monotonic counter for heap addresses. One addr per logical
@@ -197,6 +204,20 @@ enum HeapObject {
     #[allow(dead_code)] // fields populated by later M08 tasks (Mutex eval).
     Mutex {
         value: Box<Value>,
+        holder: Option<crate::event::ThreadId>,
+        waiters: Vec<crate::event::ThreadId>,
+    },
+    /// **Post-M08 polish**: fused `Arc<Mutex<T>>` heap block. When
+    /// `Arc::new(Mutex::new(v))` runs, the Mutex's allocation is TAKEN
+    /// OVER by the Arc (matches Rust's actual memory layout — Arc<T>
+    /// stores T inline, so Arc<Mutex<T>> is ONE allocation with both
+    /// the inner T and the lock state, plus the Arc refcount). Avoids
+    /// the double-block display issue where Arc and Mutex looked like
+    /// two separate heap regions.
+    #[allow(dead_code)]
+    ArcMutex {
+        value: Box<Value>,
+        strong_count: u32,
         holder: Option<crate::event::ThreadId>,
         waiters: Vec<crate::event::ThreadId>,
     },
@@ -351,6 +372,11 @@ fn heap_object_bytes(obj: &HeapObject) -> (u32, u32) {
             let s = value_size_bytes(value) + 8;
             (s, s)
         }
+        // **Post-M08**: fused Arc<Mutex<T>> — inner + lock state + refcount.
+        HeapObject::ArcMutex { value, .. } => {
+            let s = value_size_bytes(value) + 12;
+            (s, s)
+        }
     }
 }
 
@@ -390,18 +416,20 @@ enum ThreadStatus {
 #[allow(dead_code)] // fields populated by later M08 tasks (thread::spawn).
 struct QueuedBody<'a> {
     body: &'a ast::Block,
-    /// Captured bindings: (BindingId from spawning scope, name, value, type)
-    /// tuples — snapshotted at `thread::spawn` from the spawning thread's
-    /// locals. The BindingId is the ORIGINAL binding's id from the
-    /// spawning scope; `closure_captures` records these so the closure
-    /// body's `Expr::Ident` uses resolve to the same BindingIds. In the
-    /// spawned thread's frame stack, each capture becomes a LocalSlot
-    /// keyed by this same BindingId — `lookup_local_value(binding_id)`
-    /// then finds the captured value seamlessly.
-    captures: Vec<(BindingId, String, Value, Ty)>,
+    /// Captured bindings: (BindingId, source SlotId in the spawning thread,
+    /// name, value, type) tuples — snapshotted at `thread::spawn`.
+    /// `start_queued_thread` uses `source_slot` to emit a `SlotMove`
+    /// + pedagogical Note right after the closure's own SlotAlloc/SlotWrite
+    /// for the capture — pairs the source-grays-out transition with the
+    /// destination-appears transition at the same cursor stop.
+    captures: Vec<(BindingId, SlotId, String, Value, Ty)>,
     /// Span of the closure expression — used for the spawned thread's
     /// initial FrameEnter span.
     span: Span,
+    /// The thread that did the `thread::spawn` call — needed to mark
+    /// its source LocalSlots as moved when `start_queued_thread` runs
+    /// (so drop_current_scope on the spawning thread skips them).
+    spawning_thread: crate::event::ThreadId,
 }
 
 struct Frame {
@@ -430,6 +458,14 @@ struct LocalSlot {
     slot_id: SlotId,
     value: Value,
     decl_span: Span,
+    /// **Post-M08 polish**: `true` once the binding has been moved (e.g.
+    /// captured by a `move` closure). The slot remains on the stack
+    /// (its pointer-bytes persist per the M03.1 "memory persists until
+    /// reused" principle) but the type-system no longer permits use of
+    /// the binding, and Drop is NOT run at scope exit (ownership
+    /// transferred to the new owner, who runs Drop in their scope).
+    /// The UI grays out moved slots with a `<moved>` annotation.
+    moved: bool,
 }
 
 impl<'a> Evaluator<'a> {
@@ -564,6 +600,7 @@ impl<'a> Evaluator<'a> {
             next_frame_id: 0,
             next_borrow_id: 0,
             pending_notes: Vec::new(),
+            pending_thread_runs: Vec::new(),
             heap: HeapState::new(),
             next_heap_addr: 0,
             heap_generations: std::collections::HashMap::new(),
@@ -596,21 +633,33 @@ impl<'a> Evaluator<'a> {
     /// the UI's heap-block label updates at this cursor step. Mirrors
     /// the existing M07 vec_push in-place-update pattern.
     fn refresh_arc_display(&mut self, addr: crate::event::HeapAddr, span: Span) {
-        let (display, size) = if let Some(HeapObject::Arc { value, strong_count }) =
-            self.heap.objects.get(&addr)
-        {
-            let inner_ty_name = match value.as_ref() {
-                Value::Int { kind, .. } => kind.name().to_owned(),
-                Value::Float { kind, .. } => kind.name().to_owned(),
-                Value::Bool(_) => "bool".to_owned(),
-                _ => "?".to_owned(),
-            };
-            let value_str = render_value_for_note(value);
-            let display = format!("Arc<{inner_ty_name}> = {value_str} [refs: {strong_count}]");
-            let size = value_size_bytes(value) + 4;
-            (display, size)
-        } else {
-            return;
+        let (display, size) = match self.heap.objects.get(&addr) {
+            Some(HeapObject::Arc { value, strong_count }) => {
+                let inner_ty_name = match value.as_ref() {
+                    Value::Int { kind, .. } => kind.name().to_owned(),
+                    Value::Float { kind, .. } => kind.name().to_owned(),
+                    Value::Bool(_) => "bool".to_owned(),
+                    _ => "?".to_owned(),
+                };
+                let value_str = render_value_for_note(value);
+                let display = format!("Arc<{inner_ty_name}> = {value_str} [refs: {strong_count}]");
+                let size = value_size_bytes(value) + 4;
+                (display, size)
+            }
+            // Post-M08: fused Arc<Mutex<T>> — combined refcount + lock state display.
+            Some(HeapObject::ArcMutex { value, strong_count, holder, .. }) => {
+                let value_str = render_value_for_note(value);
+                let lock_suffix = match holder {
+                    Some(tid) => format!(" [locked by #{}]", tid.0),
+                    None => " [free]".to_owned(),
+                };
+                let display = format!(
+                    "Arc<Mutex> = {value_str} [refs: {strong_count}]{lock_suffix}"
+                );
+                let size = value_size_bytes(value) + 12;
+                (display, size)
+            }
+            _ => return,
         };
         self.events.push(MemEvent::HeapRealloc {
             from: addr,
@@ -669,7 +718,7 @@ impl<'a> Evaluator<'a> {
         let obj = self.heap.objects.get_mut(&addr)
             .expect("mutex_lock: heap object present");
         match obj {
-            HeapObject::Mutex { holder, .. } => {
+            HeapObject::Mutex { holder, .. } | HeapObject::ArcMutex { holder, .. } => {
                 if holder.is_some() {
                     // M08 v1 limitation: contention doesn't park (would
                     // need async/continuations). Panic with clear message
@@ -682,10 +731,23 @@ impl<'a> Evaluator<'a> {
                 }
                 *holder = Some(current);
             }
-            _ => panic!("mutex_lock: heap object is not Mutex"),
+            _ => panic!("mutex_lock: heap object is not Mutex or ArcMutex"),
         }
         self.events.push(MemEvent::LockAcquire { addr, span });
         self.refresh_mutex_display(addr, span);
+        // **Post-M08 polish**: pedagogical Note explaining the lock
+        // acquire. Coalesces with the LockAcquire → HeapRealloc atom
+        // via the existing marker→display+Note coalescer, so the user
+        // sees the badge flip red AND reads the explanation at one step.
+        self.events.push(MemEvent::Note {
+            kind: NoteKind::Info,
+            message: format!(
+                "Thread #{tid} ACQUIRED the lock on heap #{addr_num}. While the guard returned by `.lock()` is alive, this thread has EXCLUSIVE access to the inner value — other threads attempting `.lock()` would park until the guard drops.",
+                tid = current.0,
+                addr_num = addr.0,
+            ),
+            span,
+        });
         Value::MutexGuard { addr }
     }
 
@@ -759,25 +821,37 @@ impl<'a> Evaluator<'a> {
     /// holder change. Similar to refresh_arc_display but for Mutex's
     /// `[locked by #N]` suffix.
     fn refresh_mutex_display(&mut self, addr: crate::event::HeapAddr, span: Span) {
-        let (display, size) = if let Some(HeapObject::Mutex { value, holder, .. }) =
-            self.heap.objects.get(&addr)
-        {
-            let inner_ty_name = match value.as_ref() {
-                Value::Int { kind, .. } => kind.name().to_owned(),
-                Value::Float { kind, .. } => kind.name().to_owned(),
-                Value::Bool(_) => "bool".to_owned(),
-                _ => "?".to_owned(),
-            };
-            let value_str = render_value_for_note(value);
-            let lock_suffix = match holder {
-                Some(tid) => format!(" [locked by #{}]", tid.0),
-                None => String::new(),
-            };
-            let display = format!("Mutex<{inner_ty_name}> = {value_str}{lock_suffix}");
-            let size = value_size_bytes(value) + 8;
-            (display, size)
-        } else {
-            return;
+        let (display, size) = match self.heap.objects.get(&addr) {
+            Some(HeapObject::Mutex { value, holder, .. }) => {
+                let inner_ty_name = match value.as_ref() {
+                    Value::Int { kind, .. } => kind.name().to_owned(),
+                    Value::Float { kind, .. } => kind.name().to_owned(),
+                    Value::Bool(_) => "bool".to_owned(),
+                    _ => "?".to_owned(),
+                };
+                let value_str = render_value_for_note(value);
+                let lock_suffix = match holder {
+                    Some(tid) => format!(" [locked by #{}]", tid.0),
+                    None => " [free]".to_owned(),
+                };
+                let display = format!("Mutex<{inner_ty_name}> = {value_str}{lock_suffix}");
+                let size = value_size_bytes(value) + 8;
+                (display, size)
+            }
+            // Post-M08: fused Arc<Mutex<T>>. Same display as refresh_arc_display.
+            Some(HeapObject::ArcMutex { value, strong_count, holder, .. }) => {
+                let value_str = render_value_for_note(value);
+                let lock_suffix = match holder {
+                    Some(tid) => format!(" [locked by #{}]", tid.0),
+                    None => " [free]".to_owned(),
+                };
+                let display = format!(
+                    "Arc<Mutex> = {value_str} [refs: {strong_count}]{lock_suffix}"
+                );
+                let size = value_size_bytes(value) + 12;
+                (display, size)
+            }
+            _ => return,
         };
         self.events.push(MemEvent::HeapRealloc {
             from: addr,
@@ -846,28 +920,68 @@ impl<'a> Evaluator<'a> {
         // BindingId so the closure body's `Expr::Ident` uses (which the
         // resolver mapped to those outer BindingIds) lookup the captured
         // slot via the standard `lookup_local_value(binding_id)` path.
-        for (cap_binding, cap_name, cap_value, cap_ty) in queued.captures {
-            let slot_id = self.alloc_slot_id();
+        // **Post-M08 polish**: immediately after each capture's
+        // SlotAlloc/SlotWrite, emit `SlotMove` + a pedagogical Note +
+        // flip the spawning thread's source LocalSlot to `moved: true`.
+        // This pairs source-grays-out with destination-appears at one
+        // logical cursor stop (the existing SlotAlloc→SlotWrite and
+        // marker→Note coalescers compress them together).
+        let spawning_thread = queued.spawning_thread;
+        for (cap_binding, source_slot, cap_name, cap_value, cap_ty) in queued.captures {
+            let dest_slot = self.alloc_slot_id();
             self.events.push(MemEvent::SlotAlloc {
-                slot_id,
+                slot_id: dest_slot,
                 name: cap_name.clone(),
                 ty: cap_ty,
                 span: queued.span,
             });
             self.events.push(MemEvent::SlotWrite {
-                slot_id,
+                slot_id: dest_slot,
                 value: cap_value.clone(),
                 span: queued.span,
             });
+            // Push the LocalSlot into the spawned thread's scope.
             let ts = self.threads.get_mut(&tid).unwrap();
             let scope = ts.frames.last_mut().unwrap().scopes.last_mut().unwrap();
             scope.locals.push(LocalSlot {
                 binding_id: cap_binding,
-                slot_id,
-                value: cap_value,
+                slot_id: dest_slot,
+                value: cap_value.clone(),
                 decl_span: queued.span,
+                moved: false,
             });
-            let _ = cap_name; // recorded in SlotAlloc event
+            // Emit SlotMove from the SOURCE slot in the spawning thread —
+            // pairs the source-grays transition with the destination-
+            // appears transition (same coalesced step in the UI).
+            self.events.push(MemEvent::SlotMove {
+                from: source_slot,
+                to: dest_slot,
+                value: cap_value.clone(),
+                span: queued.span,
+            });
+            // Mark the source LocalSlot as moved in the spawning thread
+            // so its drop_current_scope skips the unconditional Drop
+            // (the new owner — this spawned thread — will run Drop
+            // when its body's scope exits).
+            if let Some(spawning_ts) = self.threads.get_mut(&spawning_thread) {
+                for frame in spawning_ts.frames.iter_mut() {
+                    for scope in frame.scopes.iter_mut() {
+                        for local in scope.locals.iter_mut() {
+                            if local.binding_id == cap_binding {
+                                local.moved = true;
+                            }
+                        }
+                    }
+                }
+            }
+            // Pedagogical Note explaining the move.
+            self.events.push(MemEvent::Note {
+                kind: NoteKind::Info,
+                message: format!(
+                    "`{cap_name}` is MOVED into the spawned closure (`move ||`). The source slot on the spawning thread's frame stays visible — its bytes physically persist — but the binding is no longer usable (Rust's compiler prevents further references). Drop will NOT run on the source; the new owner here runs Drop when its scope exits.",
+                ),
+                span: queued.span,
+            });
         }
     }
 
@@ -1392,6 +1506,7 @@ impl<'a> Evaluator<'a> {
                     slot_id,
                     value,
                     decl_span,
+                    moved: false,
                 });
         }
 
@@ -1486,6 +1601,15 @@ impl<'a> Evaluator<'a> {
         // (currently none in M07), just SlotDrop. Copy locals: nothing.
         let _ = scope.heap_allocs; // tracked redundantly; iteration via locals is the source of truth.
         for local in scope.locals.into_iter().rev() {
+            // **Post-M08 polish**: moved bindings skip Drop — ownership
+            // has been transferred (e.g. by `move ||` capture), so the
+            // new owner's scope-exit drop is responsible for the
+            // resource. Without this, Arc::clone refcount math goes
+            // wrong: main drops m2 → refcount-- → closure drops m2 →
+            // refcount-- → double-decrement.
+            if local.moved {
+                continue;
+            }
             let ty = self
                 .lookup_var_ty(local.binding_id)
                 .expect("var ty after typeck");
@@ -1511,35 +1635,83 @@ impl<'a> Evaluator<'a> {
                                 if *strong_count > 0 { *strong_count -= 1; }
                                 *strong_count
                             }
+                            // Post-M08: ArcMutex carries refcount too.
+                            Some(HeapObject::ArcMutex { strong_count, .. }) => {
+                                if *strong_count > 0 { *strong_count -= 1; }
+                                *strong_count
+                            }
                             _ => 0, // shouldn't happen
                         }
                     };
                     self.events.push(MemEvent::ArcDrop { addr, span: end_span });
                     self.refresh_arc_display(addr, end_span);
                     if new_count == 0 {
+                        // Last-reference drop: explain the free.
                         self.events.push(MemEvent::Note {
                             kind: NoteKind::Info,
                             message: format!(
-                                "`{name}` goes out of scope: last Arc reference dropped, refcount → 0, freeing heap addr {}",
+                                "`{name}` goes out of scope: last Arc reference dropped, refcount → 0 — heap addr #{} is freed.",
                                 addr.0,
                             ),
                             span: end_span,
                         });
                         self.free_heap(addr, end_span);
+                    } else {
+                        // Non-final drop: explain why the heap STAYS alive.
+                        self.events.push(MemEvent::Note {
+                            kind: NoteKind::Info,
+                            message: format!(
+                                "`{name}` goes out of scope: refcount on heap #{addr_num} → {new_count} (still {new_count} owner{plural}). The heap stays alive — Drop only frees when the count reaches 0.",
+                                addr_num = addr.0,
+                                plural = if new_count == 1 { "" } else { "s" },
+                            ),
+                            span: end_span,
+                        });
                     }
                     let _ = ty;
                     continue;
                 }
                 Value::MutexGuard { addr } => {
                     let addr = *addr;
+                    // Snapshot the previous holder for the Note — it's
+                    // about to be cleared by the release.
+                    let prev_holder = match self.heap.objects.get(&addr) {
+                        Some(HeapObject::Mutex { holder, .. })
+                        | Some(HeapObject::ArcMutex { holder, .. }) => *holder,
+                        _ => None,
+                    };
                     // Clear the holder + emit LockRelease. No HeapFree —
                     // the mutex's underlying allocation stays alive (owned
                     // by the Mutex/Arc binding, not the guard).
-                    if let Some(HeapObject::Mutex { holder, .. }) = self.heap.objects.get_mut(&addr) {
-                        *holder = None;
+                    // Post-M08: also handles fused Arc<Mutex<T>> blocks
+                    // (HeapObject::ArcMutex) whose holder lives on the
+                    // same heap object.
+                    match self.heap.objects.get_mut(&addr) {
+                        Some(HeapObject::Mutex { holder, .. }) => *holder = None,
+                        Some(HeapObject::ArcMutex { holder, .. }) => *holder = None,
+                        _ => {}
                     }
                     self.events.push(MemEvent::LockRelease { addr, span: end_span });
                     self.refresh_mutex_display(addr, end_span);
+                    // **Post-M08 polish**: pedagogical Note explaining
+                    // the unlock. The guard's Drop is what releases the
+                    // lock — there's no explicit `.unlock()` in Rust;
+                    // ownership of the guard going out of scope IS the
+                    // release mechanism. Coalesces into the same step
+                    // as LockRelease → HeapRealloc → Note via the
+                    // existing heap-marker coalescer.
+                    let tid_str = match prev_holder {
+                        Some(tid) => format!("Thread #{}", tid.0),
+                        None => "this thread".to_owned(),
+                    };
+                    self.events.push(MemEvent::Note {
+                        kind: NoteKind::Info,
+                        message: format!(
+                            "`{name}` (MutexGuard) goes out of scope: Drop runs, RELEASING the lock on heap #{addr_num}. {tid_str} no longer holds it. There's no explicit `.unlock()` in Rust — the lock is released automatically when the guard drops, making it impossible to forget to unlock.",
+                            addr_num = addr.0,
+                        ),
+                        span: end_span,
+                    });
                     let _ = ty;
                     continue;
                 }
@@ -1665,6 +1837,29 @@ impl<'a> Evaluator<'a> {
         if !self.halted {
             self.flush_pending_notes();
         }
+        // **Post-M08 polish**: drain `pending_thread_runs` AFTER the
+        // statement's main effects (including the let-binding's SlotAlloc
+        // + SlotWrite for the JoinHandle). The spawned thread's body
+        // then runs at the next cursor step(s), with `h: JoinHandle(#N)`
+        // already visible in the spawning thread's frame card.
+        if !self.halted {
+            let to_run: Vec<crate::event::ThreadId> =
+                std::mem::take(&mut self.pending_thread_runs);
+            let resume = self.current_thread_id;
+            for tid in to_run {
+                if self.halted { break; }
+                // Use the statement's tail span as the switch span;
+                // we don't have a more precise one at this layer.
+                let switch_span = match stmt {
+                    ast::Stmt::Let(let_stmt) => let_stmt.span,
+                    ast::Stmt::Expr(e) => e.span(),
+                    ast::Stmt::Assign { span, .. } => *span,
+                };
+                self.switch_to(tid, switch_span);
+                self.run_queued_thread_to_done(tid);
+                self.switch_to(resume, switch_span);
+            }
+        }
         let _ = result;
     }
 
@@ -1740,6 +1935,7 @@ impl<'a> Evaluator<'a> {
                         slot_id,
                         value,
                         decl_span: let_stmt.span,
+                        moved: false,
                     });
             }
             ast::Stmt::Expr(expr) => {
@@ -2497,6 +2693,53 @@ impl<'a> Evaluator<'a> {
             ["Arc", "new"] => {
                 let v = self.eval_expr(&args[0]);
                 if self.halted { return Value::Unit; }
+                // **Post-M08 polish**: `Arc::new(Mutex::new(...))` should
+                // produce ONE heap block (Arc owns the Mutex inline,
+                // matching Rust's actual memory layout). Detect the
+                // Value::Mutex input and FUSE by taking over the existing
+                // Mutex heap block — transform its HeapObject from Mutex
+                // to ArcMutex; emit HeapRealloc to update display in place.
+                // Avoids the misleading "two heap blocks with a Mutex →
+                // heap[N] pointer" visualization.
+                if let Value::Mutex { addr: m_addr } = v {
+                    // Take over the existing Mutex heap block.
+                    let (inner_value, holder, waiters) = match self.heap.objects.shift_remove(&m_addr) {
+                        Some(HeapObject::Mutex { value, holder, waiters }) => {
+                            (value, holder, waiters)
+                        }
+                        _ => panic!("Arc::new(Mutex<...>): expected HeapObject::Mutex at {m_addr:?}"),
+                    };
+                    let inner_size = value_size_bytes(&inner_value) + 12;
+                    let value_str = render_value_for_note(&inner_value);
+                    let lock_suffix = match &holder {
+                        Some(tid) => format!(" [locked by #{}]", tid.0),
+                        None => " [free]".to_owned(),
+                    };
+                    let display = format!("Arc<Mutex> = {value_str} [refs: 1]{lock_suffix}");
+                    self.heap.objects.insert(m_addr, HeapObject::ArcMutex {
+                        value: inner_value,
+                        strong_count: 1,
+                        holder,
+                        waiters,
+                    });
+                    self.events.push(MemEvent::HeapRealloc {
+                        from: m_addr,
+                        to: m_addr,
+                        new_size: inner_size,
+                        new_used: inner_size,
+                        new_display: display,
+                        span,
+                    });
+                    self.events.push(MemEvent::Note {
+                        kind: NoteKind::Info,
+                        message: format!(
+                            "Arc::new(Mutex::new(...)) FUSES the two into one heap block: the Mutex's allocation is taken over by the Arc (refcount 1, lock free). Arc<T> stores T INLINE — `Arc<Mutex<T>>` is ONE allocation containing the inner value, the lock state, AND the refcount.",
+                        ),
+                        span,
+                    });
+                    return Value::Arc { addr: m_addr };
+                }
+                // Standard case: non-Mutex inner value.
                 let inner_size = value_size_bytes(&v);
                 let inner_ty_name = match &v {
                     Value::Int { kind, .. } => kind.name().to_owned(),
@@ -2512,6 +2755,16 @@ impl<'a> Evaluator<'a> {
                     inner_size + 4, // inner + 4 bytes refcount metadata
                     span,
                 );
+                // M08: explain the initial Arc state. The refcount of 1 = a single
+                // owner; subsequent Arc::clone calls share this allocation by
+                // incrementing the count rather than copying the value.
+                self.events.push(MemEvent::Note {
+                    kind: NoteKind::Info,
+                    message: format!(
+                        "Arc::new allocates {value_str} on the heap with refcount 1 — `a` is the single owner. Subsequent `Arc::clone(&a)` will SHARE this allocation (no copy) by incrementing the count.",
+                    ),
+                    span,
+                });
                 Value::Arc { addr }
             }
             // **M08**: `Arc::clone(&a)` — eval inner, expect Value::Ref
@@ -2532,15 +2785,34 @@ impl<'a> Evaluator<'a> {
                     }
                     _ => panic!("Arc::clone arg must be &Arc<T>"),
                 };
-                // Increment refcount in the heap object.
-                if let Some(HeapObject::Arc { strong_count, .. }) = self.heap.objects.get_mut(&addr) {
-                    *strong_count += 1;
-                } else {
-                    panic!("Arc::clone: heap object missing or not Arc at {addr:?}");
-                }
+                // Increment refcount in the heap object. Handles both bare
+                // HeapObject::Arc and fused HeapObject::ArcMutex.
+                let new_count = match self.heap.objects.get_mut(&addr) {
+                    Some(HeapObject::Arc { strong_count, .. }) => {
+                        *strong_count += 1;
+                        *strong_count
+                    }
+                    Some(HeapObject::ArcMutex { strong_count, .. }) => {
+                        *strong_count += 1;
+                        *strong_count
+                    }
+                    _ => panic!("Arc::clone: heap object missing or not Arc at {addr:?}"),
+                };
                 self.events.push(MemEvent::ArcClone { addr, span });
                 // Refresh the heap object's display string with the new refcount.
                 self.refresh_arc_display(addr, span);
+                // M08: explain the share-by-refcount semantics. The clone
+                // bumps the count rather than duplicating the value — both
+                // bindings now point at the SAME heap allocation.
+                self.events.push(MemEvent::Note {
+                    kind: NoteKind::Info,
+                    message: format!(
+                        "Arc::clone bumps refcount on heap #{addr_num} from {prev} → {new_count}. The heap value is NOT copied — both Arc bindings now SHARE this allocation. Drop will only free when the count reaches 0.",
+                        addr_num = addr.0,
+                        prev = new_count - 1,
+                    ),
+                    span,
+                });
                 Value::Arc { addr }
             }
             // **M08**: `Mutex::new(v)` — allocate `HeapObject::Mutex` with
@@ -2586,7 +2858,12 @@ impl<'a> Evaluator<'a> {
                     .get(&closure_span)
                     .cloned()
                     .unwrap_or_default();
-                let mut captures: Vec<(BindingId, String, Value, Ty)> = Vec::new();
+                // **Post-M08 polish**: build captures with source slot
+                // ids, so `start_queued_thread` can emit the per-capture
+                // `SlotMove` right after the destination's SlotAlloc/SlotWrite.
+                // This pairs the source-grays transition with the
+                // destination-appears transition at one logical step.
+                let mut captures: Vec<(BindingId, SlotId, String, Value, Ty)> = Vec::new();
                 for bid in cap_bindings {
                     let decl = self.resolution.bindings.get(&bid)
                         .expect("capture binding resolved");
@@ -2595,8 +2872,11 @@ impl<'a> Evaluator<'a> {
                         .expect("captured binding has a value in spawning thread");
                     let ty = self.lookup_var_ty(bid)
                         .expect("captured binding has a Ty after typeck");
-                    captures.push((bid, name, value, ty));
+                    let source_slot = self.lookup_local_slot(bid)
+                        .expect("captured binding has a slot in spawning thread");
+                    captures.push((bid, source_slot, name, value, ty));
                 }
+                let spawning_thread = self.current_thread_id;
                 // Allocate a fresh ThreadId.
                 let new_tid = crate::event::ThreadId(self.next_thread_id);
                 self.next_thread_id += 1;
@@ -2608,11 +2888,36 @@ impl<'a> Evaluator<'a> {
                         body,
                         captures,
                         span: closure_span,
+                        spawning_thread,
                     }),
                 });
-                // Emit ThreadSpawn (current thread continues — no switch).
+                // Emit ThreadSpawn.
                 self.events.push(MemEvent::ThreadSpawn {
                     thread_id: new_tid.0,
+                    span,
+                });
+                // **Post-M08 polish**: queue the spawned thread to run at
+                // the END of the current statement, rather than inline.
+                // The let-binding's own `SlotAlloc h + SlotWrite h` for
+                // the returned JoinHandle then fires BEFORE the closure
+                // body runs — so `h: JoinHandle(#N)` is visible in the
+                // spawning thread's frame at the spawn step, matching
+                // the user's mental model "the let-binding completes,
+                // THEN the thread runs". `eval_stmt` drains
+                // `pending_thread_runs` after each stmt completes.
+                self.pending_thread_runs.push(new_tid);
+                let _ = spawning_thread; // run-deferred path — no inline switch here
+                // Pedagogical Note explaining the JoinHandle return.
+                // Coalesces with the subsequent SlotAlloc h + SlotWrite h
+                // via the existing SlotAlloc→SlotWrite + adjacent-Note
+                // coalescers, so the binding appearance and the
+                // explanation land at one cursor stop.
+                self.events.push(MemEvent::Note {
+                    kind: NoteKind::Info,
+                    message: format!(
+                        "`thread::spawn` returns a `JoinHandle` representing the running thread #{tid}. Calling `.join()` on it later WAITS for the thread to finish. Without `.join()`, the spawned thread runs to completion independently — the parent doesn't wait.",
+                        tid = new_tid.0,
+                    ),
                     span,
                 });
                 Value::JoinHandle { thread_id: new_tid }
@@ -2684,11 +2989,14 @@ impl<'a> Evaluator<'a> {
                 self.mutex_lock(*addr, span)
             }
             // **M08**: Arc auto-deref for method dispatch — `arc_of_mutex.lock()`.
-            // Read the Arc's HeapObject, inspect the inner Value, recursively
-            // dispatch as if the receiver were that inner Value. Only matters
-            // for `.lock()` in M08 (no other Arc-wrapped types appear).
+            // Post-M08 fusion: when the Arc heap block IS a fused
+            // ArcMutex, dispatch lock directly on the same addr (no
+            // inner-addr indirection — the lock state is on the same
+            // block). Fall back to the pre-fusion indirection path for
+            // the legacy two-block shape.
             (Value::Arc { addr }, "lock") => {
-                let inner_addr = match self.heap.objects.get(addr) {
+                let target_addr = match self.heap.objects.get(addr) {
+                    Some(HeapObject::ArcMutex { .. }) => *addr,
                     Some(HeapObject::Arc { value, .. }) => match value.as_ref() {
                         Value::Mutex { addr: m_addr } => *m_addr,
                         other => panic!(
@@ -2697,7 +3005,7 @@ impl<'a> Evaluator<'a> {
                     },
                     _ => panic!("Value::Arc addr not found in heap"),
                 };
-                self.mutex_lock(inner_addr, span)
+                self.mutex_lock(target_addr, span)
             }
             // **M08**: `handle.join()` — switch to the joined thread if not
             // yet done, run it, return. Returns unit.
@@ -3687,6 +3995,21 @@ fn heap_object_display(obj: &HeapObject) -> String {
                 None => String::new(),
             };
             format!("Mutex = {}{}", render_value_for_note(value), lock_suffix)
+        }
+        // **Post-M08**: fused Arc<Mutex<T>> display — combines refcount AND
+        // lock state in one heap block label. UI extracts both via the
+        // suffix parsers + the new mutex_state field.
+        HeapObject::ArcMutex { value, strong_count, holder, .. } => {
+            let lock_suffix = match holder {
+                Some(tid) => format!(" [locked by #{}]", tid.0),
+                None => " [free]".to_owned(),
+            };
+            format!(
+                "Arc<Mutex> = {} [refs: {}]{}",
+                render_value_for_note(value),
+                strong_count,
+                lock_suffix,
+            )
         }
     }
 }

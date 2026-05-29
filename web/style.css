@@ -585,15 +585,72 @@ main > section:last-child {
 }
 
 .thread-column {
-  flex: 1 1 0;
-  min-width: 240px;
-  max-width: 360px;
+  /* **Post-M08**: widen the cap (was 360px which clipped MutexGuard /
+     fat-pointer value cells) and let columns shrink only as far as their
+     content demands. The outer `.thread-columns` container scrolls
+     horizontally past 3 columns so wider cards never compress. */
+  flex: 1 1 auto;
+  min-width: 280px;
+  max-width: 520px;
   display: flex;
   flex-direction: column-reverse; /* innermost frame on top (pre-M08 behavior) */
   gap: 0.5rem;
   padding: 0.5rem;
   border: 1px dashed transparent;
   border-radius: 4px;
+  /* Allow frame cards inside to overflow vertically (long value cells
+     wrap rather than truncate). */
+  min-height: 0;
+}
+
+/* **Post-M08**: inside narrow thread columns, the pre-M08 single-line
+   3-column grid (name | type | value) crushes the value cell when types
+   are long (`Arc<Mutex<i32>>`, `MutexGuard<i32>`, etc). Switch to a
+   STACKED layout per slot — `name : type` on line 1, value on a second
+   line indented under it. Gives the value the full column width and
+   reads more naturally for fat-pointer / heap-owning values. The
+   single-thread fall-back path keeps the legacy grid layout untouched. */
+.thread-column .frame-card .slots {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.thread-column .slot-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.05rem;
+  padding-left: 0.1rem;
+  /* `slot-row::before` from the grid-mode siblings doesn't apply here;
+     the row is now a normal block. */
+}
+
+.thread-column .slot-row .slot-name {
+  font-weight: 600;
+  display: inline;
+}
+
+.thread-column .slot-row .slot-ty {
+  color: var(--muted);
+  display: inline;
+  margin-left: 0.1rem;
+}
+
+.thread-column .slot-row .slot-value {
+  display: block;
+  margin-left: 1rem;
+  color: var(--text);
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  min-width: 0;
+}
+
+/* Hide the value line entirely when there's nothing to display (pending
+   placeholder is rendered via ::before — the empty cell would otherwise
+   reserve a row of vertical space). Keep .slot-pending visible because
+   it carries the `?` indicator. */
+.thread-column .slot-row .slot-value:empty:not(.slot-pending) {
+  display: none;
 }
 
 /* M08: only animate on first appearance. JS adds .thread-new for one
@@ -873,6 +930,52 @@ main > section:last-child {
   color: #8a4fb4;
   font-weight: 600;
   margin-left: 0.3rem;
+}
+
+/* **Post-M08 polish**: moved bindings stay on the frame card with
+   grayed-out styling. Rust's move semantics: the stack bytes physically
+   persist; only the binding becomes unusable (compiler prevents further
+   references; the new owner runs Drop in their scope). Matches the
+   project's M03.1 "memory persists until reused" principle that already
+   grays out returned frames and freed-heap pointers. */
+.slot-row.slot-moved .slot-name,
+.slot-row.slot-moved .slot-ty {
+  color: var(--muted);
+  text-decoration: line-through;
+  opacity: 0.6;
+}
+
+.slot-row.slot-moved .slot-value.slot-moved-value {
+  color: var(--muted);
+  font-style: italic;
+  opacity: 0.7;
+}
+
+/* **Post-M08 polish**: Mutex lock-state badge on Mutex / Arc<Mutex<T>>
+   heap blocks. Green pill when free; red when locked by a thread.
+   Appended to the heap-block addr line alongside the refcount. */
+.heap-box .heap-mutex-state {
+  display: inline-block;
+  margin-left: 0.3rem;
+  padding: 0 5px;
+  border-radius: 8px;
+  font-size: 9px;
+  font-weight: 700;
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  letter-spacing: 0.3px;
+  vertical-align: 1px;
+}
+
+.heap-box .heap-mutex-state.mutex-free {
+  background: #d8f5d8;
+  color: #2a8a3f;
+  border: 1px solid #8fce96;
+}
+
+.heap-box .heap-mutex-state.mutex-locked {
+  background: #f7d8d8;
+  color: #b53030;
+  border: 1px solid #d88a8a;
 }
 
 #heap {

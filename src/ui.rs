@@ -97,6 +97,16 @@ pub struct StateSnapshot {
     pub position: usize,
     /// Total events in the trace.
     pub total: usize,
+    /// **Post-M08 polish**: user-visible step counter. Counts non-coalesced
+    /// positions only, so the counter advances 1-by-1 even when raw cursor
+    /// positions jump over coalesced pairs (SlotAlloc→SlotWrite,
+    /// ArcClone→HeapRealloc, etc.). Always ≤ `position`.
+    #[serde(default)]
+    pub logical_position: usize,
+    /// Total logical (user-visible) steps in the trace, after coalescing.
+    /// Always ≤ `total`. Use as the denominator for the step counter.
+    #[serde(default)]
+    pub logical_total: usize,
 }
 
 /// **M07.2**: transient "bytes copied" indication. Set on `StateSnapshot`
@@ -309,6 +319,25 @@ pub struct HeapView {
     /// blocks; serde skip-if-none keeps existing snapshots byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refcount: Option<u32>,
+    /// **Post-M08 polish**: lock state for Mutex / Arc<Mutex<T>> blocks.
+    /// `Some(Free)` → render green "🔓 free" badge; `Some(Locked { holder })`
+    /// → render red "🔒 by #N" badge. None for non-Mutex blocks.
+    /// Parsed from the heap-block display string's `[free]` / `[locked by
+    /// #N]` suffix in apply_event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutex_state: Option<MutexLockState>,
+}
+
+/// **Post-M08 polish**: Mutex lock-state for the UI badge.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum MutexLockState {
+    /// Lock is currently held — by `holder` (a ThreadId.0).
+    Locked {
+        /// `ThreadId.0` of the thread currently holding the lock.
+        holder: u32,
+    },
+    /// Lock is currently free.
+    Free,
 }
 
 /// One function-call frame's view.
@@ -373,6 +402,13 @@ pub struct SlotRowView {
     /// with `value` / `inline_cells` / `struct_view`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dyn_view: Option<DynView>,
+    /// **Post-M08 polish**: `true` once the binding has been moved (e.g.
+    /// captured by a `move ||` closure). The slot stays visible to
+    /// convey "the stack bytes physically persist" (M03.1 principle),
+    /// but JS renders it grayed-out with a `<moved>` annotation to
+    /// signal the binding is no longer usable.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub moved: bool,
 }
 
 /// **M07.4**: per-struct render data for the stack-slot visualization.
@@ -451,6 +487,107 @@ impl Cursor {
         self.position = self.position.saturating_sub(1);
     }
 
+    /// **Post-M08 polish**: returns true iff `pos` lands INSIDE a logical
+    /// "atomic event group" — multiple consecutive events that together
+    /// represent ONE user-visible step. The Player wrapper skips such
+    /// positions so step-forward / step-back move between groups rather
+    /// than between raw events.
+    ///
+    /// Recognized groups (each row = one atomic step):
+    /// - `SlotAlloc { slot_id }` → `SlotWrite { slot_id }` — let-binding init.
+    /// - `ArcClone | ArcDrop | LockAcquire | LockRelease { addr }`
+    ///   → in-place `HeapRealloc { addr }` → `Note { Info }` [→ `HeapFree`]
+    ///   — heap-state transition (marker + display refresh + pedagogical
+    ///   note + optional free-on-last-drop), all visually emerging together.
+    pub fn is_slot_alloc_write_pair_boundary(&self, pos: usize) -> bool {
+        if pos == 0 || pos >= self.trace.len() {
+            return false;
+        }
+        let prev = &self.trace[pos - 1];
+        let next = &self.trace[pos];
+
+        // (a) SlotAlloc → SlotWrite (same slot).
+        if let (
+            MemEvent::SlotAlloc { slot_id: a, .. },
+            MemEvent::SlotWrite { slot_id: w, .. },
+        ) = (prev, next)
+        {
+            if a == w {
+                return true;
+            }
+        }
+        // (a') SlotWrite → SlotMove (Post-M08): when a capture's
+        // destination SlotWrite is immediately followed by a SlotMove
+        // marking the source as moved, fold them into one logical step
+        // — pairs source-grays with destination-appears visually.
+        if matches!(prev, MemEvent::SlotWrite { .. })
+            && matches!(next, MemEvent::SlotMove { .. })
+        {
+            return true;
+        }
+        // (a'') SlotMove → Note (Post-M08): the move's pedagogical Note
+        // immediately follows. Fold it into the same step so the
+        // explanation lands at the move tick.
+        if matches!(prev, MemEvent::SlotMove { .. })
+            && matches!(next, MemEvent::Note { kind: NoteKind::Info, .. })
+        {
+            return true;
+        }
+
+        // (b) Heap marker → in-place HeapRealloc on the same addr.
+        let marker_addr = match prev {
+            MemEvent::ArcClone { addr, .. }
+            | MemEvent::ArcDrop { addr, .. }
+            | MemEvent::LockAcquire { addr, .. }
+            | MemEvent::LockRelease { addr, .. } => Some(*addr),
+            _ => None,
+        };
+        if let Some(m_addr) = marker_addr {
+            if let MemEvent::HeapRealloc { from, to, .. } = next {
+                if from == to && *from == m_addr {
+                    return true;
+                }
+            }
+        }
+
+        // (c) In-place HeapRealloc → Note { Info } when the preceding-
+        // preceding event was a heap marker — extends the atom in (b)
+        // to absorb the pedagogical note that ALWAYS follows a heap-
+        // state transition. User sees refcount/holder display update
+        // AND the explanatory note at the same cursor step.
+        if let MemEvent::HeapRealloc { from, to, .. } = prev {
+            if from == to && matches!(next, MemEvent::Note { kind: NoteKind::Info, .. }) {
+                if pos >= 2 {
+                    let pre_prev = &self.trace[pos - 2];
+                    if matches!(
+                        pre_prev,
+                        MemEvent::ArcClone { .. }
+                            | MemEvent::ArcDrop { .. }
+                            | MemEvent::LockAcquire { .. }
+                            | MemEvent::LockRelease { .. }
+                    ) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // (d) Note { Info } → HeapFree when the preceding-preceding event
+        // was an in-place HeapRealloc — final-drop case where the full
+        // sequence is ArcDrop → HeapRealloc(refs:0) → Note(explanation)
+        // → HeapFree. All four events at one cursor step.
+        if let MemEvent::Note { kind: NoteKind::Info, .. } = prev {
+            if matches!(next, MemEvent::HeapFree { .. }) && pos >= 2 {
+                let pre_prev = &self.trace[pos - 2];
+                if matches!(pre_prev, MemEvent::HeapRealloc { from, to, .. } if from == to) {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
     /// Reset the cursor to position 0.
     pub fn rewind(&mut self) {
         self.position = 0;
@@ -465,11 +602,19 @@ impl Cursor {
         }
         let last = self.position.checked_sub(1).map(|i| &self.trace[i]);
         let editor_highlight = last.map(event_span);
-        let status = last.and_then(note_to_status);
-        let pending_return = last.and_then(return_to_pending);
+        // **Post-M08 polish**: scan back through the coalesced atomic
+        // group (positions where `is_slot_alloc_write_pair_boundary`
+        // returns true) to find the most recent Note/ReturnValue/etc.
+        // event. Without this, when the cursor lands at the END of a
+        // coalesced group (e.g. after the HeapFree of an Arc last-drop
+        // chain ArcDrop → HeapRealloc → Note → HeapFree), the `last`
+        // event is HeapFree which has no Note — the explanatory Note
+        // that fired earlier in the group would be invisible.
+        let status = self.scan_back_for(self.position, note_to_status);
+        let pending_return = self.scan_back_for(self.position, return_to_pending);
         // M07.2: transient copy arrow indicator. Set only on the BytesCopy
         // cursor step; cleared on next step.
-        let pending_copy = last.and_then(copy_to_pending);
+        let pending_copy = self.scan_back_for(self.position, copy_to_pending);
         // M07.7: transient dispatch arrow indicator. Set only on a
         // FrameEnter cursor step where the entered frame's name has the
         // UFCS `<Type as Trait>::method` form AND a caller slot holds a
@@ -562,6 +707,7 @@ impl Cursor {
             used: h.used,
             freed: h.freed,
             refcount: h.refcount,
+            mutex_state: h.mutex_state,
         }).collect::<Vec<HeapView>>();
         // M07.2: clone the static region for the snapshot. Static blocks
         // persist; this is just a read-only view.
@@ -632,7 +778,52 @@ impl Cursor {
             pending_dispatch,
             position: self.position,
             total: self.trace.len(),
+            logical_position: self.logical_position(self.position),
+            logical_total: self.logical_position(self.trace.len()),
         }
+    }
+
+    /// **Post-M08 polish**: walk back from `position - 1` through the
+    /// current atomic group (consecutive boundary positions), applying
+    /// `extract` to each event. Returns the first non-None result.
+    /// Used by the snapshot's `last`-event lookups (Note status, etc.)
+    /// so events that were coalesced INTO the current step are still
+    /// visible. Without this, the explanatory Note in a coalesced
+    /// Arc/Lock atom would be invisible because the cursor lands AFTER
+    /// the final event in the atom (e.g. HeapFree, not the Note).
+    fn scan_back_for<T>(&self, position: usize, extract: impl Fn(&MemEvent) -> Option<T>) -> Option<T> {
+        if position == 0 {
+            return None;
+        }
+        let mut p = position;
+        loop {
+            p -= 1;
+            if let Some(result) = extract(&self.trace[p]) {
+                return Some(result);
+            }
+            // Stop when we reach the START of the atomic group — i.e.
+            // when position p is NOT a boundary (it's a real stopping
+            // point). If p == 0, we've scanned the whole trace; stop.
+            if p == 0 || !self.is_slot_alloc_write_pair_boundary(p) {
+                return None;
+            }
+        }
+    }
+
+    /// **Post-M08 polish**: count how many cursor stops the user would
+    /// see if they stepped from position 0 to `raw_pos` — i.e. raw
+    /// positions MINUS the count of intermediate "boundary" positions
+    /// that the Player wrapper skips over. Used to drive a user-facing
+    /// step counter that advances 1-by-1.
+    fn logical_position(&self, raw_pos: usize) -> usize {
+        let cap = raw_pos.min(self.trace.len());
+        let mut count = 0usize;
+        for p in 1..=cap {
+            if !self.is_slot_alloc_write_pair_boundary(p) {
+                count += 1;
+            }
+        }
+        count
     }
 }
 
@@ -781,6 +972,10 @@ struct HeapAllocState {
     /// **M08**: Arc refcount when this heap object is `HeapObject::Arc`;
     /// `None` for non-Arc blocks. Set by ArcClone/ArcDrop apply_event arms.
     refcount: Option<u32>,
+    /// **Post-M08 polish**: Mutex lock state when this block is a Mutex
+    /// or fused Arc<Mutex<T>>. Parsed from display-string suffixes
+    /// (`[free]` / `[locked by #N]`) at apply_event time.
+    mutex_state: Option<MutexLockState>,
 }
 
 /// **M08**: ownership flavor for an `OwningState` entry. `Box` → black
@@ -836,6 +1031,11 @@ struct LiveSlot {
     /// **M07.7**: populated when the slot holds a `Value::DynRef` /
     /// `Value::BoxDyn` — drives the fat-pointer two-cell rendering.
     dyn_view: Option<DynView>,
+    /// **Post-M08 polish**: `true` once a `SlotMove` event for this slot
+    /// has fired (e.g. binding captured by a `move ||` closure). Stays
+    /// `true` for the rest of the trace — moved bindings can't be
+    /// un-moved.
+    moved: bool,
 }
 
 fn apply_event(world: &mut World, event: &MemEvent) {
@@ -874,14 +1074,28 @@ fn apply_event(world: &mut World, event: &MemEvent) {
             // function returns — there is no physical "frame disappears"
             // event at the machine level, just storage that's now free to be
             // reused by the next call.
-            if let Some(frame) = world.frames.iter_mut().rev().find(|f| f.active) {
+            // Post-M08: route to the innermost active frame OF THE
+            // CURRENT THREAD (not the globally innermost). Otherwise a
+            // joined thread's FrameLeave could close main's frame if
+            // main is still mid-flow but other threads have intervening
+            // frames.
+            let current_tid = world.current_thread_id;
+            if let Some(frame) = world.frames.iter_mut().rev()
+                .find(|f| f.active && f.thread_id == current_tid)
+            {
                 frame.active = false;
             }
         }
         MemEvent::SlotAlloc { slot_id, name, ty, .. } => {
             // M03.1: route the alloc to the innermost ACTIVE frame; inactive
             // (grayed) frames shouldn't receive new slots.
-            if let Some(frame) = world.frames.iter_mut().rev().find(|f| f.active) {
+            // Post-M08: filter by current_thread_id so a spawned thread's
+            // captures land in its OWN frame, not in main's (which would
+            // make the captures invisible in the thread's column).
+            let current_tid = world.current_thread_id;
+            if let Some(frame) = world.frames.iter_mut().rev()
+                .find(|f| f.active && f.thread_id == current_tid)
+            {
                 frame.slots.push(LiveSlot {
                     slot_id: slot_id.0,
                     name: name.clone(),
@@ -890,6 +1104,7 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                     inline_cells: None,
                     struct_view: None,
                     dyn_view: None,
+                    moved: false,
                 });
             }
         }
@@ -1297,6 +1512,14 @@ fn apply_event(world: &mut World, event: &MemEvent) {
             } else {
                 None
             };
+            // Post-M08: detect Mutex blocks for the lock-state badge.
+            // Initial state is always Free (Mutex::new creates an
+            // unlocked mutex).
+            let mutex_state = if ty_name.starts_with("Mutex<") {
+                Some(MutexLockState::Free)
+            } else {
+                None
+            };
             let new_state = HeapAllocState {
                 addr: addr.0,
                 ty_name: ty_name.clone(),
@@ -1305,6 +1528,7 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                 used: *used,
                 freed: fragment_of.is_some(),
                 refcount,
+                mutex_state,
             };
             let inserted_at = if let Some(parent) = fragment_of {
                 // (Legacy path) Fragment: insert immediately after the parent
@@ -1341,6 +1565,7 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                     used: 0,
                     freed: true,
                     refcount: None,
+                    mutex_state: None,
                 };
                 world.heap.insert(inserted_at + 1, frag);
             }
@@ -1358,6 +1583,13 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                     if let Some(rc) = parse_refcount_suffix(new_display) {
                         h.refcount = Some(rc);
                     }
+                    // Post-M08: extract mutex lock state from display
+                    // suffix (`[free]` / `[locked by #N]`). For ArcMutex
+                    // fusion the display carries BOTH refcount and lock
+                    // state; we parse both.
+                    if let Some(state) = parse_mutex_state_suffix(new_display) {
+                        h.mutex_state = Some(state);
+                    }
                 }
             } else {
                 if let Some(h) = world.heap.iter_mut().find(|h| h.addr == from.0 && !h.freed) {
@@ -1371,6 +1603,7 @@ fn apply_event(world: &mut World, event: &MemEvent) {
                     used: *new_used,
                     freed: false,
                     refcount: None,
+                    mutex_state: None,
                 });
                 // Update owning relationships from `from` to `to`.
                 for o in world.owning.iter_mut() {
@@ -1459,8 +1692,21 @@ fn apply_event(world: &mut World, event: &MemEvent) {
             // owning-arrow lifecycle stays driven by SlotWrite of Value::Arc
             // and slot-overwrite/scope-exit on Arc bindings.
         }
-        MemEvent::SlotMove { .. }
-        | MemEvent::LockAcquire { .. }
+        // **Post-M08 polish**: SlotMove marks the source slot as moved.
+        // The slot stays on the frame card (its pointer-bytes persist
+        // per the M03.1 "memory persists until reused" principle) but
+        // gets a grayed-out `<moved>` rendering — matches Rust's actual
+        // move semantics where the stack bytes don't physically move,
+        // only the type-system's ownership tracking changes.
+        MemEvent::SlotMove { from, .. } => {
+            for frame in &mut world.frames {
+                if let Some(slot) = frame.slots.iter_mut().find(|s| s.slot_id == from.0) {
+                    slot.moved = true;
+                    break;
+                }
+            }
+        }
+        MemEvent::LockAcquire { .. }
         | MemEvent::LockRelease { .. }
         | MemEvent::ThreadPark { .. }
         | MemEvent::Note { .. }
@@ -1482,6 +1728,20 @@ fn parse_refcount_suffix(display: &str) -> Option<u32> {
     n_str.trim().parse().ok()
 }
 
+/// **Post-M08 polish**: parse the Mutex lock-state suffix from a heap-block
+/// display string. Returns `Some(Locked { holder })` for `[locked by #N]`,
+/// `Some(Free)` for `[free]`, `None` otherwise.
+fn parse_mutex_state_suffix(display: &str) -> Option<MutexLockState> {
+    if display.contains("[free]") {
+        return Some(MutexLockState::Free);
+    }
+    let start = display.rfind("[locked by #")?;
+    let end = display[start..].find(']')?;
+    let n_str = &display[start + 12..start + end];
+    let holder: u32 = n_str.trim().parse().ok()?;
+    Some(MutexLockState::Locked { holder })
+}
+
 fn frame_to_view(frame: FrameInProgress, current_frame_id: Option<u32>) -> FrameCardView {
     let current = current_frame_id == Some(frame.frame_id);
     FrameCardView {
@@ -1498,6 +1758,7 @@ fn frame_to_view(frame: FrameInProgress, current_frame_id: Option<u32>) -> Frame
                 inline_cells: s.inline_cells,
                 struct_view: s.struct_view,
                 dyn_view: s.dyn_view,
+                moved: s.moved,
             })
             .collect(),
         active: frame.active,
@@ -1863,14 +2124,26 @@ mod wasm {
         }
 
         /// Advance by one event. Returns the new state JSON.
+        /// **Post-M08 polish**: coalesce multi-event atomic groups
+        /// (SlotAlloc+SlotWrite, ArcClone+HeapRealloc+Note, etc.) so the
+        /// user sees ONE step per logical action. Loops while landing
+        /// inside an atom; the raw Cursor.step_forward stays single-event
+        /// for tests / programmatic access.
         pub fn step_forward(&mut self) -> String {
             self.cursor.step_forward();
+            while self.cursor.is_slot_alloc_write_pair_boundary(self.cursor.position) {
+                self.cursor.step_forward();
+            }
             self.state()
         }
 
         /// Step back by one event. Returns the new state JSON.
+        /// Symmetric coalesce with `step_forward`.
         pub fn step_back(&mut self) -> String {
             self.cursor.step_back();
+            while self.cursor.is_slot_alloc_write_pair_boundary(self.cursor.position) {
+                self.cursor.step_back();
+            }
             self.state()
         }
 

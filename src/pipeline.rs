@@ -2217,8 +2217,11 @@ mod tests {
     fn run_pipeline_arc_mutex() {
         let source = "fn main() { let m = Arc::new(Mutex::new(0)); let m2 = Arc::clone(&m); let h = thread::spawn(move || { let g = m2.lock(); }); { let g = m.lock(); }; h.join(); }\n";
         let events = run_pipeline(source).expect("Arc<Mutex<T>> compiles");
+        // Post-M08 fusion: Arc::new(Mutex::new(...)) produces ONE heap
+        // allocation (the Mutex's block is taken over by the Arc as a
+        // fused ArcMutex). Was 2 in M08 v1.
         let alloc_count = events.iter().filter(|e| matches!(e, crate::MemEvent::HeapAlloc { .. })).count();
-        assert_eq!(alloc_count, 2, "expected 2 HeapAllocs (Mutex + Arc)");
+        assert_eq!(alloc_count, 1, "expected 1 HeapAlloc (fused Arc<Mutex<T>>)");
         let arc_clone = events.iter().any(|e| matches!(e, crate::MemEvent::ArcClone { .. }));
         assert!(arc_clone, "expected ArcClone");
         let lock_acquires = events.iter().filter(|e| matches!(e, crate::MemEvent::LockAcquire { .. })).count();

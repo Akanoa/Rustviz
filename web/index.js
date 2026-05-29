@@ -232,7 +232,15 @@ function render(state) {
     card.appendChild(header);
     const slotGrid = el("div", { class: "slots" });
     for (const slot of frame.slots) {
-      const row = el("div", { class: "slot-row" });
+      const rowCls = ["slot-row"];
+      // **Post-M08 polish**: moved bindings stay on the frame card with
+      // grayed-out styling — the slot's pointer-bytes physically persist
+      // (Rust's actual move semantics: only the type-system's ownership
+      // tracking changes; the stack bytes don't move). The class toggles
+      // muted color + strikethrough on the name and replaces the value
+      // cell with a `<moved>` annotation via CSS.
+      if (slot.moved) rowCls.push("slot-moved");
+      const row = el("div", { class: rowCls.join(" ") });
       // M06: data-slot-id lives on the .slot-name child (the row itself uses
       // `display: contents` so it has no own bounding box — getBoundingClientRect
       // on the row returns zero coords. Anchor on a child that has real layout).
@@ -241,7 +249,11 @@ function render(state) {
       row.appendChild(nameEl);
       row.appendChild(el("span", { class: "slot-ty", text: `: ${slot.ty}` }));
       const valueEl = el("span", { class: "slot-value" });
-      if (slot.value === null || slot.value === undefined) {
+      if (slot.moved) {
+        // Post-M08: moved slots replace the value with a `<moved>` marker.
+        valueEl.textContent = "<moved>";
+        valueEl.classList.add("slot-moved-value");
+      } else if (slot.value === null || slot.value === undefined) {
         valueEl.classList.add("slot-pending");
       } else if (slot.value === "") {
         // M07: empty value cell for heap-owning slots. The owning arrow +
@@ -387,8 +399,14 @@ function render(state) {
     statusEl.className = "";
   }
 
-  // Step indicator.
-  document.getElementById("step-indicator").textContent = `${state.position} / ${state.total}`;
+  // Step indicator. **Post-M08 polish**: prefer the coalesced logical
+  // counter so the visible number advances 1-by-1 even when the raw
+  // cursor position jumps over coalesced pairs (SlotAlloc→SlotWrite,
+  // ArcClone→HeapRealloc, etc.). Falls back to raw position when the
+  // logical fields are absent (older snapshots).
+  const stepPos = state.logical_position ?? state.position;
+  const stepTotal = state.logical_total ?? state.total;
+  document.getElementById("step-indicator").textContent = `${stepPos} / ${stepTotal}`;
 
   // M05 / US2: success path — clear any error underline + re-enable controls.
   editorView.dispatch({ effects: setError.of(null) });
@@ -1192,6 +1210,26 @@ function renderHeap(heap) {
       refSpan.textContent = `[refs: ${h.refcount}]`;
     } else if (refSpan) {
       refSpan.remove();
+    }
+    // **Post-M08 polish**: Mutex lock-state badge. Green pill when free,
+    // red pill with thread # when locked. Driven by `state.heap[i].mutex_state`
+    // which the apply_event parses from the heap-display suffix.
+    let mutexBadge = addrEl.querySelector(".heap-mutex-state");
+    if (h.mutex_state) {
+      if (!mutexBadge) {
+        mutexBadge = document.createElement("span");
+        mutexBadge.className = "heap-mutex-state";
+        addrEl.appendChild(mutexBadge);
+      }
+      if (h.mutex_state === "Free") {
+        mutexBadge.className = "heap-mutex-state mutex-free";
+        mutexBadge.textContent = "🔓 free";
+      } else if (h.mutex_state.Locked !== undefined) {
+        mutexBadge.className = "heap-mutex-state mutex-locked";
+        mutexBadge.textContent = `🔒 by #${h.mutex_state.Locked.holder}`;
+      }
+    } else if (mutexBadge) {
+      mutexBadge.remove();
     }
     // **M07.1**: for Vec displays (format: `Vec [e0, e1, ...] (cap=N, len=N)`),
     // segment each element into a `<span data-elem-idx="i">` so the slice
