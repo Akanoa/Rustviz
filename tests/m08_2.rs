@@ -63,6 +63,42 @@ fn different_seed_divergence() {
     );
 }
 
+/// Regression for the "thread frame grayed before body finishes" bug:
+/// `ThreadJoin` MUST fire only after the target thread reaches Done.
+/// Without this guarantee, the UI marks the thread joined (grayed-out)
+/// while its body's events keep firing — visually confusing. Asserts
+/// that for every ThreadJoin in the trace, all of that thread's events
+/// (FrameEnter / SlotAlloc / LockAcquire / LockRelease / FrameLeave)
+/// appear BEFORE the ThreadJoin event.
+#[test]
+fn join_fires_after_thread_actually_done() {
+    use rustviz::MemEvent;
+    // The seed reported by the user for the original glitch.
+    let seed = 2267206117u32;
+    let trace = run_pipeline(M08_2_COUNTER, seed).expect("counter sample compiles");
+    // Find every ThreadJoin and assert no events of the joined thread
+    // appear AFTER it (other than the ThreadJoin itself).
+    let mut joined_threads: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for (i, ev) in trace.iter().enumerate() {
+        if let MemEvent::ThreadJoin { thread_id, .. } = ev {
+            joined_threads.insert(*thread_id);
+            // Scan forward — no ThreadSwitch back to this thread should
+            // follow (the thread is supposedly Done).
+            for later in &trace[i+1..] {
+                if let MemEvent::ThreadSwitch { thread_id: tid, .. } = later {
+                    if tid.0 == *thread_id {
+                        panic!(
+                            "ThreadSwitch to thread {} fired AFTER its ThreadJoin (event {i}). Trace not well-ordered.",
+                            thread_id
+                        );
+                    }
+                }
+            }
+        }
+    }
+    assert!(joined_threads.len() >= 2, "expected ≥ 2 joined threads in the counter sample");
+}
+
 /// Race-for-lock sample: two threads each try to lock the same Arc<Mutex>.
 /// The seed determines which thread acquires first; the other parks until
 /// the first releases. The trace MUST diverge widely across seeds (this

@@ -889,58 +889,81 @@ impl<'a> Evaluator<'a> {
             self.events.push(MemEvent::ThreadJoin { thread_id: target.0, span });
             return;
         }
-        // Switch to target, run its body to completion, then return.
+        // **M08.2**: drive the target thread (and any threads holding
+        // locks it's parked on) until target reaches Done. ThreadJoin
+        // MUST fire AFTER target's body fully finishes (FrameLeave +
+        // status flip to Done) — otherwise the UI marks the thread
+        // "joined" while its body events keep firing, causing the
+        // grayed-frame-but-events-still-firing visual glitch.
         let from = self.current_thread_id;
-        self.switch_to(target, span);
-        self.run_queued_thread_to_done(target);
-        self.switch_to(from, span);
+        let max_iterations = 10_000; // safety: avoid infinite loop on logic bugs
+        let mut iterations = 0;
+        loop {
+            iterations += 1;
+            if iterations > max_iterations {
+                // Hard safety bail-out. Should never trigger in well-formed
+                // samples; if it does, there's a scheduler logic bug.
+                break;
+            }
+            let target_status = self.threads.get(&target).map(|t| t.status.clone());
+            match target_status {
+                Some(ThreadStatus::Done) => break,
+                Some(ThreadStatus::Ready) | Some(ThreadStatus::Running) => {
+                    // Advance the target by one stmt.
+                    self.switch_to(target, span);
+                    let progress = self.run_queued_thread_one_stmt(target, span);
+                    self.handle_step_progress(target, progress, span);
+                    self.switch_to(from, span);
+                }
+                Some(ThreadStatus::Parked { .. }) | Some(ThreadStatus::JoinWait { .. }) => {
+                    // Target is parked. Drive other Ready/Running threads
+                    // (excluding `from` which is the joining thread, mid-call).
+                    let mut ready: Vec<crate::event::ThreadId> = self.threads.iter()
+                        .filter(|(t, ts)| **t != from && matches!(
+                            ts.status,
+                            ThreadStatus::Ready | ThreadStatus::Running
+                        ))
+                        .map(|(t, _)| *t)
+                        .collect();
+                    if ready.is_empty() {
+                        // Nothing can advance — deadlock.
+                        let parked: Vec<crate::event::ThreadId> = self.threads.iter()
+                            .filter(|(_, ts)| matches!(
+                                ts.status,
+                                ThreadStatus::Parked { .. } | ThreadStatus::JoinWait { .. }
+                            ))
+                            .map(|(t, _)| *t)
+                            .collect();
+                        if !parked.is_empty() {
+                            let mut ids = parked;
+                            ids.sort_by_key(|t| t.0);
+                            self.events.push(MemEvent::Deadlock {
+                                thread_ids: ids,
+                                span,
+                            });
+                            self.halted = true;
+                        }
+                        return;
+                    }
+                    ready.sort_by_key(|t| t.0);
+                    let chosen = self.scheduler.pick(&ready);
+                    self.switch_to(chosen, span);
+                    let progress = self.run_queued_thread_one_stmt(chosen, span);
+                    self.handle_step_progress(chosen, progress, span);
+                    self.switch_to(from, span);
+                }
+                None => break, // target gone — shouldn't happen
+            }
+            if self.halted && self.park_signal.is_none() {
+                return; // real runtime error
+            }
+        }
         self.events.push(MemEvent::ThreadJoin { thread_id: target.0, span });
     }
 
-    /// **M08 v1**: run a `Ready` thread's queued body to completion. Emits
-    /// FrameEnter + captures, evaluates the body, drops scopes, emits
-    /// FrameLeave, marks the thread `Done`. The thread MUST be the
-    /// current thread (caller switches before invoking).
-    fn run_queued_thread_to_done(&mut self, tid: crate::event::ThreadId) {
-        // Only handle Ready threads.
-        if !matches!(self.threads.get(&tid).map(|t| &t.status), Some(ThreadStatus::Ready)) {
-            return;
-        }
-        // Take the queued body BEFORE setting up the frame (start_queued_thread
-        // consumes the Option). Need a body reference for eval after start.
-        let body_ref: &'a ast::Block = match self.threads.get(&tid).and_then(|t| t.queued_body.as_ref()) {
-            Some(qb) => qb.body,
-            None => return, // body already taken — shouldn't happen
-        };
-        // Materialize frame + captures.
-        self.start_queued_thread(tid);
-        // Evaluate the body.
-        let _ = self.eval_fn_body(body_ref);
-        // Drop the body scope (start_queued_thread pushed an outer scope
-        // before the captures; eval_fn_body pushed an inner scope for the
-        // body's lets; eval_fn_body does NOT drop its scope at the end of
-        // execution per the M06 contract).
-        let body_close_span = closing_brace_span(body_ref.span);
-        // eval_fn_body emits no drops; we need to drop both scopes (body inner + frame outer).
-        self.drop_current_scope(body_close_span);
-        self.drop_current_scope(body_close_span);
-        // Emit FrameLeave.
-        let frame_id = self.threads.get(&tid)
-            .and_then(|t| t.frames.last())
-            .map(|f| f.frame_id);
-        if let Some(fid) = frame_id {
-            self.events.push(MemEvent::FrameLeave {
-                frame_id: fid,
-                return_value: Value::Unit,
-                span: body_close_span,
-            });
-        }
-        // Pop frame + mark Done.
-        if let Some(ts) = self.threads.get_mut(&tid) {
-            ts.frames.pop();
-            ts.status = ThreadStatus::Done;
-        }
-    }
+    // M08.2: `run_queued_thread_to_done` removed — replaced by the
+    // cooperative `run_queued_thread_one_stmt` driven by `scheduler_tick`
+    // and `join_thread`.
 
     /// **M08**: refresh the display string for a HeapObject::Mutex after a
     /// holder change. Similar to refresh_arc_display but for Mutex's
