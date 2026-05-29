@@ -107,6 +107,12 @@ pub struct StateSnapshot {
     /// Always ≤ `total`. Use as the denominator for the step counter.
     #[serde(default)]
     pub logical_total: usize,
+    /// **M08.2**: seed used to generate this trace. JS UI displays this in
+    /// the seed input field so the user knows which seed produced what
+    /// they're looking at. `0` for traces from M01–M07.7 single-threaded
+    /// samples (or any sample run with the default seed).
+    #[serde(default)]
+    pub seed: u32,
 }
 
 /// **M07.2**: transient "bytes copied" indication. Set on `StateSnapshot`
@@ -780,6 +786,9 @@ impl Cursor {
             total: self.trace.len(),
             logical_position: self.logical_position(self.position),
             logical_total: self.logical_position(self.trace.len()),
+            // **M08.2**: overwritten by the Player wrapper (which owns the
+            // seed). Cursor itself doesn't know about scheduling.
+            seed: 0,
         }
     }
 
@@ -1716,6 +1725,10 @@ fn apply_event(world: &mut World, event: &MemEvent) {
             // + parked-thread machinery (deferred to M08.1 per the
             // simplified scheduler — no contention in M08 v1).
         }
+        MemEvent::Deadlock { .. } => {
+            // **M08.2**: terminal event. No world-state change here; the
+            // UI surfaces deadlock via the status bar (Phase 6).
+        }
     }
 }
 
@@ -2019,7 +2032,8 @@ fn event_span(event: &MemEvent) -> Span {
         | MemEvent::ArcClone { span, .. }
         | MemEvent::ArcDrop { span, .. }
         | MemEvent::Note { span, .. }
-        | MemEvent::ReturnValue { span, .. } => *span,
+        | MemEvent::ReturnValue { span, .. }
+        | MemEvent::Deadlock { span, .. } => *span,
     }
 }
 
@@ -2038,6 +2052,9 @@ mod wasm {
         cursor: Cursor,
         source: String,
         last_error: Option<crate::pipeline::CompileError>,
+        /// **M08.2**: current seed used by the most recent `set_source` call.
+        /// Surfaced via state snapshot so the JS UI can display it.
+        seed: u32,
     }
 
     /// Serialized form of a successful `set_source` call.
@@ -2068,12 +2085,20 @@ mod wasm {
                 cursor: Cursor::new(Vec::new()),
                 source: String::new(),
                 last_error: None,
+                seed: 0,
             };
             // Discard the returned JSON; constructor exists for the side effect
             // of compiling-and-loading. JS can call `state()` / `error_json()`
             // separately if it needs the initial result.
-            let _ = player.set_source(source);
+            let _ = player.set_source(source, 0);
             player
+        }
+
+        /// **M08.2**: re-run the pipeline with the current source and the new
+        /// seed. Returns JSON of the same shape as `set_source`.
+        pub fn set_seed(&mut self, seed: u32) -> String {
+            let source = self.source.clone();
+            self.set_source(&source, seed)
         }
 
         /// **M05**: compile + load fresh source. Returns JSON of shape:
@@ -2086,13 +2111,15 @@ mod wasm {
         /// On failure: cursor is replaced with an empty `Cursor::new(vec![])`;
         /// `self.source` is still updated (so `source()` reflects what the
         /// user typed); `self.last_error = Some(err)`.
-        pub fn set_source(&mut self, source: &str) -> String {
+        pub fn set_source(&mut self, source: &str, seed: u32) -> String {
             self.source = source.to_owned();
-            match crate::pipeline::run_pipeline(source) {
+            self.seed = seed;
+            match crate::pipeline::run_pipeline(source, seed) {
                 Ok(events) => {
                     self.cursor = Cursor::new(events);
                     self.last_error = None;
-                    let snapshot = self.cursor.state_snapshot(&self.source);
+                    let mut snapshot = self.cursor.state_snapshot(&self.source);
+                    snapshot.seed = self.seed;
                     serde_json::to_string(&SetSourceOk {
                         ok: true,
                         state: &snapshot,
@@ -2114,7 +2141,9 @@ mod wasm {
 
         /// Current state snapshot as JSON.
         pub fn state(&self) -> String {
-            serde_json::to_string(&self.cursor.state_snapshot(&self.source))
+            let mut snapshot = self.cursor.state_snapshot(&self.source);
+            snapshot.seed = self.seed;
+            serde_json::to_string(&snapshot)
                 .expect("StateSnapshot is always Serialize")
         }
 

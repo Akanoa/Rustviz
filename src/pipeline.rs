@@ -57,7 +57,7 @@ impl CompileError {
 /// The source is added to a fresh `SourceMap` under the name `editor.rs`.
 /// Callers needing multi-file support build their own `SourceMap` and call
 /// each stage directly.
-pub fn run_pipeline(source: &str) -> Result<Vec<MemEvent>, CompileError> {
+pub fn run_pipeline(source: &str, seed: u32) -> Result<Vec<MemEvent>, CompileError> {
     let mut sm = crate::parse::span::SourceMap::new();
     let file = sm.add("editor.rs".to_owned(), source.to_owned());
 
@@ -67,7 +67,7 @@ pub fn run_pipeline(source: &str) -> Result<Vec<MemEvent>, CompileError> {
         .map_err(|e| CompileError::from_parse_error(e, CompileStage::Resolve))?;
     let types = typeck(&program, &resolution)
         .map_err(|e| CompileError::from_parse_error(e, CompileStage::Typeck))?;
-    let events = evaluate(&program, &resolution, &types)
+    let events = evaluate(&program, &resolution, &types, seed)
         .map_err(|e| CompileError::from_parse_error(e, CompileStage::Eval))?;
 
     let _ = FileId(file.0); // silence unused-import-on-feature gate; keeps re-export honest
@@ -80,7 +80,7 @@ mod tests {
 
     #[test]
     fn run_pipeline_minimal() {
-        let events = run_pipeline("fn main() { let x = 5; }")
+        let events = run_pipeline("fn main() { let x = 5; }", 0)
             .expect("minimal program compiles");
         // Expect at minimum: FrameEnter, SlotAlloc, SlotWrite, FrameLeave.
         // M07.2: ReturnValue(Unit) for implicit-unit returns is skipped
@@ -91,7 +91,7 @@ mod tests {
 
     #[test]
     fn run_pipeline_arithmetic() {
-        let events = run_pipeline("fn main() { let x = 2 + 3; }")
+        let events = run_pipeline("fn main() { let x = 2 + 3; }", 0)
             .expect("arithmetic compiles");
         assert!(!events.is_empty());
     }
@@ -99,7 +99,7 @@ mod tests {
     #[test]
     fn run_pipeline_fn_call() {
         let source = "fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\nfn main() {\n    let r = add(2, 3);\n}\n";
-        let events = run_pipeline(source).expect("fn call compiles");
+        let events = run_pipeline(source, 0).expect("fn call compiles");
         // M03.1 post-revision: 12 events.
         // M07.2: -1 because main's implicit-unit ReturnValue is now skipped.
         // `add` still emits ReturnValue(Int 5) because it has an explicit
@@ -109,7 +109,7 @@ mod tests {
 
     #[test]
     fn run_pipeline_parse_error() {
-        let err = run_pipeline("fn main() { let x = ; }")
+        let err = run_pipeline("fn main() { let x = ; }", 0)
             .expect_err("missing initializer should fail to parse");
         assert_eq!(err.stage, CompileStage::Parse);
         assert!(err.span.end > err.span.start);
@@ -118,7 +118,7 @@ mod tests {
 
     #[test]
     fn run_pipeline_resolve_error() {
-        let err = run_pipeline("fn main() { let y = undefined_var; }")
+        let err = run_pipeline("fn main() { let y = undefined_var; }", 0)
             .expect_err("undefined ident should fail to resolve");
         assert_eq!(err.stage, CompileStage::Resolve);
         assert!(!err.message.is_empty());
@@ -126,7 +126,7 @@ mod tests {
 
     #[test]
     fn run_pipeline_typeck_error() {
-        let err = run_pipeline("fn main() { let z: i32 = true; }")
+        let err = run_pipeline("fn main() { let z: i32 = true; }", 0)
             .expect_err("i32 = true should fail typeck");
         assert_eq!(err.stage, CompileStage::Typeck);
         assert!(!err.message.is_empty());
@@ -137,7 +137,7 @@ mod tests {
     #[test]
     fn run_pipeline_u8_basic() {
         let source = "fn main() { let a: u8 = 5; let b: u8 = 3; let c: u8 = a + b; }";
-        let events = run_pipeline(source).expect("u8 arithmetic compiles");
+        let events = run_pipeline(source, 0).expect("u8 arithmetic compiles");
         // Verify at least one SlotWrite with the new Value::Int { kind: U8 } form.
         let has_u8 = events.iter().any(|e| matches!(e,
             crate::MemEvent::SlotWrite {
@@ -151,7 +151,7 @@ mod tests {
     #[test]
     fn run_pipeline_u8_overflow() {
         let source = "fn main() { let a: u8 = 250; let b: u8 = a + 10; }";
-        let events = run_pipeline(source).expect("u8 overflow compiles fine; halts at runtime");
+        let events = run_pipeline(source, 0).expect("u8 overflow compiles fine; halts at runtime");
         // Trace must end with a RuntimeError Note (overflow halt).
         let last = events.last().expect("non-empty trace");
         assert!(
@@ -162,21 +162,21 @@ mod tests {
 
     #[test]
     fn run_pipeline_unsigned_negation_rejected() {
-        let err = run_pipeline("fn main() { let x: u8 = -1; }")
+        let err = run_pipeline("fn main() { let x: u8 = -1; }", 0)
             .expect_err("unsigned negation should fail typeck");
         assert_eq!(err.stage, CompileStage::Typeck);
     }
 
     #[test]
     fn run_pipeline_literal_out_of_range() {
-        let err = run_pipeline("fn main() { let x: u8 = 300; }")
+        let err = run_pipeline("fn main() { let x: u8 = 300; }", 0)
             .expect_err("literal 300 doesn't fit u8");
         assert_eq!(err.stage, CompileStage::Typeck);
     }
 
     #[test]
     fn run_pipeline_cross_type_error() {
-        let err = run_pipeline("fn main() { let a: u8 = 1; let b: i32 = 2; let c = a + b; }")
+        let err = run_pipeline("fn main() { let a: u8 = 1; let b: i32 = 2; let c = a + b; }", 0)
             .expect_err("u8 + i32 is cross-type");
         assert_eq!(err.stage, CompileStage::Typeck);
     }
@@ -185,7 +185,7 @@ mod tests {
     fn run_pipeline_literal_suffix_u8() {
         // M03.2 enhancement: literal suffix `5u8` works without annotation.
         let source = "fn main() { let x = 5u8 + 3u8; }";
-        let events = run_pipeline(source).expect("suffixed literal arithmetic compiles");
+        let events = run_pipeline(source, 0).expect("suffixed literal arithmetic compiles");
         let has_u8 = events.iter().any(|e| matches!(e,
             crate::MemEvent::SlotWrite {
                 value: crate::Value::Int { kind: crate::typeck::IntKind::U8, .. },
@@ -199,7 +199,7 @@ mod tests {
     fn run_pipeline_literal_suffix_underscore() {
         // Underscore separator: `5_u8` works the same as `5u8`.
         let source = "fn main() { let x = 5_u8 + 3_u8; }";
-        let events = run_pipeline(source).expect("underscore-separated suffix compiles");
+        let events = run_pipeline(source, 0).expect("underscore-separated suffix compiles");
         assert!(!events.is_empty());
     }
 
@@ -207,7 +207,7 @@ mod tests {
     fn run_pipeline_literal_suffix_f64() {
         // Float suffix: `2.5_f64` (with or without separator).
         let source = "fn main() { let x = 2.5f64 + 1.5f64; }";
-        let events = run_pipeline(source).expect("float-suffixed literals compile");
+        let events = run_pipeline(source, 0).expect("float-suffixed literals compile");
         let has_f64 = events.iter().any(|e| matches!(e,
             crate::MemEvent::SlotWrite {
                 value: crate::Value::Float { kind: crate::typeck::FloatKind::F64, .. },
@@ -220,21 +220,21 @@ mod tests {
     #[test]
     fn run_pipeline_literal_suffix_mismatch_rejected() {
         // Conflicting annotation vs. suffix: `let x: i32 = 5u8;` — typeck error.
-        let err = run_pipeline("fn main() { let x: i32 = 5u8; }")
+        let err = run_pipeline("fn main() { let x: i32 = 5u8; }", 0)
             .expect_err("u8 suffix conflicts with i32 annotation");
         assert_eq!(err.stage, CompileStage::Typeck);
     }
 
     #[test]
     fn run_pipeline_invalid_suffix_rejected() {
-        let err = run_pipeline("fn main() { let x = 5u7; }")
+        let err = run_pipeline("fn main() { let x = 5u7; }", 0)
             .expect_err("u7 isn't a valid type");
         assert_eq!(err.stage, CompileStage::Parse);
     }
 
     #[test]
     fn run_pipeline_int_suffix_on_float_literal_rejected() {
-        let err = run_pipeline("fn main() { let x = 2.5u8; }")
+        let err = run_pipeline("fn main() { let x = 2.5u8; }", 0)
             .expect_err("u8 suffix on float literal is invalid");
         assert_eq!(err.stage, CompileStage::Parse);
     }
@@ -242,7 +242,7 @@ mod tests {
     #[test]
     fn run_pipeline_i64_arithmetic() {
         let source = "fn main() { let a: i64 = 100; let b: i64 = 200; let c: i64 = a + b; }";
-        let events = run_pipeline(source).expect("i64 arithmetic compiles");
+        let events = run_pipeline(source, 0).expect("i64 arithmetic compiles");
         assert!(!events.is_empty());
     }
 
@@ -251,7 +251,7 @@ mod tests {
     #[test]
     fn run_pipeline_float_basic() {
         let source = "fn main() { let a: f64 = 1.5; let b: f64 = 2.5; let c: f64 = a + b; }";
-        let events = run_pipeline(source).expect("f64 arithmetic compiles");
+        let events = run_pipeline(source, 0).expect("f64 arithmetic compiles");
         // Verify at least one Float SlotWrite with value 4.0.
         let has_float = events.iter().any(|e| matches!(e,
             crate::MemEvent::SlotWrite {
@@ -268,7 +268,7 @@ mod tests {
     #[test]
     fn run_pipeline_float_nan() {
         let source = "fn main() { let a: f64 = 0.0; let b: f64 = a / a; }";
-        let events = run_pipeline(source).expect("float division by zero compiles");
+        let events = run_pipeline(source, 0).expect("float division by zero compiles");
         // Must contain at least one Info note (produced NaN).
         let has_info = events.iter().any(|e| matches!(e,
             crate::MemEvent::Note { kind: crate::NoteKind::Info, .. }
@@ -282,7 +282,7 @@ mod tests {
     #[test]
     fn run_pipeline_float_inf() {
         let source = "fn main() { let a: f64 = 0.0; let b: f64 = 1.0; let c: f64 = b / a; }";
-        let events = run_pipeline(source).expect("1/0 compiles");
+        let events = run_pipeline(source, 0).expect("1/0 compiles");
         // Same Info-note + no halt expectation.
         let has_info = events.iter().any(|e| matches!(e,
             crate::MemEvent::Note { kind: crate::NoteKind::Info, message, .. } if message.contains("+Inf")
@@ -299,7 +299,7 @@ mod tests {
             let n: f64 = a / a;
             let m: f64 = n + 1.0;
         }";
-        let events = run_pipeline(source).expect("compiles");
+        let events = run_pipeline(source, 0).expect("compiles");
         let info_count = events.iter().filter(|e| matches!(e,
             crate::MemEvent::Note { kind: crate::NoteKind::Info, .. }
         )).count();
@@ -310,7 +310,7 @@ mod tests {
     #[test]
     fn run_pipeline_shared_borrow() {
         let source = "fn main() { let x = 5; let r = &x; }";
-        let events = run_pipeline(source).expect("shared borrow compiles");
+        let events = run_pipeline(source, 0).expect("shared borrow compiles");
         let has_shared = events.iter().any(|e| matches!(e,
             crate::MemEvent::BorrowShared { .. }));
         let has_end = events.iter().any(|e| matches!(e,
@@ -323,7 +323,7 @@ mod tests {
     fn run_pipeline_shared_borrow_multiple() {
         // Multiple shared borrows OK in Rust.
         let source = "fn main() { let x = 5; let r1 = &x; let r2 = &x; }";
-        let events = run_pipeline(source).expect("two shared borrows are valid");
+        let events = run_pipeline(source, 0).expect("two shared borrows are valid");
         let shared_count = events.iter().filter(|e| matches!(e,
             crate::MemEvent::BorrowShared { .. })).count();
         assert_eq!(shared_count, 2);
@@ -333,7 +333,7 @@ mod tests {
     #[test]
     fn run_pipeline_mut_borrow() {
         let source = "fn main() { let mut x = 5; let r = &mut x; }";
-        let events = run_pipeline(source).expect("mut borrow compiles");
+        let events = run_pipeline(source, 0).expect("mut borrow compiles");
         let has_mut = events.iter().any(|e| matches!(e,
             crate::MemEvent::BorrowMut { .. }));
         assert!(has_mut, "expected a BorrowMut event");
@@ -341,7 +341,7 @@ mod tests {
 
     #[test]
     fn run_pipeline_mut_borrow_on_non_mut_rejected() {
-        let err = run_pipeline("fn main() { let x = 5; let r = &mut x; }")
+        let err = run_pipeline("fn main() { let x = 5; let r = &mut x; }", 0)
             .expect_err("cannot &mut a non-mut binding");
         assert_eq!(err.stage, CompileStage::Typeck);
     }
@@ -349,21 +349,21 @@ mod tests {
     // M06 / US3: aliasing rule violations.
     #[test]
     fn run_pipeline_shared_then_mut_rejected() {
-        let err = run_pipeline("fn main() { let mut x = 5; let r1 = &x; let r2 = &mut x; }")
+        let err = run_pipeline("fn main() { let mut x = 5; let r1 = &x; let r2 = &mut x; }", 0)
             .expect_err("&mut while & exists is invalid");
         assert_eq!(err.stage, CompileStage::Typeck);
     }
 
     #[test]
     fn run_pipeline_two_mut_rejected() {
-        let err = run_pipeline("fn main() { let mut x = 5; let r1 = &mut x; let r2 = &mut x; }")
+        let err = run_pipeline("fn main() { let mut x = 5; let r1 = &mut x; let r2 = &mut x; }", 0)
             .expect_err("two &mut on same binding is invalid");
         assert_eq!(err.stage, CompileStage::Typeck);
     }
 
     #[test]
     fn run_pipeline_mut_then_shared_rejected() {
-        let err = run_pipeline("fn main() { let mut x = 5; let r1 = &mut x; let r2 = &x; }")
+        let err = run_pipeline("fn main() { let mut x = 5; let r1 = &mut x; let r2 = &x; }", 0)
             .expect_err("& while &mut exists is invalid");
         assert_eq!(err.stage, CompileStage::Typeck);
     }
@@ -372,7 +372,7 @@ mod tests {
     #[test]
     fn run_pipeline_scoped_borrow_ends_at_inner_brace() {
         let source = "fn main() { let x = 5; { let r = &x; } }";
-        let events = run_pipeline(source).expect("scoped borrow compiles");
+        let events = run_pipeline(source, 0).expect("scoped borrow compiles");
         // Find positions of BorrowShared and BorrowEnd; BorrowEnd must come
         // before the outer SlotDrop for x (if any), but more concretely,
         // before the function's FrameLeave.
@@ -393,7 +393,7 @@ mod tests {
     // M06: place-expression check — borrowing a non-place is rejected.
     #[test]
     fn run_pipeline_borrow_of_literal_rejected() {
-        let err = run_pipeline("fn main() { let r = &5; }")
+        let err = run_pipeline("fn main() { let r = &5; }", 0)
             .expect_err("&literal is invalid (not a place)");
         assert_eq!(err.stage, CompileStage::Typeck);
     }
@@ -403,7 +403,7 @@ mod tests {
     #[test]
     fn run_pipeline_assign_basic() {
         let source = "fn main() { let mut x = 0; x = 7; }";
-        let events = run_pipeline(source).expect("direct assign compiles");
+        let events = run_pipeline(source, 0).expect("direct assign compiles");
         let writes = events
             .iter()
             .filter(|e| matches!(e, crate::MemEvent::SlotWrite { .. }))
@@ -413,7 +413,7 @@ mod tests {
 
     #[test]
     fn run_pipeline_assign_immutable_rejected() {
-        let err = run_pipeline("fn main() { let x = 0; x = 7; }")
+        let err = run_pipeline("fn main() { let x = 0; x = 7; }", 0)
             .expect_err("immutable binding rejects reassignment");
         assert_eq!(err.stage, CompileStage::Typeck);
     }
@@ -423,7 +423,7 @@ mod tests {
     #[test]
     fn run_pipeline_deref_read_shared() {
         let source = "fn main() { let x = 42; let r = &x; let y = *r; }";
-        let events = run_pipeline(source).expect("deref-read through &T compiles");
+        let events = run_pipeline(source, 0).expect("deref-read through &T compiles");
         let has_42 = events.iter().any(|e| matches!(e,
             crate::MemEvent::SlotWrite {
                 value: crate::Value::Int { bits: 42, .. },
@@ -435,7 +435,7 @@ mod tests {
 
     #[test]
     fn run_pipeline_deref_on_non_reference_rejected() {
-        let err = run_pipeline("fn main() { let x = 5; let y = *x; }")
+        let err = run_pipeline("fn main() { let x = 5; let y = *x; }", 0)
             .expect_err("deref of non-reference is invalid");
         assert_eq!(err.stage, CompileStage::Typeck);
     }
@@ -445,7 +445,7 @@ mod tests {
     #[test]
     fn run_pipeline_deref_write_basic() {
         let source = "fn main() { let mut x = 5; let r = &mut x; *r = 10; }";
-        let events = run_pipeline(source).expect("through-ref write compiles");
+        let events = run_pipeline(source, 0).expect("through-ref write compiles");
         let has_10 = events.iter().any(|e| matches!(e,
             crate::MemEvent::SlotWrite {
                 value: crate::Value::Int { bits: 10, .. },
@@ -457,14 +457,14 @@ mod tests {
 
     #[test]
     fn run_pipeline_deref_write_through_shared_rejected() {
-        let err = run_pipeline("fn main() { let x = 5; let r = &x; *r = 10; }")
+        let err = run_pipeline("fn main() { let x = 5; let r = &x; *r = 10; }", 0)
             .expect_err("cannot assign through &T");
         assert_eq!(err.stage, CompileStage::Typeck);
     }
 
     #[test]
     fn run_pipeline_assign_to_borrowed_rejected() {
-        let err = run_pipeline("fn main() { let mut x = 5; let r = &x; x = 7; }")
+        let err = run_pipeline("fn main() { let mut x = 5; let r = &x; x = 7; }", 0)
             .expect_err("cannot assign to a borrowed binding");
         assert_eq!(err.stage, CompileStage::Typeck);
     }
@@ -474,7 +474,7 @@ mod tests {
     #[test]
     fn run_pipeline_box_basic() {
         let source = "fn main() { let b = Box::new(5); }";
-        let events = run_pipeline(source).expect("box compiles");
+        let events = run_pipeline(source, 0).expect("box compiles");
         let alloc_count = events.iter().filter(|e| matches!(e, crate::MemEvent::HeapAlloc { .. })).count();
         let free_count = events.iter().filter(|e| matches!(e, crate::MemEvent::HeapFree { .. })).count();
         assert_eq!(alloc_count, 1, "expected exactly 1 HeapAlloc");
@@ -484,7 +484,7 @@ mod tests {
     #[test]
     fn run_pipeline_box_deref_read() {
         let source = "fn main() { let b = Box::new(42); let y = *b; }";
-        let events = run_pipeline(source).expect("box deref compiles");
+        let events = run_pipeline(source, 0).expect("box deref compiles");
         let has_42 = events.iter().any(|e| matches!(e,
             crate::MemEvent::SlotWrite { value: crate::Value::Int { bits: 42, .. }, .. }
         ));
@@ -501,7 +501,7 @@ mod tests {
             v.push(2);
             v.push(3);
         }";
-        let events = run_pipeline(source).expect("vec push compiles");
+        let events = run_pipeline(source, 0).expect("vec push compiles");
         // Vec::new emits 1 HeapAlloc (cap 0). Pushes 1,2,3 each cross a
         // capacity boundary (0→1, 1→2, 2→4) = 3 HeapReallocs.
         let realloc_count = events.iter().filter(|e| matches!(e, crate::MemEvent::HeapRealloc { .. })).count();
@@ -515,7 +515,7 @@ mod tests {
             v.push(5);
             let x = v[0];
         }";
-        let events = run_pipeline(source).expect("vec index compiles");
+        let events = run_pipeline(source, 0).expect("vec index compiles");
         let has_5 = events.iter().any(|e| matches!(e,
             crate::MemEvent::SlotWrite { value: crate::Value::Int { bits: 5, .. }, .. }
         ));
@@ -528,7 +528,7 @@ mod tests {
             let v: Vec<i32> = Vec::new();
             let x = v[0];
         }";
-        let events = run_pipeline(source).expect("vec OOB compiles; halts at runtime");
+        let events = run_pipeline(source, 0).expect("vec OOB compiles; halts at runtime");
         let has_oob = events.iter().any(|e| matches!(e,
             crate::MemEvent::Note { kind: crate::NoteKind::RuntimeError, message, .. }
                 if message.contains("index out of bounds")
@@ -550,7 +550,7 @@ mod tests {
             let b = Box::new(99);
             v.push(3);
         }";
-        let events = run_pipeline(source).expect("vec dangling compiles");
+        let events = run_pipeline(source, 0).expect("vec dangling compiles");
         let has_dangling = events.iter().any(|e| matches!(e,
             crate::MemEvent::Note { kind: crate::NoteKind::RuntimeError, message, .. }
                 if message.contains("dangling reference")
@@ -565,7 +565,7 @@ mod tests {
     #[test]
     fn run_pipeline_string_from() {
         let source = "fn main() { let s = String::from(\"hi\"); }";
-        let events = run_pipeline(source).expect("String compiles");
+        let events = run_pipeline(source, 0).expect("String compiles");
         let heap_count = events.iter().filter(|e| matches!(e, crate::MemEvent::HeapAlloc { .. })).count();
         let static_count = events.iter().filter(|e| matches!(e, crate::MemEvent::StaticAlloc { .. })).count();
         assert_eq!(heap_count, 1, "expected one heap allocation for the String buffer");
@@ -578,7 +578,7 @@ mod tests {
             let mut s = String::from(\"hi\");
             s.push_str(\"world\");
         }";
-        let events = run_pipeline(source).expect("String push_str compiles");
+        let events = run_pipeline(source, 0).expect("String push_str compiles");
         let realloc_count = events.iter().filter(|e| matches!(e, crate::MemEvent::HeapRealloc { .. })).count();
         let static_count = events.iter().filter(|e| matches!(e, crate::MemEvent::StaticAlloc { .. })).count();
         assert!(realloc_count >= 1, "expected ≥ 1 HeapRealloc when push_str grows capacity");
@@ -595,7 +595,7 @@ mod tests {
             v.push(1);
             let s = &mut v[..];
         }";
-        let err = run_pipeline(source).expect_err("mutable slice must be rejected");
+        let err = run_pipeline(source, 0).expect_err("mutable slice must be rejected");
         assert_eq!(err.stage, CompileStage::Typeck);
         assert!(
             err.message.contains("mutable slices are out of scope"),
@@ -610,7 +610,7 @@ mod tests {
     #[test]
     fn run_pipeline_standalone_range_rejected() {
         let source = "fn main() { let r = 1..3; }";
-        let err = run_pipeline(source).expect_err("standalone range must be rejected");
+        let err = run_pipeline(source, 0).expect_err("standalone range must be rejected");
         assert_eq!(err.stage, CompileStage::Parse);
     }
 
@@ -634,7 +634,7 @@ mod tests {
             let b = Box::new(99);
             v.push(3);
         }";
-        let events = run_pipeline(source).expect("slice dangling compiles");
+        let events = run_pipeline(source, 0).expect("slice dangling compiles");
         let has_dangling = events.iter().any(|e| matches!(e,
             crate::MemEvent::Note { kind: crate::NoteKind::RuntimeError, message, .. }
                 if message.contains("dangling reference")
@@ -644,7 +644,7 @@ mod tests {
 
     #[test]
     fn compile_error_serde_roundtrip() {
-        let err = run_pipeline("fn main() { let x = ; }").expect_err("parse error");
+        let err = run_pipeline("fn main() { let x = ; }", 0).expect_err("parse error");
         let json = serde_json::to_string(&err).expect("serialize");
         let back: CompileError = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(err, back);
@@ -658,7 +658,7 @@ mod tests {
     #[test]
     fn run_pipeline_array_basic() {
         let source = "fn main() { let t = [10, 20, 30]; let n = t.len(); }";
-        let events = run_pipeline(source).expect("array compiles");
+        let events = run_pipeline(source, 0).expect("array compiles");
         // SlotWrite of t with Value::Array of 3 elements.
         let array_write = events.iter().any(|e| matches!(e,
             crate::MemEvent::SlotWrite {
@@ -682,7 +682,7 @@ mod tests {
     #[test]
     fn run_pipeline_array_index() {
         let source = "fn main() { let t = [10, 20, 30]; let x = t[1]; }";
-        let events = run_pipeline(source).expect("array index compiles");
+        let events = run_pipeline(source, 0).expect("array index compiles");
         let x_eq_20 = events.iter().any(|e| matches!(e,
             crate::MemEvent::SlotWrite {
                 value: crate::Value::Int { kind: crate::typeck::IntKind::I32, bits: 20 },
@@ -695,7 +695,7 @@ mod tests {
     #[test]
     fn run_pipeline_array_index_oob() {
         let source = "fn main() { let t = [10, 20]; let x = t[5]; }";
-        let events = run_pipeline(source).expect("OOB compiles; halts at runtime");
+        let events = run_pipeline(source, 0).expect("OOB compiles; halts at runtime");
         let has_oob = events.iter().any(|e| matches!(e,
             crate::MemEvent::Note { kind: crate::NoteKind::RuntimeError, message, .. }
                 if message.contains("array len is 2") && message.contains("index is 5")
@@ -711,7 +711,7 @@ mod tests {
     #[test]
     fn run_pipeline_array_slice() {
         let source = "fn main() { let t = [1, 2, 3, 4]; let s = &t[1..3]; }";
-        let events = run_pipeline(source).expect("array slice compiles");
+        let events = run_pipeline(source, 0).expect("array slice compiles");
         // s's SlotWrite carries Value::Slice with Slot target.
         let slot_slice = events.iter().any(|e| matches!(e,
             crate::MemEvent::SlotWrite {
@@ -739,7 +739,7 @@ mod tests {
     #[test]
     fn run_pipeline_array_slice_oob() {
         let source = "fn main() { let t = [1, 2]; let s = &t[0..5]; }";
-        let events = run_pipeline(source).expect("OOB slice compiles; halts");
+        let events = run_pipeline(source, 0).expect("OOB slice compiles; halts");
         let has_oob = events.iter().any(|e| matches!(e,
             crate::MemEvent::Note { kind: crate::NoteKind::RuntimeError, message, .. }
                 if message.contains("slice end out of bounds")
@@ -754,7 +754,7 @@ mod tests {
     #[test]
     fn run_pipeline_array_lit_type_inference() {
         let source = "fn main() { let t = [10, 20, 30_u64]; }";
-        let events = run_pipeline(source).expect("array with suffix-driven inference compiles");
+        let events = run_pipeline(source, 0).expect("array with suffix-driven inference compiles");
         // SlotWrite of t with Value::Array of 3 U64 elements.
         let ok = events.iter().any(|e| matches!(e,
             crate::MemEvent::SlotWrite {
@@ -770,7 +770,7 @@ mod tests {
     #[test]
     fn run_pipeline_array_no_heap() {
         let source = "fn main() { let t = [10, 20, 30]; let n = t.len(); }";
-        let events = run_pipeline(source).expect("compiles");
+        let events = run_pipeline(source, 0).expect("compiles");
         let heap_event_count = events.iter().filter(|e| matches!(
             e,
             crate::MemEvent::HeapAlloc { .. }
@@ -789,7 +789,7 @@ mod tests {
     #[test]
     fn run_pipeline_str_literal() {
         let source = "fn main() { let s = \"toto\"; }";
-        let events = run_pipeline(source).expect("str literal compiles");
+        let events = run_pipeline(source, 0).expect("str literal compiles");
         // Exactly one StaticAlloc with the literal's bytes.
         let static_allocs: Vec<&str> = events.iter().filter_map(|e| match e {
             crate::MemEvent::StaticAlloc { bytes, .. } => Some(bytes.as_str()),
@@ -822,7 +822,7 @@ mod tests {
             let s = \"hi\";
             let t = String::from(s);
         }";
-        let events = run_pipeline(source).expect("String::from(&str binding) compiles");
+        let events = run_pipeline(source, 0).expect("String::from(&str binding) compiles");
         let static_count = events.iter().filter(|e| matches!(e, crate::MemEvent::StaticAlloc { .. })).count();
         let heap_count = events.iter().filter(|e| matches!(e, crate::MemEvent::HeapAlloc { .. })).count();
         let copy_count = events.iter().filter(|e| matches!(e, crate::MemEvent::BytesCopy { .. })).count();
@@ -840,7 +840,7 @@ mod tests {
             let s = \"hello\";
             let t = String::from(&s[1..4]);
         }";
-        let events = run_pipeline(source).expect("compiles");
+        let events = run_pipeline(source, 0).expect("compiles");
         let copy = events.iter().find_map(|e| match e {
             crate::MemEvent::BytesCopy { n_bytes, .. } => Some(*n_bytes),
             _ => None,
@@ -856,7 +856,7 @@ mod tests {
     #[test]
     fn run_pipeline_string_from_static_visible() {
         let source = "fn main() { let s = String::from(\"hi\"); }";
-        let events = run_pipeline(source).expect("String::from compiles");
+        let events = run_pipeline(source, 0).expect("String::from compiles");
         // Exactly one StaticAlloc for the "hi" literal.
         let static_allocs: Vec<&str> = events.iter().filter_map(|e| match e {
             crate::MemEvent::StaticAlloc { bytes, .. } => Some(bytes.as_str()),
@@ -883,7 +883,7 @@ mod tests {
             let mut s = String::from(\"hi\");
             s.push_str(\"!\");
         }";
-        let events = run_pipeline(source).expect("push_str compiles");
+        let events = run_pipeline(source, 0).expect("push_str compiles");
         let static_count = events.iter().filter(|e| matches!(e, crate::MemEvent::StaticAlloc { .. })).count();
         let heap_count = events.iter().filter(|e| matches!(e, crate::MemEvent::HeapAlloc { .. })).count();
         assert_eq!(static_count, 2, "expected two static blocks (one for \"hi\", one for \"!\")");
@@ -899,7 +899,7 @@ mod tests {
             let s = \"hello\";
             let s2 = &s[..2];
         }";
-        let events = run_pipeline(source).expect("&str sub-slice compiles");
+        let events = run_pipeline(source, 0).expect("&str sub-slice compiles");
         // One StaticAlloc for "hello"; no separate alloc for the sub-slice
         // (it shares the same static block).
         let static_count = events.iter().filter(|e| matches!(e, crate::MemEvent::StaticAlloc { .. })).count();
@@ -932,7 +932,7 @@ mod tests {
             let s = \"hello\";
             let s2 = &s[1..4];
         }";
-        let events = run_pipeline(source).expect("compiles");
+        let events = run_pipeline(source, 0).expect("compiles");
         let s2_write = events.iter().any(|e| matches!(e,
             crate::MemEvent::SlotWrite {
                 value: crate::Value::Slice {
@@ -949,7 +949,7 @@ mod tests {
     #[test]
     fn run_pipeline_str_len() {
         let source = "fn main() { let s = \"toto\"; let n = s.len(); }";
-        let events = run_pipeline(source).expect("str len compiles");
+        let events = run_pipeline(source, 0).expect("str len compiles");
         let n_is_4 = events.iter().any(|e| matches!(e,
             crate::MemEvent::SlotWrite {
                 value: crate::Value::Int { kind: crate::typeck::IntKind::U64, bits: 4 },
@@ -965,7 +965,7 @@ mod tests {
     #[test]
     fn run_pipeline_literal_dedup() {
         let source = "fn main() { let a = \"hi\"; let b = \"hi\"; }";
-        let events = run_pipeline(source).expect("literal dedup compiles");
+        let events = run_pipeline(source, 0).expect("literal dedup compiles");
         let static_count = events.iter().filter(|e| matches!(e, crate::MemEvent::StaticAlloc { .. })).count();
         assert_eq!(static_count, 1, "two identical literals should share one StaticAlloc");
         // M07.2: Pointee::Static borrows no longer emit BorrowShared events.
@@ -994,7 +994,7 @@ mod tests {
             v.push(40);
             let s = &v[1..3];
         }";
-        let events = run_pipeline(source).expect("slice range compiles");
+        let events = run_pipeline(source, 0).expect("slice range compiles");
         // BorrowShared with Pointee::Heap target.
         let shared_heap = events.iter().any(|e| matches!(e,
             crate::MemEvent::BorrowShared { target: crate::event::Pointee::Heap(_), .. }
@@ -1014,7 +1014,7 @@ mod tests {
             v.push(1);
             let s = &v[0..5];
         }";
-        let events = run_pipeline(source).expect("slice OOB compiles; halts at runtime");
+        let events = run_pipeline(source, 0).expect("slice OOB compiles; halts at runtime");
         let has_oob = events.iter().any(|e| matches!(e,
             crate::MemEvent::Note { kind: crate::NoteKind::RuntimeError, message, .. }
                 if message.contains("slice end out of bounds")
@@ -1034,7 +1034,7 @@ mod tests {
             let s = &v[..];
             let n = s.len();
         }";
-        let events = run_pipeline(source).expect("slice basic compiles");
+        let events = run_pipeline(source, 0).expect("slice basic compiles");
         // `s` is a slice with len 3.
         let slice_len_3 = events.iter().any(|e| matches!(e,
             crate::MemEvent::SlotWrite { value: crate::Value::Slice { len: 3, .. }, .. }
@@ -1064,7 +1064,7 @@ mod tests {
             let c = &v[..2];
             let d = &v[0..2];
         }";
-        let events = run_pipeline(source).expect("all four range forms compile");
+        let events = run_pipeline(source, 0).expect("all four range forms compile");
         let slice_writes: Vec<u64> = events.iter().filter_map(|e| match e {
             crate::MemEvent::SlotWrite { value: crate::Value::Slice { len, .. }, .. } => Some(*len),
             _ => None,
@@ -1084,7 +1084,7 @@ mod tests {
             v.push(2);
             let s = &v[2..1];
         }";
-        let events = run_pipeline(source).expect("slice start>end compiles; halts");
+        let events = run_pipeline(source, 0).expect("slice start>end compiles; halts");
         let has_inv = events.iter().any(|e| matches!(e,
             crate::MemEvent::Note { kind: crate::NoteKind::RuntimeError, message, .. }
                 if message.contains("slice start > end")
@@ -1101,7 +1101,7 @@ mod tests {
     #[test]
     fn run_pipeline_struct_basic() {
         let source = "struct Point { x: i32, y: i32 }\nfn main() {\n    let p = Point { x: 1, y: 2 };\n    let a = p.x;\n}\n";
-        let events = run_pipeline(source).expect("struct compiles");
+        let events = run_pipeline(source, 0).expect("struct compiles");
         // SlotWrite of p with Value::Struct { name: "Point", fields: [("x", 1), ("y", 2)] }.
         let p_write = events.iter().any(|e| matches!(e,
             crate::MemEvent::SlotWrite {
@@ -1135,7 +1135,7 @@ mod tests {
     #[test]
     fn run_pipeline_struct_shorthand() {
         let source = "struct Point { x: i32, y: i32 }\nfn main() {\n    let x = 1;\n    let y = 2;\n    let p = Point { x, y };\n}\n";
-        let events = run_pipeline(source).expect("shorthand compiles");
+        let events = run_pipeline(source, 0).expect("shorthand compiles");
         let p_write = events.iter().any(|e| matches!(e,
             crate::MemEvent::SlotWrite {
                 value: crate::Value::Struct { name, fields },
@@ -1151,7 +1151,7 @@ mod tests {
     #[test]
     fn run_pipeline_struct_missing_field() {
         let source = "struct Point { x: i32, y: i32 }\nfn main() {\n    let p = Point { x: 1 };\n}\n";
-        let err = run_pipeline(source).expect_err("missing field should fail typeck");
+        let err = run_pipeline(source, 0).expect_err("missing field should fail typeck");
         assert_eq!(err.stage, CompileStage::Typeck);
         assert!(
             err.message.contains("missing field `y`"),
@@ -1164,7 +1164,7 @@ mod tests {
     #[test]
     fn run_pipeline_struct_extra_field() {
         let source = "struct Point { x: i32, y: i32 }\nfn main() {\n    let p = Point { x: 1, y: 2, z: 3 };\n}\n";
-        let err = run_pipeline(source).expect_err("extra field should fail typeck");
+        let err = run_pipeline(source, 0).expect_err("extra field should fail typeck");
         assert_eq!(err.stage, CompileStage::Typeck);
         assert!(
             err.message.contains("no field `z`"),
@@ -1181,7 +1181,7 @@ mod tests {
     #[test]
     fn run_pipeline_struct_int_to_float_coercion() {
         let source = "struct Point { x: i32, y: f64 }\nfn main() {\n    let p = Point { x: 1, y: 2 };\n}\n";
-        let events = run_pipeline(source).expect("mixed-type struct compiles");
+        let events = run_pipeline(source, 0).expect("mixed-type struct compiles");
         let p_write = events.iter().find_map(|e| match e {
             crate::MemEvent::SlotWrite {
                 value: crate::Value::Struct { name, fields },
@@ -1204,7 +1204,7 @@ mod tests {
     #[test]
     fn run_pipeline_struct_wrong_type() {
         let source = "struct Point { x: i32, y: i32 }\nfn main() {\n    let p = Point { x: true, y: 2 };\n}\n";
-        let err = run_pipeline(source).expect_err("wrong-type field should fail typeck");
+        let err = run_pipeline(source, 0).expect_err("wrong-type field should fail typeck");
         assert_eq!(err.stage, CompileStage::Typeck);
         assert!(
             err.message.contains("expected `i32`") && err.message.contains("found `bool`"),
@@ -1222,7 +1222,7 @@ mod tests {
     #[test]
     fn run_pipeline_field_borrow() {
         let source = "struct Point { x: i32, y: i32 }\nfn main() {\n    let p = Point { x: 1, y: 2 };\n    let r = &p.x;\n}\n";
-        let events = run_pipeline(source).expect("field borrow compiles");
+        let events = run_pipeline(source, 0).expect("field borrow compiles");
         let ref_write = events.iter().any(|e| matches!(e,
             crate::MemEvent::SlotWrite {
                 value: crate::Value::Ref {
@@ -1255,7 +1255,7 @@ mod tests {
     #[test]
     fn run_pipeline_method() {
         let source = "struct Point { x: i32, y: i32 }\nimpl Point { fn x(&self) -> i32 { self.x } }\nfn main() {\n    let p = Point { x: 1, y: 2 };\n    let v = p.x();\n}\n";
-        let events = run_pipeline(source).expect("method compiles");
+        let events = run_pipeline(source, 0).expect("method compiles");
         // FrameEnter for Point::x.
         let frame_enter = events.iter().any(|e| matches!(e,
             crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "Point::x"
@@ -1296,7 +1296,7 @@ mod tests {
     #[test]
     fn run_pipeline_method_two_methods() {
         let source = "struct Point { x: i32, y: i32 }\nimpl Point {\n    fn x(&self) -> i32 { self.x }\n    fn dist(&self) -> i32 { self.x }\n}\nfn main() {\n    let p = Point { x: 7, y: 9 };\n    let v = p.dist();\n}\n";
-        let events = run_pipeline(source).expect("two-method impl compiles");
+        let events = run_pipeline(source, 0).expect("two-method impl compiles");
         let dist_frame = events.iter().any(|e| matches!(e,
             crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "Point::dist"
         ));
@@ -1314,7 +1314,7 @@ mod tests {
     #[test]
     fn run_pipeline_method_unknown() {
         let source = "struct Point { x: i32, y: i32 }\nfn main() {\n    let p = Point { x: 1, y: 2 };\n    let v = p.bogus();\n}\n";
-        let err = run_pipeline(source).expect_err("unknown method should fail typeck");
+        let err = run_pipeline(source, 0).expect_err("unknown method should fail typeck");
         assert_eq!(err.stage, CompileStage::Typeck);
         assert!(
             err.message.contains("no method `bogus`"),
@@ -1327,7 +1327,7 @@ mod tests {
     #[test]
     fn run_pipeline_field_borrow_unknown() {
         let source = "struct Point { x: i32, y: i32 }\nfn main() {\n    let p = Point { x: 1, y: 2 };\n    let r = &p.z;\n}\n";
-        let err = run_pipeline(source).expect_err("unknown field should fail typeck");
+        let err = run_pipeline(source, 0).expect_err("unknown field should fail typeck");
         assert_eq!(err.stage, CompileStage::Typeck);
         assert!(
             err.message.contains("no field `z`"),
@@ -1346,7 +1346,7 @@ mod tests {
     #[test]
     fn run_pipeline_assoc_fn() {
         let source = "struct Point { x: i32, y: i32 }\nimpl Point { fn new(x: i32, y: i32) -> Point { Point { x, y } } }\nfn main() {\n    let p = Point::new(1, 2);\n}\n";
-        let events = run_pipeline(source).expect("assoc fn compiles");
+        let events = run_pipeline(source, 0).expect("assoc fn compiles");
         let frame = events.iter().any(|e| matches!(e,
             crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "Point::new"
         ));
@@ -1376,7 +1376,7 @@ mod tests {
     #[test]
     fn run_pipeline_assoc_fn_mixed() {
         let source = "struct Point { x: i32, y: i32 }\nimpl Point { fn new(x: i32, y: i32) -> Point { Point { x, y } } }\nfn main() {\n    let v: Vec<i32> = Vec::new();\n    let p = Point::new(3, 4);\n}\n";
-        let events = run_pipeline(source).expect("mixed dispatch compiles");
+        let events = run_pipeline(source, 0).expect("mixed dispatch compiles");
         // Vec::new emits HeapAlloc.
         let heap = events.iter().any(|e| matches!(e, crate::MemEvent::HeapAlloc { .. }));
         assert!(heap, "expected HeapAlloc from Vec::new (builtin)");
@@ -1393,7 +1393,7 @@ mod tests {
     #[test]
     fn run_pipeline_struct_forward_ref() {
         let source = "impl Point { fn new(x: i32, y: i32) -> Point { Point { x, y } } }\nstruct Point { x: i32, y: i32 }\nfn main() {\n    let p = Point::new(5, 6);\n}\n";
-        let events = run_pipeline(source).expect("forward reference compiles via two-pass typeck");
+        let events = run_pipeline(source, 0).expect("forward reference compiles via two-pass typeck");
         let p_write = events.iter().any(|e| matches!(e,
             crate::MemEvent::SlotWrite {
                 value: crate::Value::Struct { name, .. },
@@ -1411,7 +1411,7 @@ mod tests {
     #[test]
     fn run_pipeline_struct_field_assign() {
         let source = "struct Point { x: i32, y: i32 }\nfn main() {\n    let mut p = Point { x: 1, y: 2 };\n    p.x = 5;\n    let a = p.x;\n}\n";
-        let events = run_pipeline(source).expect("field assign compiles");
+        let events = run_pipeline(source, 0).expect("field assign compiles");
         // Two SlotWrites for p: first with x=1,y=2; second with x=5,y=2.
         let p_writes: Vec<_> = events.iter().filter_map(|e| match e {
             crate::MemEvent::SlotWrite {
@@ -1445,7 +1445,7 @@ mod tests {
     #[test]
     fn run_pipeline_struct_field_assign_immutable() {
         let source = "struct Point { x: i32, y: i32 }\nfn main() {\n    let p = Point { x: 1, y: 2 };\n    p.x = 5;\n}\n";
-        let err = run_pipeline(source).expect_err("immutable field assign should fail");
+        let err = run_pipeline(source, 0).expect_err("immutable field assign should fail");
         assert_eq!(err.stage, CompileStage::Typeck);
         assert!(
             err.message.contains("immutable"),
@@ -1458,7 +1458,7 @@ mod tests {
     #[test]
     fn run_pipeline_struct_no_heap() {
         let source = "struct Point { x: i32, y: i32 }\nimpl Point { fn new(x: i32, y: i32) -> Point { Point { x, y } } fn x(&self) -> i32 { self.x } }\nfn main() {\n    let p = Point::new(1, 2);\n    let v = p.x();\n}\n";
-        let events = run_pipeline(source).expect("struct-only compiles");
+        let events = run_pipeline(source, 0).expect("struct-only compiles");
         let heap_count = events.iter().filter(|e| matches!(
             e,
             crate::MemEvent::HeapAlloc { .. }
@@ -1477,7 +1477,7 @@ mod tests {
     #[test]
     fn run_pipeline_generic_id_fn() {
         let source = "fn id<T>(x: T) -> T {\n    x\n}\nfn main() {\n    let a = id(5);\n    let b = id(true);\n}\n";
-        let events = run_pipeline(source).expect("generic id fn compiles");
+        let events = run_pipeline(source, 0).expect("generic id fn compiles");
         let id_i32 = events.iter().any(|e| matches!(e,
             crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "id::<i32>"
         ));
@@ -1502,7 +1502,7 @@ mod tests {
     #[test]
     fn run_pipeline_generic_inference_mismatch() {
         let source = "fn pair<T>(a: T, b: T) -> T {\n    a\n}\nfn main() {\n    let _ = pair(5, true);\n}\n";
-        let err = run_pipeline(source).expect_err("inference mismatch should fail typeck");
+        let err = run_pipeline(source, 0).expect_err("inference mismatch should fail typeck");
         assert_eq!(err.stage, CompileStage::Typeck);
         assert!(
             err.message.contains("cannot infer") && err.message.contains("conflicting"),
@@ -1518,7 +1518,7 @@ mod tests {
     #[test]
     fn run_pipeline_generic_struct() {
         let source = "struct Wrapper<T> {\n    v: T,\n}\nfn main() {\n    let w = Wrapper { v: 5 };\n    let a = w.v;\n}\n";
-        let events = run_pipeline(source).expect("generic struct compiles");
+        let events = run_pipeline(source, 0).expect("generic struct compiles");
         // SlotWrite for w carries Value::Struct { name: "Wrapper", fields: [("v", Int{I32, 5})] }.
         let w_write = events.iter().any(|e| matches!(e,
             crate::MemEvent::SlotWrite {
@@ -1553,7 +1553,7 @@ mod tests {
     #[test]
     fn run_pipeline_generic_struct_two_instantiations() {
         let source = "struct Wrapper<T> {\n    v: T,\n}\nfn main() {\n    let w1 = Wrapper { v: 5 };\n    let w2 = Wrapper { v: true };\n}\n";
-        let events = run_pipeline(source).expect("compiles");
+        let events = run_pipeline(source, 0).expect("compiles");
         let i32_alloc = events.iter().any(|e| matches!(e,
             crate::MemEvent::SlotAlloc {
                 ty: crate::Ty::Struct { name, type_args, .. },
@@ -1577,7 +1577,7 @@ mod tests {
     #[test]
     fn run_pipeline_turbofish() {
         let source = "fn id<T>(x: T) -> T {\n    x\n}\nfn main() {\n    let v = id::<bool>(false);\n}\n";
-        let events = run_pipeline(source).expect("turbofish compiles");
+        let events = run_pipeline(source, 0).expect("turbofish compiles");
         let frame = events.iter().any(|e| matches!(e,
             crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "id::<bool>"
         ));
@@ -1593,7 +1593,7 @@ mod tests {
     #[test]
     fn run_pipeline_turbofish_type_mismatch() {
         let source = "fn id<T>(x: T) -> T {\n    x\n}\nfn main() {\n    let v = id::<bool>(5);\n}\n";
-        let err = run_pipeline(source).expect_err("turbofish mismatch should fail");
+        let err = run_pipeline(source, 0).expect_err("turbofish mismatch should fail");
         assert_eq!(err.stage, CompileStage::Typeck);
         assert!(
             err.message.contains("expected `bool`") && err.message.contains("found `i32`"),
@@ -1608,7 +1608,7 @@ mod tests {
     #[test]
     fn run_pipeline_generic_multi_param_rejected() {
         let source = "fn pair<T, U>(a: T, b: U) -> T {\n    a\n}\nfn main() {\n    let _ = pair(5, true);\n}\n";
-        let err = run_pipeline(source).expect_err("multi-T should fail");
+        let err = run_pipeline(source, 0).expect_err("multi-T should fail");
         assert_eq!(err.stage, CompileStage::Typeck);
         assert!(
             err.message.contains("single type parameter"),
@@ -1625,7 +1625,7 @@ mod tests {
     #[test]
     fn run_pipeline_generic_bound_rejected() {
         let source = "fn id<T: Foo>(x: T) -> T {\n    x\n}\nfn main() {\n    let _ = id(5);\n}\n";
-        let err = run_pipeline(source).expect_err("bound on unknown trait should fail");
+        let err = run_pipeline(source, 0).expect_err("bound on unknown trait should fail");
         assert_eq!(err.stage, CompileStage::Typeck);
         assert!(
             err.message.contains("Foo") && err.message.contains("trait"),
@@ -1638,7 +1638,7 @@ mod tests {
     #[test]
     fn run_pipeline_generic_nested_call_rejected() {
         let source = "fn id<T>(x: T) -> T {\n    x\n}\nfn outer<T>(x: T) -> T {\n    id::<T>(x)\n}\nfn main() {\n    let _ = outer(5);\n}\n";
-        let err = run_pipeline(source).expect_err("nested generic call should fail");
+        let err = run_pipeline(source, 0).expect_err("nested generic call should fail");
         assert_eq!(err.stage, CompileStage::Typeck);
         assert!(
             err.message.contains("out of scope in M07.5") || err.message.contains("inside another generic"),
@@ -1655,7 +1655,7 @@ mod tests {
     #[test]
     fn run_pipeline_trait_basic() {
         let source = "struct Point { x: i32, y: i32 }\ntrait Show { fn show(&self) -> i32; }\nimpl Show for Point { fn show(&self) -> i32 { self.x } }\nfn main() { let p = Point { x: 1, y: 2 }; let s = p.show(); }\n";
-        let events = run_pipeline(source).expect("trait basic compiles");
+        let events = run_pipeline(source, 0).expect("trait basic compiles");
         let frame = events.iter().any(|e| matches!(e,
             crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "<Point as Show>::show"
         ));
@@ -1673,7 +1673,7 @@ mod tests {
     #[test]
     fn run_pipeline_trait_missing_method() {
         let source = "struct Point { x: i32, y: i32 }\ntrait Show { fn show(&self) -> i32; }\nimpl Show for Point {}\nfn main() {}\n";
-        let err = run_pipeline(source).expect_err("missing required method should fail");
+        let err = run_pipeline(source, 0).expect_err("missing required method should fail");
         assert_eq!(err.stage, CompileStage::Typeck);
         assert!(
             err.message.contains("missing implementation") && err.message.contains("show"),
@@ -1686,7 +1686,7 @@ mod tests {
     #[test]
     fn run_pipeline_trait_extra_method() {
         let source = "struct Point { x: i32, y: i32 }\ntrait Show { fn show(&self) -> i32; }\nimpl Show for Point { fn show(&self) -> i32 { self.x } fn other(&self) -> i32 { 0 } }\nfn main() {}\n";
-        let err = run_pipeline(source).expect_err("extra method should fail");
+        let err = run_pipeline(source, 0).expect_err("extra method should fail");
         assert_eq!(err.stage, CompileStage::Typeck);
         assert!(
             err.message.contains("not on trait") && err.message.contains("other"),
@@ -1703,7 +1703,7 @@ mod tests {
     #[test]
     fn run_pipeline_default_method() {
         let source = "struct Point { x: i32, y: i32 }\ntrait Counter { fn count(&self) -> i32; fn double(&self) -> i32 { self.count() * 2 } }\nimpl Counter for Point { fn count(&self) -> i32 { self.x } }\nfn main() { let p = Point { x: 1, y: 2 }; let v = p.double(); }\n";
-        let events = run_pipeline(source).expect("default method compiles");
+        let events = run_pipeline(source, 0).expect("default method compiles");
         let outer = events.iter().any(|e| matches!(e,
             crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "<Point as Counter>::double"
         ));
@@ -1729,7 +1729,7 @@ mod tests {
     #[test]
     fn run_pipeline_generic_bound() {
         let source = "struct Point { x: i32, y: i32 }\ntrait Show { fn show(&self) -> i32; }\nimpl Show for Point { fn show(&self) -> i32 { self.x } }\nfn print<T: Show>(x: T) -> i32 { x.show() }\nfn main() { let p = Point { x: 1, y: 2 }; let r = print(p); }\n";
-        let events = run_pipeline(source).expect("generic bound compiles");
+        let events = run_pipeline(source, 0).expect("generic bound compiles");
         let outer = events.iter().any(|e| matches!(e,
             crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "print::<Point>"
         ));
@@ -1744,7 +1744,7 @@ mod tests {
     #[test]
     fn run_pipeline_trait_bound_unsatisfied() {
         let source = "struct Point { x: i32, y: i32 }\ntrait Show { fn show(&self) -> i32; }\nimpl Show for Point { fn show(&self) -> i32 { self.x } }\nfn print<T: Show>(x: T) -> i32 { x.show() }\nfn main() { let r = print(5); }\n";
-        let err = run_pipeline(source).expect_err("bound not satisfied should fail");
+        let err = run_pipeline(source, 0).expect_err("bound not satisfied should fail");
         assert_eq!(err.stage, CompileStage::Typeck);
         assert!(
             err.message.contains("trait bound") && err.message.contains("i32") && err.message.contains("Show"),
@@ -1760,7 +1760,7 @@ mod tests {
     #[test]
     fn run_pipeline_multi_bound() {
         let source = "struct Point { x: i32, y: i32 }\ntrait Show { fn show(&self) -> i32; }\ntrait Counter { fn count(&self) -> i32; }\nimpl Show for Point { fn show(&self) -> i32 { self.x } }\nimpl Counter for Point { fn count(&self) -> i32 { self.y } }\nfn show_n_count<T: Show + Counter>(x: T) -> i32 { x.show() + x.count() }\nfn main() { let p = Point { x: 1, y: 2 }; let r = show_n_count(p); }\n";
-        let events = run_pipeline(source).expect("multi-bound compiles");
+        let events = run_pipeline(source, 0).expect("multi-bound compiles");
         let outer = events.iter().any(|e| matches!(e,
             crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "show_n_count::<Point>"
         ));
@@ -1786,7 +1786,7 @@ mod tests {
     #[test]
     fn run_pipeline_trait_method_ambiguous() {
         let source = "struct Point { x: i32, y: i32 }\ntrait A { fn name(&self) -> i32; }\ntrait B { fn name(&self) -> i32; }\nimpl A for Point { fn name(&self) -> i32 { self.x } }\nimpl B for Point { fn name(&self) -> i32 { self.y } }\nfn foo<T: A + B>(x: T) -> i32 { x.name() }\nfn main() { let p = Point { x: 1, y: 2 }; let _ = foo(p); }\n";
-        let err = run_pipeline(source).expect_err("ambiguous method should fail");
+        let err = run_pipeline(source, 0).expect_err("ambiguous method should fail");
         assert_eq!(err.stage, CompileStage::Typeck);
         assert!(
             err.message.contains("ambiguous") && err.message.contains("UFCS"),
@@ -1801,7 +1801,7 @@ mod tests {
     #[test]
     fn run_pipeline_trait_inherent_wins() {
         let source = "struct Point { x: i32, y: i32 }\ntrait Show { fn show(&self) -> i32; }\nimpl Point { fn show(&self) -> i32 { 42 } }\nimpl Show for Point { fn show(&self) -> i32 { self.x } }\nfn main() { let p = Point { x: 1, y: 2 }; let v = p.show(); }\n";
-        let events = run_pipeline(source).expect("inherent + trait compiles");
+        let events = run_pipeline(source, 0).expect("inherent + trait compiles");
         // Inherent frame (M07.4 format), NOT trait `<as>` form.
         let inherent_frame = events.iter().any(|e| matches!(e,
             crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "Point::show"
@@ -1825,7 +1825,7 @@ mod tests {
     #[test]
     fn run_pipeline_trait_duplicate_decl() {
         let source = "trait Show { fn show(&self) -> i32; }\ntrait Show { fn show(&self) -> i32; }\nfn main() {}\n";
-        let err = run_pipeline(source).expect_err("duplicate trait should fail");
+        let err = run_pipeline(source, 0).expect_err("duplicate trait should fail");
         assert_eq!(err.stage, CompileStage::Typeck);
         assert!(
             err.message.contains("already defined") && err.message.contains("Show"),
@@ -1838,7 +1838,7 @@ mod tests {
     #[test]
     fn run_pipeline_trait_duplicate_impl() {
         let source = "struct Point { x: i32, y: i32 }\ntrait Show { fn show(&self) -> i32; }\nimpl Show for Point { fn show(&self) -> i32 { self.x } }\nimpl Show for Point { fn show(&self) -> i32 { self.y } }\nfn main() {}\n";
-        let err = run_pipeline(source).expect_err("duplicate impl should fail");
+        let err = run_pipeline(source, 0).expect_err("duplicate impl should fail");
         assert_eq!(err.stage, CompileStage::Typeck);
         assert!(
             err.message.contains("duplicate") && err.message.contains("Show"),
@@ -1855,7 +1855,7 @@ mod tests {
     #[test]
     fn run_pipeline_dyn_basic() {
         let source = "struct Point { x: i32, y: i32 }\ntrait Show { fn show(&self) -> i32; }\nimpl Show for Point { fn show(&self) -> i32 { self.x } }\nfn main() { let p = Point { x: 1, y: 2 }; let d: &dyn Show = &p; let s = d.show(); }\n";
-        let events = run_pipeline(source).expect("dyn basic compiles");
+        let events = run_pipeline(source, 0).expect("dyn basic compiles");
         let vtable_alloc = events.iter().filter(|e| matches!(e,
             crate::MemEvent::VtableAlloc { trait_name, type_name, .. }
                 if trait_name == "Show" && type_name == "Point"
@@ -1885,7 +1885,7 @@ mod tests {
     #[test]
     fn run_pipeline_dyn_coercion_error() {
         let source = "trait Show { fn show(&self) -> i32; }\nfn main() { let n = 5_i32; let d: &dyn Show = &n; let _ = d.show(); }\n";
-        let err = run_pipeline(source).expect_err("&i32 → &dyn Show should be rejected");
+        let err = run_pipeline(source, 0).expect_err("&i32 → &dyn Show should be rejected");
         assert_eq!(err.stage, CompileStage::Typeck);
         assert!(
             err.message.contains("i32") && err.message.contains("Show"),
@@ -1899,7 +1899,7 @@ mod tests {
     #[test]
     fn run_pipeline_dyn_inherent_rejected() {
         let source = "struct Point { x: i32, y: i32 }\ntrait Show { fn show(&self) -> i32; }\nimpl Point { fn extra(&self) -> i32 { 42 } }\nimpl Show for Point { fn show(&self) -> i32 { self.x } }\nfn main() { let p = Point { x: 1, y: 2 }; let d: &dyn Show = &p; let _ = d.extra(); }\n";
-        let err = run_pipeline(source).expect_err("inherent-via-dyn should be rejected");
+        let err = run_pipeline(source, 0).expect_err("inherent-via-dyn should be rejected");
         assert_eq!(err.stage, CompileStage::Typeck);
         assert!(
             err.message.contains("extra") && err.message.contains("Show"),
@@ -1916,7 +1916,7 @@ mod tests {
     #[test]
     fn run_pipeline_dyn_param() {
         let source = "struct Point { x: i32, y: i32 }\ntrait Show { fn show(&self) -> i32; }\nimpl Show for Point { fn show(&self) -> i32 { self.x } }\nfn print(x: &dyn Show) -> i32 { x.show() }\nfn main() { let p = Point { x: 1, y: 2 }; let r = print(&p); }\n";
-        let events = run_pipeline(source).expect("dyn param compiles");
+        let events = run_pipeline(source, 0).expect("dyn param compiles");
         let outer = events.iter().any(|e| matches!(e,
             crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "print"
         ));
@@ -1945,7 +1945,7 @@ mod tests {
     #[test]
     fn run_pipeline_dyn_param_two_types() {
         let source = "struct A { v: i32 }\nstruct B { v: i32 }\ntrait Show { fn show(&self) -> i32; }\nimpl Show for A { fn show(&self) -> i32 { self.v } }\nimpl Show for B { fn show(&self) -> i32 { self.v + 100 } }\nfn print(x: &dyn Show) -> i32 { x.show() }\nfn main() { let a = A { v: 1 }; let b = B { v: 2 }; let r1 = print(&a); let r2 = print(&b); }\n";
-        let events = run_pipeline(source).expect("dyn param two types compiles");
+        let events = run_pipeline(source, 0).expect("dyn param two types compiles");
         // TWO `print` frames (one per call), neither mangled.
         let print_frames = events.iter().filter(|e| matches!(e,
             crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "print"
@@ -1966,7 +1966,7 @@ mod tests {
     #[test]
     fn run_pipeline_dyn_vtable_interned() {
         let source = "struct Point { x: i32, y: i32 }\ntrait Show { fn show(&self) -> i32; }\nimpl Show for Point { fn show(&self) -> i32 { self.x } }\nfn main() { let p = Point { x: 1, y: 2 }; let d1: &dyn Show = &p; let d2: &dyn Show = &p; let s1 = d1.show(); let s2 = d2.show(); }\n";
-        let events = run_pipeline(source).expect("vtable interning compiles");
+        let events = run_pipeline(source, 0).expect("vtable interning compiles");
         let alloc_count = events.iter().filter(|e| matches!(e,
             crate::MemEvent::VtableAlloc { trait_name, type_name, .. }
                 if trait_name == "Show" && type_name == "Point"
@@ -1984,7 +1984,7 @@ mod tests {
     #[test]
     fn run_pipeline_box_dyn() {
         let source = "struct Point { x: i32, y: i32 }\ntrait Show { fn show(&self) -> i32; }\nimpl Show for Point { fn show(&self) -> i32 { self.x } }\nfn main() { let p = Point { x: 1, y: 2 }; let b: Box<dyn Show> = Box::new(p); let s = b.show(); }\n";
-        let events = run_pipeline(source).expect("box dyn compiles");
+        let events = run_pipeline(source, 0).expect("box dyn compiles");
         let heap_alloc = events.iter().any(|e| matches!(e, crate::MemEvent::HeapAlloc { .. }));
         assert!(heap_alloc, "expected HeapAlloc for Box::new");
         let vtable_alloc = events.iter().any(|e| matches!(e,
@@ -2021,7 +2021,7 @@ mod tests {
     #[test]
     fn run_pipeline_static_vs_dyn() {
         let source = "struct Point { x: i32, y: i32 }\ntrait Show { fn show(&self) -> i32; }\nimpl Show for Point { fn show(&self) -> i32 { self.x } }\nfn s<T: Show>(x: T) -> i32 { x.show() }\nfn d(x: &dyn Show) -> i32 { x.show() }\nfn main() { let p = Point { x: 1, y: 2 }; let a = s(p); let b = d(&p); }\n";
-        let events = run_pipeline(source).expect("static vs dyn compiles");
+        let events = run_pipeline(source, 0).expect("static vs dyn compiles");
         // Static dispatch: mangled `s::<Point>` frame.
         let static_frame = events.iter().any(|e| matches!(e,
             crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "s::<Point>"
@@ -2050,7 +2050,7 @@ mod tests {
     #[test]
     fn run_pipeline_dyn_mut_coercion_rejected() {
         let source = "struct Point { x: i32, y: i32 }\ntrait Show { fn show(&self) -> i32; }\nimpl Show for Point { fn show(&self) -> i32 { self.x } }\nfn main() { let p = Point { x: 1, y: 2 }; let d: &mut dyn Show = &p; let _ = d.show(); }\n";
-        let err = run_pipeline(source).expect_err("&T → &mut dyn should be rejected");
+        let err = run_pipeline(source, 0).expect_err("&T → &mut dyn should be rejected");
         assert_eq!(err.stage, CompileStage::Typeck);
         // Error message can match either the explicit-cast wording or the
         // general type-mismatch fallback — both convey the same rejection.
@@ -2068,7 +2068,7 @@ mod tests {
     #[test]
     fn run_pipeline_dyn_default_method() {
         let source = "struct Point { x: i32, y: i32 }\ntrait Counter { fn count(&self) -> i32; fn double(&self) -> i32 { self.count() * 2 } }\nimpl Counter for Point { fn count(&self) -> i32 { self.x } }\nfn main() { let p = Point { x: 1, y: 2 }; let d: &dyn Counter = &p; let v = d.double(); }\n";
-        let events = run_pipeline(source).expect("default method through dyn compiles");
+        let events = run_pipeline(source, 0).expect("default method through dyn compiles");
         let outer = events.iter().any(|e| matches!(e,
             crate::MemEvent::FrameEnter { fn_name, .. } if fn_name == "<Point as Counter>::double"
         ));
@@ -2095,7 +2095,7 @@ mod tests {
     #[test]
     fn run_pipeline_thread_spawn() {
         let source = "fn main() { let h = thread::spawn(move || { let x = 5; }); h.join(); }\n";
-        let events = run_pipeline(source).expect("thread::spawn compiles");
+        let events = run_pipeline(source, 0).expect("thread::spawn compiles");
         let spawn_count = events.iter().filter(|e| matches!(e,
             crate::MemEvent::ThreadSpawn { thread_id: 1, .. }
         )).count();
@@ -2122,7 +2122,7 @@ mod tests {
     #[test]
     fn run_pipeline_closure_outside_spawn() {
         let source = "fn main() { let f = move || { let x = 5; }; }\n";
-        let err = run_pipeline(source).expect_err("standalone closure should be rejected");
+        let err = run_pipeline(source, 0).expect_err("standalone closure should be rejected");
         assert_eq!(err.stage, CompileStage::Typeck);
         assert!(
             err.message.contains("closures") && err.message.contains("thread::spawn"),
@@ -2135,7 +2135,7 @@ mod tests {
     #[test]
     fn run_pipeline_non_move_closure() {
         let source = "fn main() { thread::spawn(|| { let x = 5; }); }\n";
-        let err = run_pipeline(source).expect_err("non-move closure should be rejected");
+        let err = run_pipeline(source, 0).expect_err("non-move closure should be rejected");
         assert_eq!(err.stage, CompileStage::Typeck);
         assert!(
             err.message.contains("move"),
@@ -2152,7 +2152,7 @@ mod tests {
     #[test]
     fn run_pipeline_arc_clone() {
         let source = "fn main() { let a = Arc::new(5); { let b = Arc::clone(&a); } }\n";
-        let events = run_pipeline(source).expect("Arc clone compiles");
+        let events = run_pipeline(source, 0).expect("Arc clone compiles");
         let alloc_count = events.iter().filter(|e| matches!(e,
             crate::MemEvent::HeapAlloc { .. }
         )).count();
@@ -2181,7 +2181,7 @@ mod tests {
     #[test]
     fn run_pipeline_arc_drop_decrement() {
         let source = "fn main() { let a = Arc::new(5); { let b = Arc::clone(&a); } }\n";
-        let events = run_pipeline(source).expect("compiles");
+        let events = run_pipeline(source, 0).expect("compiles");
         // Find the events in order and check the b-drop (first ArcDrop) doesn't
         // produce HeapFree, but the a-drop (second ArcDrop) does.
         let mut first_drop_seen = false;
@@ -2216,7 +2216,7 @@ mod tests {
     #[test]
     fn run_pipeline_arc_mutex() {
         let source = "fn main() { let m = Arc::new(Mutex::new(0)); let m2 = Arc::clone(&m); let h = thread::spawn(move || { let g = m2.lock(); }); { let g = m.lock(); }; h.join(); }\n";
-        let events = run_pipeline(source).expect("Arc<Mutex<T>> compiles");
+        let events = run_pipeline(source, 0).expect("Arc<Mutex<T>> compiles");
         // Post-M08 fusion: Arc::new(Mutex::new(...)) produces ONE heap
         // allocation (the Mutex's block is taken over by the Arc as a
         // fused ArcMutex). Was 2 in M08 v1.
@@ -2239,8 +2239,8 @@ mod tests {
     #[test]
     fn run_pipeline_determinism() {
         let source = "fn main() { let m = Arc::new(Mutex::new(0)); let m2 = Arc::clone(&m); let h = thread::spawn(move || { let g = m2.lock(); }); { let g = m.lock(); }; h.join(); }\n";
-        let run1 = run_pipeline(source).expect("run 1 compiles");
-        let run2 = run_pipeline(source).expect("run 2 compiles");
+        let run1 = run_pipeline(source, 0).expect("run 1 compiles");
+        let run2 = run_pipeline(source, 0).expect("run 2 compiles");
         assert_eq!(run1, run2, "M08 event stream must be deterministic across runs");
     }
 
@@ -2248,7 +2248,7 @@ mod tests {
     #[test]
     fn run_pipeline_arc_clone_non_arc() {
         let source = "fn main() { let n = 5; let a = Arc::clone(&n); }\n";
-        let err = run_pipeline(source).expect_err("Arc::clone on non-Arc should be rejected");
+        let err = run_pipeline(source, 0).expect_err("Arc::clone on non-Arc should be rejected");
         assert_eq!(err.stage, CompileStage::Typeck);
         assert!(
             err.message.contains("Arc"),

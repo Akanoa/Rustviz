@@ -122,6 +122,12 @@ let debounceTimer = null;
 let lastSnapshot = null;
 let redrawScheduled = false;
 
+// **M08.2 / 021**: seed used for thread scheduling. Default 0 on page load
+// (deterministic first impression). Updated by US2's seed input + US3's
+// re-roll button. Synced from state.seed on every successful render so the
+// JS in-memory value never drifts from what produced the visible trace.
+let currentSeed = 0;
+
 const DEBOUNCE_MS = 300;
 
 // ─── 020: panel layout (fold + drag-resize + persistence) ─────────────────
@@ -520,6 +526,10 @@ function render(state) {
   // **020**: cache for redrawOverlays() — fold/drag/reset triggers a redraw
   // using this snapshot without rerunning the WASM pipeline.
   lastSnapshot = state;
+  // **M08.2**: keep the in-memory `currentSeed` in sync with the trace that's
+  // currently rendered (single source of truth — VR-SF2). The Phase 4 UI
+  // (seed input field) reads from this on display.
+  if (typeof state.seed === "number") currentSeed = state.seed;
   // Stacks panel: rebuild from scratch.
   const stacksEl = document.getElementById("stacks");
   // **M08**: multi-thread routing — when `state.threads` is non-empty,
@@ -1829,9 +1839,11 @@ function setEditorSource(source) {
 
 // US1: re-run the M01→M02→M03 pipeline on the current editor content and
 // render the result. Called by the debounced updateListener.
+// **M08.2**: passes currentSeed so the scheduler uses the same seed across
+// edits (sticky seed — user changes it explicitly via the seed input).
 function recompile(source) {
   stopPlay();
-  const result = JSON.parse(player.set_source(source));
+  const result = JSON.parse(player.set_source(source, currentSeed));
   if (result.ok) {
     render(result.state);
   } else {

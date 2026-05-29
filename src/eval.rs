@@ -14,17 +14,83 @@ use crate::typeck::{BindingType, Ty, TypeMap};
 /// `RuntimeError` Note and halts (research R-013).
 const RECURSION_LIMIT: usize = 100;
 
+// ─── M08.2: seeded PRNG for the randomized scheduler ────────────────────
+//
+// xorshift64* — period 2^64-1, passes BigCrush, ~5 LOC. Used by
+// `Scheduler::pick` to choose a thread uniformly from the Ready set.
+// Hand-rolled instead of pulling `rand`/`rand_core` (~100KB of WASM).
+// See research.md R-001.
+struct Prng {
+    state: u64,
+}
+
+impl Prng {
+    fn new(seed: u32) -> Self {
+        // Splat u32 to u64 so seed=0 doesn't degenerate (xorshift on 0
+        // stays at 0 forever).
+        let s = ((seed as u64) << 32) | (seed as u64);
+        // If still 0 (seed=0 → s=0), use a constant kick so the stream
+        // is non-trivial. Deterministic and still "seed=0 is the default".
+        let state = if s == 0 { 0xDEAD_BEEF_CAFE_F00D } else { s };
+        Self { state }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        // xorshift64*
+        self.state ^= self.state >> 12;
+        self.state ^= self.state << 25;
+        self.state ^= self.state >> 27;
+        self.state.wrapping_mul(0x2545F4914F6CDD1D)
+    }
+}
+
+/// **M08.2**: seeded scheduler. Picks which Ready thread advances at each
+/// scheduling decision point. For single-choice picks, the PRNG state is
+/// NOT advanced — preserves single-thread byte-identical traces (VR-S2,
+/// SC-002).
+struct Scheduler {
+    prng: Prng,
+    /// Original seed (for pedagogical Notes and debug).
+    #[allow(dead_code)] // surfaced in Phase 3 / 4 (US1 Note emission, US2 state).
+    seed: u32,
+}
+
+impl Scheduler {
+    fn new(seed: u32) -> Self {
+        Self { prng: Prng::new(seed), seed }
+    }
+
+    /// Pick uniformly at random from a non-empty sorted-by-id slice. For
+    /// a single-element slice, returns the element WITHOUT advancing the
+    /// PRNG state (VR-S2). Caller MUST sort by ThreadId for determinism
+    /// (VR-S3); the underlying IndexMap iteration order is preserved but
+    /// we explicitly sort to defend against future iteration-order changes.
+    #[allow(dead_code)] // wired in Phase 3 (US1).
+    fn pick(&mut self, ready: &[crate::event::ThreadId]) -> crate::event::ThreadId {
+        assert!(!ready.is_empty(), "Scheduler::pick called on empty Ready set (VR-S1)");
+        if ready.len() == 1 {
+            return ready[0];
+        }
+        let idx = (self.prng.next_u64() % ready.len() as u64) as usize;
+        ready[idx]
+    }
+}
+
 /// Evaluate a resolved + typed program, producing a deterministic event stream.
 ///
 /// On success (including runtime errors that surface as `Note` events), returns
 /// `Ok(Vec<MemEvent>)`. `Err(ParseError)` is reserved for static-time invariant
 /// violations that should be unreachable when M02 succeeded.
+///
+/// **M08.2**: `seed` parameter controls thread-scheduling decisions. For
+/// single-threaded programs the seed has no observable effect.
 pub fn evaluate(
     program: &ast::Program,
     resolution: &Resolution,
     types: &TypeMap,
+    seed: u32,
 ) -> Result<Vec<MemEvent>, ParseError> {
-    let mut eval = Evaluator::new(program, resolution, types)?;
+    let mut eval = Evaluator::new(program, resolution, types, seed)?;
 
     // Look up `main` and call it. If there's no `main`, return an empty stream
     // (this isn't an error — some samples might just define helper fns).
@@ -130,6 +196,11 @@ struct Evaluator<'a> {
     events: Vec<MemEvent>,
     /// Set to true on runtime error to stop further evaluation.
     halted: bool,
+    /// **M08.2**: seeded scheduler. Consulted at scheduling decision points
+    /// (pending-thread-runs drain in Phase 2; full cooperative scheduling
+    /// + parking in Phase 3). For single-Ready picks the PRNG state isn't
+    /// advanced — single-threaded samples stay byte-identical (SC-002).
+    scheduler: Scheduler,
 }
 
 /// **M07**: heap state. Each live allocation is one HeapObject indexed by
@@ -473,6 +544,7 @@ impl<'a> Evaluator<'a> {
         program: &'a ast::Program,
         resolution: &'a Resolution,
         types: &'a TypeMap,
+        seed: u32,
     ) -> Result<Self, ParseError> {
         let mut fn_decls = HashMap::new();
         let mut methods: HashMap<(String, String), &'a ast::FnDecl> = HashMap::new();
@@ -608,6 +680,7 @@ impl<'a> Evaluator<'a> {
             static_region: StaticState::new(),
             events: Vec::new(),
             halted: false,
+            scheduler: Scheduler::new(seed),
         })
     }
 
@@ -1837,26 +1910,27 @@ impl<'a> Evaluator<'a> {
         if !self.halted {
             self.flush_pending_notes();
         }
-        // **Post-M08 polish**: drain `pending_thread_runs` AFTER the
-        // statement's main effects (including the let-binding's SlotAlloc
-        // + SlotWrite for the JoinHandle). The spawned thread's body
-        // then runs at the next cursor step(s), with `h: JoinHandle(#N)`
-        // already visible in the spawning thread's frame card.
+        // **Post-M08 polish + M08.2**: drain `pending_thread_runs` AFTER
+        // the statement's main effects. Order is now scheduler-driven —
+        // when multiple threads are queued, the seeded PRNG picks which
+        // runs first. Single-element queues bypass the PRNG to preserve
+        // single-thread byte-identical traces (VR-S2, SC-002).
         if !self.halted {
-            let to_run: Vec<crate::event::ThreadId> =
+            let mut to_run: Vec<crate::event::ThreadId> =
                 std::mem::take(&mut self.pending_thread_runs);
             let resume = self.current_thread_id;
-            for tid in to_run {
-                if self.halted { break; }
-                // Use the statement's tail span as the switch span;
-                // we don't have a more precise one at this layer.
+            while !to_run.is_empty() && !self.halted {
+                // Sort by ThreadId for determinism (VR-S3) before the pick.
+                to_run.sort_by_key(|t| t.0);
+                let chosen = self.scheduler.pick(&to_run);
+                to_run.retain(|t| *t != chosen);
                 let switch_span = match stmt {
                     ast::Stmt::Let(let_stmt) => let_stmt.span,
                     ast::Stmt::Expr(e) => e.span(),
                     ast::Stmt::Assign { span, .. } => *span,
                 };
-                self.switch_to(tid, switch_span);
-                self.run_queued_thread_to_done(tid);
+                self.switch_to(chosen, switch_span);
+                self.run_queued_thread_to_done(chosen);
                 self.switch_to(resume, switch_span);
             }
         }

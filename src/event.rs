@@ -487,6 +487,16 @@ pub enum MemEvent {
         /// `join()` for join-driven, body close brace for completion).
         span: Span,
     },
+    /// **M08.2**: the scheduler detected an unrecoverable deadlock — no
+    /// Ready threads exist but at least one thread is Parked/JoinWait.
+    /// Emitted ONCE as the FINAL event of the trace. The player stops at
+    /// this step; no further events follow.
+    Deadlock {
+        /// All currently-blocked threads (the deadlocked set). Non-empty.
+        thread_ids: Vec<ThreadId>,
+        /// Span of the most-recent scheduling decision point.
+        span: Span,
+    },
     /// **M07.7**: a vtable was allocated in the VTABLES region. Fires
     /// ONCE per unique `(trait_name, type_name)` pair when the first
     /// trait-object value targeting that pair is constructed. Content-
