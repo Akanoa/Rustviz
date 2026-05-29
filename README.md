@@ -13,7 +13,7 @@ The aim is to make tangible what is usually abstract:
 
 ## Try it locally
 
-Requires Rust ≥ 1.85, the `wasm32-unknown-unknown` target, and [Trunk](https://trunkrs.dev/).
+Requires Rust ≥ 1.85, the `wasm32-unknown-unknown` target, and [Trunk](https://github.com/trunk-rs/trunk).
 
 ```sh
 rustup target add wasm32-unknown-unknown
