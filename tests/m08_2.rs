@@ -23,6 +23,7 @@ const M08_ARC_MUTEX: &str = include_str!("../web/samples/m08_arc_mutex.rs");
 const M03_ARITHMETIC: &str = include_str!("../web/samples/m03_arithmetic.rs");
 const M03_FN_CALL: &str = include_str!("../web/samples/m03_fn_call.rs");
 const M07_BOX: &str = include_str!("../web/samples/m07_box.rs");
+const M08_2_DEADLOCK: &str = include_str!("../web/samples/m08_2_deadlock.rs");
 
 /// Same source + same seed → byte-identical event stream on every run.
 /// Covers B-M082-1, SC-003.
@@ -38,6 +39,49 @@ fn same_seed_determinism() {
         let b = run_pipeline(M08_ARC_MUTEX, seed).expect("compiles");
         assert_eq!(a, b, "same (source, seed={seed}) must produce identical traces");
     }
+}
+
+/// At least one (seed_a, seed_b) pair produces non-identical traces on
+/// the M08 Arc<Mutex> sample. Phase 3 cooperative scheduling means seed
+/// controls the order main vs. the spawned closure run their stmts, so
+/// different seeds visibly shift event ordering.
+/// Covers B-M082-3, SC-001.
+#[test]
+fn different_seed_divergence() {
+    let baseline = run_pipeline(M08_ARC_MUTEX, 0).expect("compiles");
+    let mut diverged_seeds = 0;
+    for seed in 1u32..=20 {
+        let trace = run_pipeline(M08_ARC_MUTEX, seed).expect("compiles");
+        if trace != baseline {
+            diverged_seeds += 1;
+        }
+    }
+    assert!(
+        diverged_seeds > 0,
+        "expected at least one of seeds 1..=20 to produce a trace different from seed=0; got {diverged_seeds} divergent seeds (the scheduler appears purely deterministic — multi-Ready picks may not be exercising the PRNG)"
+    );
+}
+
+/// Detect deadlock on the m08_2_deadlock sample: under at least one seed
+/// in 1..=50, the trace ends with `MemEvent::Deadlock`. Cover B-M082-4,
+/// SC-007. The sample acquires locks in opposite orders on two threads;
+/// with the right interleaving, both end up waiting on each other.
+#[test]
+fn deadlock_detection() {
+    use rustviz::MemEvent;
+    let mut found_deadlock_seed = None;
+    for seed in 0u32..=50 {
+        let trace = run_pipeline(M08_2_DEADLOCK, seed).expect("compiles");
+        if let Some(MemEvent::Deadlock { thread_ids, .. }) = trace.last() {
+            assert!(!thread_ids.is_empty(), "Deadlock thread_ids must be non-empty");
+            found_deadlock_seed = Some(seed);
+            break;
+        }
+    }
+    assert!(
+        found_deadlock_seed.is_some(),
+        "expected at least one of seeds 0..=50 to produce a Deadlock event on the m08_2_deadlock sample"
+    );
 }
 
 /// Single-threaded programs produce identical traces across all seeds.

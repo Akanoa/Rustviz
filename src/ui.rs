@@ -1789,6 +1789,19 @@ fn note_to_status(event: &MemEvent) -> Option<StatusView> {
             },
             message: message.clone(),
         }),
+        // **M08.2**: deadlock surfaces in the status bar as an error.
+        MemEvent::Deadlock { thread_ids, .. } => {
+            let ids = thread_ids.iter()
+                .map(|t| format!("#{}", t.0))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Some(StatusView {
+                kind: "error".to_owned(),
+                message: format!(
+                    "Deadlock: threads {ids} are all waiting on each other's locks. No further progress is possible. The trace ends here — step back to inspect the prior state, or try a different seed to see if the program completes under another schedule."
+                ),
+            })
+        }
         _ => None,
     }
 }

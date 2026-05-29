@@ -111,6 +111,9 @@ pub fn evaluate(
             decl.span.file,
         );
         let _ = eval.call_fn(id, Vec::new(), entry_span);
+        // **M08.2**: main finished — drain any remaining spawned threads
+        // cooperatively, handling Mutex parking + deadlock detection.
+        eval.drain_remaining_threads(entry_span);
     }
 
     Ok(eval.events)
@@ -201,6 +204,21 @@ struct Evaluator<'a> {
     /// + parking in Phase 3). For single-Ready picks the PRNG state isn't
     /// advanced — single-threaded samples stay byte-identical (SC-002).
     scheduler: Scheduler,
+    /// **M08.2**: set when the currently-executing thread should yield to
+    /// the scheduler (Mutex contention or join-wait). Eval-stack bails
+    /// out via the same `if self.halted` checks; the scheduler reads this,
+    /// marks the thread's status, clears the signal, picks another thread.
+    park_signal: Option<ParkSignal>,
+}
+
+/// **M08.2**: reason the current thread is yielding to the scheduler.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // Join variant reserved for cooperative join parking
+enum ParkSignal {
+    /// Thread tried to acquire a contended Mutex at `addr`.
+    Lock(crate::event::HeapAddr),
+    /// Thread tried to join `target` which isn't Done yet.
+    Join(crate::event::ThreadId),
 }
 
 /// **M07**: heap state. Each live allocation is one HeapObject indexed by
@@ -501,6 +519,32 @@ struct QueuedBody<'a> {
     /// its source LocalSlots as moved when `start_queued_thread` runs
     /// (so drop_current_scope on the spawning thread skips them).
     spawning_thread: crate::event::ThreadId,
+    /// **M08.2**: cooperative scheduler resume point. Index into
+    /// `body.stmts` of the next stmt to run. 0 on initial queue;
+    /// incremented after each successful stmt eval; stmt is RE-RUN on
+    /// resume when the thread parked on that stmt (mutex / join).
+    next_stmt_idx: usize,
+    /// **M08.2**: true after the first call to `run_queued_thread_one_stmt`
+    /// emitted FrameEnter + captures + pushed the frame/scope. Setup is
+    /// done once per queued thread; subsequent calls skip it.
+    setup_done: bool,
+}
+
+/// **M08.2**: result of advancing a thread by one cooperative-scheduling
+/// step. Returned by `run_queued_thread_one_stmt` so the scheduler loop
+/// knows whether to re-queue, mark Done, or pick another thread.
+#[derive(Debug)]
+enum StepProgress {
+    /// Thread ran a stmt successfully; more stmts remain. Stays Ready.
+    Continue,
+    /// Thread completed its body (or returned early). Now Done.
+    Done,
+    /// Thread parked on a contended Mutex lock. Status flipped to
+    /// `Parked { lock: addr }`. Will resume when the lock is released.
+    ParkedLock,
+    /// Thread parked waiting on another thread's join. Status flipped to
+    /// `JoinWait { target: tid }`. Will resume when target reaches Done.
+    ParkedJoin,
 }
 
 struct Frame {
@@ -681,6 +725,7 @@ impl<'a> Evaluator<'a> {
             events: Vec::new(),
             halted: false,
             scheduler: Scheduler::new(seed),
+            park_signal: None,
         })
     }
 
@@ -792,17 +837,24 @@ impl<'a> Evaluator<'a> {
             .expect("mutex_lock: heap object present");
         match obj {
             HeapObject::Mutex { holder, .. } | HeapObject::ArcMutex { holder, .. } => {
-                if holder.is_some() {
-                    // M08 v1 limitation: contention doesn't park (would
-                    // need async/continuations). Panic with clear message
-                    // — should be unreachable in well-formed M08 v1 samples
-                    // (all M08 samples lock in non-contending order due to
-                    // join-runs-spawned-inline behavior).
-                    panic!(
-                        "mutex_lock: M08 v1 doesn't support parking; sample exercises real contention which is deferred to M08.1"
-                    );
+                if let Some(h) = *holder {
+                    if h != current {
+                        // **M08.2**: lock is held by another thread. Park.
+                        // The scheduler reads `park_signal` after the eval
+                        // stack unwinds (via `halted`), flips the thread's
+                        // status to ThreadStatus::Parked, clears the signal
+                        // + halted, and picks another Ready thread.
+                        self.park_signal = Some(ParkSignal::Lock(addr));
+                        self.halted = true;
+                        return Value::Unit; // sentinel — caller bails out via halted
+                    }
+                    // Re-entrant lock by same thread — fall through to no-op
+                    // (Rust's std::sync::Mutex panics on re-entrance, but
+                    // for pedagogy we just allow it; matches M08 v1 behavior
+                    // where this case was implicitly fine).
+                } else {
+                    *holder = Some(current);
                 }
-                *holder = Some(current);
             }
             _ => panic!("mutex_lock: heap object is not Mutex or ArcMutex"),
         }
@@ -941,8 +993,8 @@ impl<'a> Evaluator<'a> {
     /// status `Ready` (queued, not yet started) or `Running` (just
     /// unparked or unblocked). Returns `None` if all threads are blocked
     /// (deadlock — caller decides whether to panic or proceed).
-    /// **Note**: unused in M08 v1's join-runs-target-inline model. Kept
-    /// for the future M08.1 (parking) extension.
+    /// **Note**: kept for backward compat; cooperative loop uses
+    /// `scheduler_tick`.
     #[allow(dead_code)]
     fn schedule_next_ready(&self) -> Option<crate::event::ThreadId> {
         for (tid, ts) in &self.threads {
@@ -953,19 +1005,303 @@ impl<'a> Evaluator<'a> {
         None
     }
 
+    /// **M08.2**: cooperative scheduler tick. Called at each stmt boundary
+    /// of the currently-running thread. Picks via seeded PRNG from
+    /// `{self, ...ready_spawned_threads}`. If self wins → no-op (caller
+    /// continues its own next stmt). If a spawned thread wins → switch to
+    /// it, run one stmt, handle park, switch back.
+    fn scheduler_tick(&mut self, span: Span) {
+        if self.halted {
+            return;
+        }
+        // **M08.2**: only main triggers the cooperative tick. Spawned threads
+        // run their own stmts uninterrupted from their start until they
+        // park / finish (driven by run_queued_thread_one_stmt). Without
+        // this guard, a spawned thread's post-stmt scheduler_tick would
+        // recursively try to advance main, breaking the call-stack
+        // invariant (main isn't resumable from arbitrary points).
+        if self.current_thread_id != crate::event::ThreadId(0) {
+            return;
+        }
+        let resume = self.current_thread_id;
+        // Build candidate list: current thread + all Ready spawned threads.
+        // Sorted by ThreadId for determinism (VR-S3).
+        let mut candidates: Vec<crate::event::ThreadId> = vec![resume];
+        for (tid, ts) in &self.threads {
+            if *tid == resume { continue; }
+            if matches!(ts.status, ThreadStatus::Ready | ThreadStatus::Running) {
+                candidates.push(*tid);
+            }
+        }
+        candidates.sort_by_key(|t| t.0);
+        let chosen = self.scheduler.pick(&candidates);
+        if chosen == resume {
+            return; // continue current thread
+        }
+        // **M08.2 / R-008**: pedagogical Note explaining the scheduler
+        // decision. Surfaces the non-determinism to learners: "this
+        // could have been the OTHER thread; seed=N gave us this choice."
+        // Only emitted when there's actually a choice (≥ 2 candidates) —
+        // forced picks are pedagogically silent.
+        if candidates.len() > 1 {
+            let n_other = candidates.len() - 1;
+            self.events.push(MemEvent::Note {
+                kind: NoteKind::Info,
+                message: format!(
+                    "Scheduler picked thread #{} to advance one statement (seed={}, {n_other} other thread{} also ready). With a different seed the choice could swing the other way — this is what 'threads are non-deterministic' means in practice.",
+                    chosen.0,
+                    self.scheduler.seed,
+                    if n_other == 1 { " was" } else { "s were" },
+                ),
+                span,
+            });
+        }
+        // Switch to the chosen spawned thread, run one stmt.
+        self.switch_to(chosen, span);
+        let progress = self.run_queued_thread_one_stmt(chosen, span);
+        self.handle_step_progress(chosen, progress, span);
+        // Switch back to the original caller.
+        self.switch_to(resume, span);
+    }
+
+    /// **M08.2**: handle the StepProgress returned by
+    /// `run_queued_thread_one_stmt`. Updates the thread's status and
+    /// triggers unparking when the thread reached Done.
+    fn handle_step_progress(
+        &mut self,
+        tid: crate::event::ThreadId,
+        progress: StepProgress,
+        span: Span,
+    ) {
+        match progress {
+            StepProgress::Continue => {}
+            StepProgress::Done => {
+                if let Some(ts) = self.threads.get_mut(&tid) {
+                    ts.status = ThreadStatus::Done;
+                }
+                // Unpark any thread that was JoinWait-ing on this one.
+                self.unpark_joiners(tid, span);
+            }
+            StepProgress::ParkedLock => {
+                // park_signal already set by mutex_lock; convert it.
+                if let Some(ParkSignal::Lock(addr)) = self.park_signal.take() {
+                    if let Some(ts) = self.threads.get_mut(&tid) {
+                        ts.status = ThreadStatus::Parked { lock: addr };
+                    }
+                }
+                self.halted = false; // clear soft halt — only this thread parked
+            }
+            StepProgress::ParkedJoin => {
+                if let Some(ParkSignal::Join(target)) = self.park_signal.take() {
+                    if let Some(ts) = self.threads.get_mut(&tid) {
+                        ts.status = ThreadStatus::JoinWait { target };
+                    }
+                }
+                self.halted = false;
+            }
+        }
+    }
+
+    /// **M08.2**: when `target` reaches Done, scan for any thread parked
+    /// on `JoinWait { target }` and flip them back to Ready/Running.
+    fn unpark_joiners(&mut self, target: crate::event::ThreadId, _span: Span) {
+        let to_unpark: Vec<crate::event::ThreadId> = self.threads.iter()
+            .filter_map(|(tid, ts)| match ts.status {
+                ThreadStatus::JoinWait { target: t } if t == target => Some(*tid),
+                _ => None,
+            })
+            .collect();
+        for tid in to_unpark {
+            if let Some(ts) = self.threads.get_mut(&tid) {
+                ts.status = ThreadStatus::Running;
+            }
+        }
+    }
+
+    /// **M08.2**: when a lock is released, scan for any thread parked on
+    /// `Parked { lock: addr }` and flip them back to Ready/Running so the
+    /// next scheduler tick can pick one of them.
+    fn unpark_lock_waiters(&mut self, addr: crate::event::HeapAddr) {
+        let to_unpark: Vec<crate::event::ThreadId> = self.threads.iter()
+            .filter_map(|(tid, ts)| match ts.status {
+                ThreadStatus::Parked { lock } if lock == addr => Some(*tid),
+                _ => None,
+            })
+            .collect();
+        for tid in to_unpark {
+            if let Some(ts) = self.threads.get_mut(&tid) {
+                ts.status = ThreadStatus::Running;
+            }
+        }
+    }
+
+    /// **M08.2**: cooperative-scheduling primitive. Run the queued thread
+    /// `tid` for ONE statement. On first call (when `setup_done == false`),
+    /// also performs the FrameEnter + captures setup. When all stmts are
+    /// done, finalizes (drops scopes, emits FrameLeave, returns Done).
+    /// Returns ParkedLock/ParkedJoin if the stmt's first action would
+    /// contend on a Mutex / wait on a join.
+    fn run_queued_thread_one_stmt(
+        &mut self,
+        tid: crate::event::ThreadId,
+        finalize_span: Span,
+    ) -> StepProgress {
+        // First-call setup: emit FrameEnter, install captures, push scope.
+        let needs_setup = self.threads.get(&tid)
+            .and_then(|t| t.queued_body.as_ref())
+            .map(|qb| !qb.setup_done)
+            .unwrap_or(false);
+        if needs_setup {
+            self.start_queued_thread(tid);
+            if self.halted { return StepProgress::Continue; }
+            // **M08.2**: mirror `eval_fn_body`'s body-scope push so the
+            // finalize path's two `drop_current_scope` calls (body inner
+            // + frame outer) have two scopes to pop. Without this, the
+            // finalize panics on `.scopes.pop().expect("scope active")`.
+            self.frames_mut()
+                .last_mut()
+                .expect("frame active after start_queued_thread")
+                .scopes
+                .push(Scope {
+                    locals: Vec::new(),
+                    borrows: Vec::new(),
+                    heap_allocs: Vec::new(),
+                });
+        }
+        // Read body + next_stmt_idx from queued_body.
+        let (body, idx, body_span) = match self.threads.get(&tid)
+            .and_then(|t| t.queued_body.as_ref())
+        {
+            Some(qb) => (qb.body, qb.next_stmt_idx, qb.body.span),
+            None => return StepProgress::Done, // already finalized
+        };
+        // All stmts done? Run the tail expression (if any), then finalize.
+        if idx >= body.stmts.len() {
+            // Tail expression evaluation (M06 block-as-expression semantics).
+            // For closure bodies in M08, this is typically the implicit
+            // unit return of `move || { ... }`; no tail expr to eval.
+            if let Some(tail) = &body.tail {
+                let _ = self.eval_expr(tail);
+                if self.halted && self.park_signal.is_some() {
+                    return self.park_progress();
+                }
+            }
+            let close_span = closing_brace_span(body_span);
+            // Drop body's inner scope + outer (frame) scope.
+            self.drop_current_scope(close_span);
+            self.drop_current_scope(close_span);
+            // Emit FrameLeave + pop frame.
+            let frame_id = self.threads.get(&tid)
+                .and_then(|t| t.frames.last())
+                .map(|f| f.frame_id);
+            if let Some(fid) = frame_id {
+                self.events.push(MemEvent::FrameLeave {
+                    frame_id: fid,
+                    return_value: Value::Unit,
+                    span: close_span,
+                });
+            }
+            if let Some(ts) = self.threads.get_mut(&tid) {
+                ts.frames.pop();
+                ts.queued_body = None;
+            }
+            let _ = finalize_span;
+            return StepProgress::Done;
+        }
+        // Evaluate one statement.
+        let stmt = &body.stmts[idx];
+        self.eval_stmt(stmt);
+        // Park signal triggered mid-stmt? (Mutex/join contention.)
+        if self.halted && self.park_signal.is_some() {
+            return self.park_progress();
+        }
+        // Increment next_stmt_idx so the next call advances.
+        if let Some(qb) = self.threads.get_mut(&tid).and_then(|t| t.queued_body.as_mut()) {
+            qb.next_stmt_idx = idx + 1;
+        }
+        StepProgress::Continue
+    }
+
+    fn park_progress(&self) -> StepProgress {
+        match self.park_signal {
+            Some(ParkSignal::Lock(_)) => StepProgress::ParkedLock,
+            Some(ParkSignal::Join(_)) => StepProgress::ParkedJoin,
+            None => StepProgress::Continue,
+        }
+    }
+
+    /// **M08.2**: top-level scheduler loop run after main's body returns.
+    /// Drains any remaining Ready / Parked threads cooperatively until
+    /// they're all Done or no progress can be made (deadlock).
+    fn drain_remaining_threads(&mut self, span: Span) {
+        loop {
+            // Anything still doing work?
+            let ready: Vec<crate::event::ThreadId> = self.threads.iter()
+                .filter(|(_, ts)| matches!(
+                    ts.status,
+                    ThreadStatus::Ready | ThreadStatus::Running
+                ))
+                .map(|(tid, _)| *tid)
+                .collect();
+            if ready.is_empty() {
+                // Check for deadlock: any Parked / JoinWait?
+                let parked: Vec<crate::event::ThreadId> = self.threads.iter()
+                    .filter(|(_, ts)| matches!(
+                        ts.status,
+                        ThreadStatus::Parked { .. } | ThreadStatus::JoinWait { .. }
+                    ))
+                    .map(|(tid, _)| *tid)
+                    .collect();
+                if !parked.is_empty() {
+                    let mut ids = parked;
+                    ids.sort_by_key(|t| t.0);
+                    self.events.push(MemEvent::Deadlock {
+                        thread_ids: ids,
+                        span,
+                    });
+                }
+                return;
+            }
+            // Sort for determinism + seed-pick.
+            let mut sorted = ready;
+            sorted.sort_by_key(|t| t.0);
+            let chosen = self.scheduler.pick(&sorted);
+            self.switch_to(chosen, span);
+            let progress = self.run_queued_thread_one_stmt(chosen, span);
+            self.handle_step_progress(chosen, progress, span);
+            if self.halted && self.park_signal.is_none() {
+                // Real halt (runtime error). Stop.
+                return;
+            }
+        }
+    }
+
     /// **M08**: start a `Ready` thread — emit `FrameEnter` for the closure
     /// body, emit per-capture `SlotAlloc` + `SlotWrite`, push a fresh
     /// frame + outer scope, transition status to `Running`. Called by
     /// `switch_to` when the target thread is in `Ready` state and has
     /// a `queued_body`.
     fn start_queued_thread(&mut self, tid: crate::event::ThreadId) {
-        // Take the queued body + captures (drops Option to None).
-        let queued = {
+        // **M08.2**: TAKE captures (they're consumed once) but KEEP body +
+        // metadata so the cooperative scheduler can resume mid-body.
+        // setup_done is set to true at the end so further calls skip setup.
+        let (body_span, captures_taken, spawning_thread) = {
             let ts = self.threads.get_mut(&tid)
                 .expect("start_queued_thread: target thread present");
-            ts.queued_body.take()
+            let qb = match ts.queued_body.as_mut() {
+                Some(qb) => qb,
+                None => return,
+            };
+            let captures = std::mem::take(&mut qb.captures);
+            (qb.span, captures, qb.spawning_thread)
         };
-        let Some(queued) = queued else { return; };
+        // Reconstruct the legacy `queued` value used by the body below.
+        struct Compat {
+            span: Span,
+            captures: Vec<(BindingId, SlotId, String, Value, Ty)>,
+            spawning_thread: crate::event::ThreadId,
+        }
+        let queued = Compat { span: body_span, captures: captures_taken, spawning_thread };
         // Allocate a fresh frame_id for the closure body.
         let frame_id = self.alloc_frame_id();
         // Emit FrameEnter using a synthetic name for closures.
@@ -1055,6 +1391,11 @@ impl<'a> Evaluator<'a> {
                 ),
                 span: queued.span,
             });
+        }
+        // **M08.2**: mark setup complete so subsequent cooperative ticks
+        // skip the setup pass.
+        if let Some(qb) = self.threads.get_mut(&tid).and_then(|t| t.queued_body.as_mut()) {
+            qb.setup_done = true;
         }
     }
 
@@ -1785,6 +2126,30 @@ impl<'a> Evaluator<'a> {
                         ),
                         span: end_span,
                     });
+                    // **M08.2**: any threads parked on this lock can now
+                    // retry. Mark them Running so the next scheduler tick
+                    // picks one. (R-008: pedagogical Note next.)
+                    let waiters: Vec<crate::event::ThreadId> = self.threads.iter()
+                        .filter_map(|(t, ts)| match ts.status {
+                            ThreadStatus::Parked { lock } if lock == addr => Some(*t),
+                            _ => None,
+                        }).collect();
+                    self.unpark_lock_waiters(addr);
+                    if !waiters.is_empty() {
+                        let mut wsorted = waiters;
+                        wsorted.sort_by_key(|t| t.0);
+                        let waiters_str = wsorted.iter()
+                            .map(|t| format!("#{}", t.0))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        self.events.push(MemEvent::Note {
+                            kind: NoteKind::Info,
+                            message: format!(
+                                "Lock released; thread(s) {waiters_str} were waiting on this lock and are now eligible to re-acquire it on the next scheduler tick (seed determines which goes first when there's more than one)."
+                            ),
+                            span: end_span,
+                        });
+                    }
                     let _ = ty;
                     continue;
                 }
@@ -1910,29 +2275,19 @@ impl<'a> Evaluator<'a> {
         if !self.halted {
             self.flush_pending_notes();
         }
-        // **Post-M08 polish + M08.2**: drain `pending_thread_runs` AFTER
-        // the statement's main effects. Order is now scheduler-driven —
-        // when multiple threads are queued, the seeded PRNG picks which
-        // runs first. Single-element queues bypass the PRNG to preserve
-        // single-thread byte-identical traces (VR-S2, SC-002).
+        // **M08.2**: cooperative scheduler tick — at every stmt boundary
+        // in the currently-running thread, give Ready spawned threads a
+        // chance to advance by one stmt. Replaces the M08 v1 "drain
+        // pending_thread_runs FIFO to completion" pattern. Seed-driven
+        // pick from {self, ready_spawned…} decides whether to continue
+        // self or advance one spawned thread now. See research.md R-002.
         if !self.halted {
-            let mut to_run: Vec<crate::event::ThreadId> =
-                std::mem::take(&mut self.pending_thread_runs);
-            let resume = self.current_thread_id;
-            while !to_run.is_empty() && !self.halted {
-                // Sort by ThreadId for determinism (VR-S3) before the pick.
-                to_run.sort_by_key(|t| t.0);
-                let chosen = self.scheduler.pick(&to_run);
-                to_run.retain(|t| *t != chosen);
-                let switch_span = match stmt {
-                    ast::Stmt::Let(let_stmt) => let_stmt.span,
-                    ast::Stmt::Expr(e) => e.span(),
-                    ast::Stmt::Assign { span, .. } => *span,
-                };
-                self.switch_to(chosen, switch_span);
-                self.run_queued_thread_to_done(chosen);
-                self.switch_to(resume, switch_span);
-            }
+            let switch_span = match stmt {
+                ast::Stmt::Let(let_stmt) => let_stmt.span,
+                ast::Stmt::Expr(e) => e.span(),
+                ast::Stmt::Assign { span, .. } => *span,
+            };
+            self.scheduler_tick(switch_span);
         }
         let _ = result;
     }
@@ -2963,6 +3318,8 @@ impl<'a> Evaluator<'a> {
                         captures,
                         span: closure_span,
                         spawning_thread,
+                        next_stmt_idx: 0,
+                        setup_done: false,
                     }),
                 });
                 // Emit ThreadSpawn.
